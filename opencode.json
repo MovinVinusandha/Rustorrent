@@ -1,0 +1,41 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["docs/ARCHITECTURE.md"],
+  "permission": {
+    "bash": {
+      "*": "allow",
+
+      "git commit": "ask",
+      "git commit *": "ask",
+      "git branch *": "ask",
+      "git checkout *": "ask",
+      "git switch *": "ask",
+      "git merge *": "ask",
+      "git rebase *": "ask",
+      "git reset *": "ask",
+      "git tag *": "ask",
+      "git stash *": "ask",
+      "git cherry-pick *": "ask",
+      "git worktree *": "ask",
+      "git clean *": "ask",
+      "git restore *": "ask",
+      "git revert *": "ask",
+      "git config *": "ask",
+
+      "git branch --list*": "allow",
+      "git branch --show-current": "allow",
+      "git branch -a": "allow",
+      "git branch -v": "allow",
+
+      "git push *": "deny",
+      "git remote *": "ask",
+      "cargo publish*": "deny",
+      "rm -rf*": "deny"
+    },
+    "edit": {
+      "*": "allow",
+      "opencode.json": "ask",
+      "AGENTS.md": "ask"
+    }
+  }
+}

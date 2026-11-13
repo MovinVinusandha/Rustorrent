@@ -1,0 +1,51 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Fuzzing (keep corpus seeds if small, ignore crashes and generated data)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Tauri / Node (GUI, later)
+node_modules/
+/gui/dist/
+/gui/src-tauri/target/
+/gui/src-tauri/gen/
+*.log
+.pnpm-store/
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.local.json
+opencode.local.json
+
+# opencode local state
+.opencode/node_modules/
+.opencode/cache/
+
+# Test and runtime data
+/tmp/
+/test-data/downloads/
+*.part
+*.resume
+*.torrent.tmp
+# Real torrents/media must never be committed; generated fixtures go in tests/fixtures/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp

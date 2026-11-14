@@ -1,0 +1,13 @@
+[package]
+name = "bt-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bt-proto.workspace = true
+bt-engine.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true

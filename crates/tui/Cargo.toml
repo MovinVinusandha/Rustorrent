@@ -1,0 +1,18 @@
+[package]
+name = "bt-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bt-tui"
+path = "src/main.rs"
+
+[dependencies]
+bt-client.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+anyhow.workspace = true

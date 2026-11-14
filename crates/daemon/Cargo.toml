@@ -1,0 +1,16 @@
+[package]
+name = "bt-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bt-daemon"
+path = "src/main.rs"
+
+[dependencies]
+bt-client.workspace = true
+bt-platform.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

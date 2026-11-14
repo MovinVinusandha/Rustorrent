@@ -3,4 +3,4 @@
 //! Protocol modules will be added incrementally behind this crate's public API.
 
 /// Version of the engine API spoken by this build.
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = bt_proto::API_VERSION;

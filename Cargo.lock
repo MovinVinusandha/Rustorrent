@@ -135,6 +135,7 @@ name = "bt-engine"
 version = "0.1.0"
 dependencies = [
  "bt-proto",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -2,5 +2,7 @@
 //!
 //! Protocol modules will be added incrementally behind this crate's public API.
 
+pub mod bencode;
+
 /// Version of the engine API spoken by this build.
 pub const API_VERSION: u32 = bt_proto::API_VERSION;

@@ -7,7 +7,10 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 
 - [ ] 1. proto types and EngineClient trait (bootstrap)
 - [ ] 2. Bencode + metainfo parsing, fuzz targets
-- [ ] 3. Storage: file mapping, piece verification, resume data
+- [ ] 3. Storage: file mapping, piece verification, resume data.
+  Sanitize torrent paths per operating system before creating any file.
+  Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
+  post-sanitization path collisions.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame

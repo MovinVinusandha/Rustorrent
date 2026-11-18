@@ -294,6 +294,32 @@ pub enum Error {
         /// Offset of the offending value.
         offset: usize,
     },
+    /// Encoded output would exceed the configured limit.
+    #[error("encoded output exceeds {max} bytes")]
+    OutputTooLarge {
+        /// Configured maximum.
+        max: usize,
+    },
+    /// A value tree is nested deeper than the configured limit.
+    #[error("value tree is deeper than {max} containers")]
+    EncodeDepthLimit {
+        /// Configured maximum.
+        max: usize,
+    },
+    /// A byte string is larger than the configured limit.
+    #[error("string length {len} exceeds {max}")]
+    EncodeStringTooLong {
+        /// Actual string length.
+        len: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+    /// A list or dictionary has more entries than the configured limit.
+    #[error("container has more than {max} items")]
+    EncodeTooManyItems {
+        /// Configured maximum.
+        max: usize,
+    },
 }
 
 /// Decodes one canonical bencode value with default limits and strict key
@@ -597,6 +623,129 @@ impl<'a> Decoder<'a> {
         }
 
         Ok(Kind::Dict(entries))
+    }
+}
+
+/// Encodes a value using canonical bencode rules and default limits.
+pub fn encode(value: &Value<'_>) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    encode_into(value, &mut out)?;
+    Ok(out)
+}
+
+/// Appends a canonically encoded value to `out` using default limits.
+///
+/// On error, `out` is restored to its original length.
+pub fn encode_into(value: &Value<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+    encode_with_limits(value, out, Limits::default())
+}
+
+fn encode_with_limits(value: &Value<'_>, out: &mut Vec<u8>, limits: Limits) -> Result<(), Error> {
+    let start = out.len();
+    let result = {
+        let mut encoder = Encoder { out, limits };
+        encoder.encode_value(value, 0)
+    };
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+struct Encoder<'a> {
+    out: &'a mut Vec<u8>,
+    limits: Limits,
+}
+
+impl Encoder<'_> {
+    fn encode_value(&mut self, value: &Value<'_>, depth: usize) -> Result<(), Error> {
+        match &value.kind {
+            Kind::Int(number) => {
+                self.push(b"i")?;
+                self.push(number.to_string().as_bytes())?;
+                self.push(b"e")
+            }
+            Kind::Bytes(bytes) => self.encode_bytes(bytes),
+            Kind::List(items) => {
+                self.check_depth(depth)?;
+                self.check_items(items.len())?;
+                self.push(b"l")?;
+                for item in items {
+                    self.encode_value(item, depth + 1)?;
+                }
+                self.push(b"e")
+            }
+            Kind::Dict(entries) => {
+                self.check_depth(depth)?;
+                self.check_items(entries.len())?;
+                self.push(b"d")?;
+                for (key, value) in entries {
+                    self.encode_bytes(key)?;
+                    self.encode_value(value, depth + 1)?;
+                }
+                self.push(b"e")
+            }
+        }
+    }
+
+    fn check_depth(&self, depth: usize) -> Result<(), Error> {
+        if depth >= self.limits.max_depth {
+            return Err(Error::EncodeDepthLimit {
+                max: self.limits.max_depth,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_items(&self, len: usize) -> Result<(), Error> {
+        if len > self.limits.max_container_items {
+            return Err(Error::EncodeTooManyItems {
+                max: self.limits.max_container_items,
+            });
+        }
+        Ok(())
+    }
+
+    fn encode_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len() > self.limits.max_string_bytes {
+            return Err(Error::EncodeStringTooLong {
+                len: bytes.len(),
+                max: self.limits.max_string_bytes,
+            });
+        }
+
+        let mut buffer = [0u8; MAX_LENGTH_DIGITS];
+        let mut number = bytes.len();
+        let mut index = buffer.len();
+        loop {
+            index -= 1;
+            buffer[index] = b'0' + (number % 10) as u8;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
+
+        self.push(&buffer[index..])?;
+        self.push(b":")?;
+        self.push(bytes)
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let new_len = self
+            .out
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(Error::OutputTooLarge {
+                max: self.limits.max_input_bytes,
+            })?;
+        if new_len > self.limits.max_input_bytes {
+            return Err(Error::OutputTooLarge {
+                max: self.limits.max_input_bytes,
+            });
+        }
+        self.out.extend_from_slice(bytes);
+        Ok(())
     }
 }
 

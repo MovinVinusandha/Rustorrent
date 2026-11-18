@@ -283,3 +283,130 @@ fn default_limits_and_options_match_constants() {
     assert_eq!(limits.max_nodes, MAX_NODES);
     assert_eq!(DecodeOptions::default().key_order, KeyOrder::Strict);
 }
+
+fn raw_value<'a>(kind: Kind<'a>) -> Value<'a> {
+    Value { kind, span: 0..0 }
+}
+
+#[test]
+fn encodes_canonical_input_byte_for_byte() {
+    let inputs: &[&[u8]] = &[
+        b"0:",
+        b"4:spam",
+        b"i3e",
+        b"i-3e",
+        b"i0e",
+        b"i9223372036854775807e",
+        b"i-9223372036854775808e",
+        b"le",
+        b"de",
+        b"l4:spam4:eggse",
+        b"d3:cow3:moo4:spam4:eggse",
+        b"d4:spaml1:a1:bee",
+        b"2:\xff\xfe",
+    ];
+
+    for &input in inputs {
+        let value = decode(input).unwrap();
+        let encoded = encode(&value).unwrap();
+        assert_eq!(encoded.as_slice(), input, "round-trip failed for {input:?}");
+    }
+}
+
+#[test]
+fn encode_into_appends() {
+    let value = decode(b"i1e").unwrap();
+    let mut out = b"prefix".to_vec();
+
+    encode_into(&value, &mut out).unwrap();
+
+    assert_eq!(&out[..6], b"prefix");
+    assert_eq!(&out[6..], b"i1e");
+}
+
+#[test]
+fn encoder_enforces_limits_and_is_transactional() {
+    let long_string = vec![b'a'; 5];
+    let mut out = Vec::new();
+
+    let value = raw_value(Kind::Bytes(long_string.as_slice()));
+    assert!(matches!(
+        encode_with_limits(
+            &value,
+            &mut out,
+            Limits {
+                max_string_bytes: 4,
+                ..Limits::default()
+            }
+        ),
+        Err(Error::EncodeStringTooLong { .. })
+    ));
+    assert!(out.is_empty());
+
+    let value = raw_value(Kind::List(vec![
+        raw_value(Kind::Int(1)),
+        raw_value(Kind::Int(2)),
+    ]));
+    assert!(matches!(
+        encode_with_limits(
+            &value,
+            &mut out,
+            Limits {
+                max_container_items: 1,
+                ..Limits::default()
+            }
+        ),
+        Err(Error::EncodeTooManyItems { .. })
+    ));
+    assert!(out.is_empty());
+
+    let value = raw_value(Kind::List(vec![raw_value(Kind::List(vec![raw_value(
+        Kind::List(vec![raw_value(Kind::Int(1))]),
+    )]))]));
+    assert!(matches!(
+        encode_with_limits(
+            &value,
+            &mut out,
+            Limits {
+                max_depth: 2,
+                ..Limits::default()
+            }
+        ),
+        Err(Error::EncodeDepthLimit { .. })
+    ));
+    assert!(out.is_empty());
+
+    let value = raw_value(Kind::Bytes(long_string.as_slice()));
+    assert!(matches!(
+        encode_with_limits(
+            &value,
+            &mut out,
+            Limits {
+                max_input_bytes: 4,
+                ..Limits::default()
+            }
+        ),
+        Err(Error::OutputTooLarge { .. })
+    ));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn encoder_restores_output_after_error() {
+    let value = raw_value(Kind::List(vec![raw_value(Kind::List(vec![raw_value(
+        Kind::List(vec![raw_value(Kind::Int(1))]),
+    )]))]));
+    let mut out = b"prefix".to_vec();
+
+    let result = encode_with_limits(
+        &value,
+        &mut out,
+        Limits {
+            max_depth: 1,
+            ..Limits::default()
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(out, b"prefix");
+}

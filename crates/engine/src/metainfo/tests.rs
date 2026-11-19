@@ -53,13 +53,45 @@ fn wrap(info: &[u8], extra: &[u8]) -> Vec<u8> {
     torrent
 }
 
-/// Single-file `info` with the given length, piece length and piece hashes.
-fn info_with(length: i64, piece_length: u64, pieces: &[u8]) -> Vec<u8> {
+/// Single-file `info` with the given name, length, piece length and pieces.
+fn info_with_name(name: &str, length: i64, piece_length: u64, pieces: &[u8]) -> Vec<u8> {
     let mut info = Vec::new();
     info.push(b'd');
-    info.extend_from_slice(
-        format!("6:lengthi{length}e4:name1:x12:piece lengthi{piece_length}e").as_bytes(),
-    );
+    info.extend_from_slice(format!("6:lengthi{length}e4:name").as_bytes());
+    info.extend_from_slice(&bencode_str(name));
+    info.extend_from_slice(format!("12:piece lengthi{piece_length}e").as_bytes());
+    info.extend_from_slice(format!("6:pieces{}:", pieces.len()).as_bytes());
+    info.extend_from_slice(pieces);
+    info.push(b'e');
+    info
+}
+
+/// Single-file `info` named `x`.
+fn info_with(length: i64, piece_length: u64, pieces: &[u8]) -> Vec<u8> {
+    info_with_name("x", length, piece_length, pieces)
+}
+
+/// Multi-file `info` with explicit paths and lengths.
+fn multi_info_with(
+    name: &str,
+    files: &[(&[&str], i64)],
+    piece_length: u64,
+    pieces: &[u8],
+) -> Vec<u8> {
+    let mut info = Vec::new();
+    info.push(b'd');
+    info.extend_from_slice(b"5:filesl");
+    for (path, length) in files {
+        info.extend_from_slice(format!("d6:lengthi{length}e4:pathl").as_bytes());
+        for component in *path {
+            info.extend_from_slice(&bencode_str(component));
+        }
+        info.extend_from_slice(b"ee");
+    }
+    info.push(b'e');
+    info.extend_from_slice(&bencode_str("name"));
+    info.extend_from_slice(&bencode_str(name));
+    info.extend_from_slice(format!("12:piece lengthi{piece_length}e").as_bytes());
     info.extend_from_slice(format!("6:pieces{}:", pieces.len()).as_bytes());
     info.extend_from_slice(pieces);
     info.push(b'e');
@@ -449,4 +481,102 @@ fn rejects_duplicate_info_keys() {
         MetaInfo::parse(&wrap(info, b"")),
         Err(Error::Bencode(bencode::Error::DuplicateDictKey { .. }))
     ));
+}
+
+#[test]
+fn rejects_unsafe_name_components() {
+    let cases = ["", ".", "..", "a/b", "a\0b", "a\nb", "a\u{7f}b"];
+
+    for name in cases {
+        let torrent = wrap(&info_with_name(name, 0, 16384, b""), b"");
+        let result = MetaInfo::parse(&torrent);
+        assert!(
+            matches!(
+                result,
+                Err(Error::EmptyPathComponent { .. } | Error::UnsafePathComponent { .. })
+            ),
+            "name {name:?} parsed as {result:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_unsafe_path_components() {
+    let cases = ["", ".", "..", "a/b", "a\0b", "a\tb", "a\u{7f}b"];
+
+    for component in cases {
+        let path: &[&str] = &[component];
+        let info = multi_info_with("dir", &[(path, 0)], 16384, b"");
+        let result = MetaInfo::parse(&wrap(&info, b""));
+        assert!(
+            matches!(
+                result,
+                Err(Error::EmptyPathComponent { .. } | Error::UnsafePathComponent { .. })
+            ),
+            "component {component:?} parsed as {result:?}"
+        );
+    }
+}
+
+#[test]
+fn accepts_components_that_storage_will_sanitize() {
+    let cases = [
+        "..\\..\\x",
+        "C:\\x",
+        "C:x",
+        "con",
+        "a.",
+        "a ",
+        "a:b",
+        "a*b",
+        "a?b",
+        "a\"b",
+        "a<b",
+        "a>b",
+        "a|b",
+    ];
+
+    for component in cases {
+        let torrent = wrap(&info_with_name(component, 0, 16384, b""), b"");
+        assert!(MetaInfo::parse(&torrent).is_ok(), "name {component:?}");
+
+        let path: &[&str] = &[component];
+        let info = multi_info_with("dir", &[(path, 0)], 16384, b"");
+        assert!(
+            MetaInfo::parse(&wrap(&info, b"")).is_ok(),
+            "path {component:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_duplicate_file_paths() {
+    let a: &[&str] = &["a.txt"];
+    let b: &[&str] = &["a.txt"];
+    let info = multi_info_with("dir", &[(a, 1), (b, 2)], 16384, &[0u8; 20]);
+
+    assert_eq!(
+        MetaInfo::parse(&wrap(&info, b"")),
+        Err(Error::DuplicatePath {
+            path: "dir/a.txt".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn duplicate_detection_is_exact_and_case_sensitive() {
+    let lower: &[&str] = &["a.txt"];
+    let upper: &[&str] = &["A.txt"];
+    let info = multi_info_with("dir", &[(lower, 1), (upper, 2)], 16384, &[0u8; 20]);
+    assert!(MetaInfo::parse(&wrap(&info, b"")).is_ok());
+
+    let first: &[&str] = &["sub", "x"];
+    let second: &[&str] = &["sub", "x"];
+    let info = multi_info_with("dir", &[(first, 1), (second, 1)], 16384, &[0u8; 20]);
+    assert_eq!(
+        MetaInfo::parse(&wrap(&info, b"")),
+        Err(Error::DuplicatePath {
+            path: "dir/sub/x".to_owned(),
+        })
+    );
 }

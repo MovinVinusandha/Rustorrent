@@ -5,7 +5,7 @@ rbit appears to provide it (verify by reading its code and tests before relying 
 
 | BEP | Name | Target | Status | rbit | Module | Tests | Notes |
 |---|---|---|---|---|---|---|---|
-| 3 | Core protocol | v0.1 | planned | verify | | | |
+| 3 | Core protocol | v0.1 | in-progress | verify | bencode, metainfo | unit + fuzz | bencode and v1 metainfo done; tracker and peer wire pending. Gaps: `.utf-8` keys and legacy text encodings (v0.2) |
 | 23 | Compact peers | v0.1 | planned | verify | | | |
 | 15 | UDP tracker | v0.1 | planned | verify | | | |
 | 12 | Multi-tracker | v0.1 | planned | verify | | | |
@@ -15,7 +15,7 @@ rbit appears to provide it (verify by reading its code and tests before relying 
 | 11 | PEX | v0.2 | planned | verify | | | |
 | 14 | LSD | v0.2 | planned | verify | | | |
 | 6 | Fast extension | v0.2 | planned | verify | | | |
-| 27 | Private torrents | v0.2 | planned | n/a | | | no DHT/PEX/LSD |
+| 27 | Private torrents | v0.2 | planned | n/a | | | `private` flag parsed; no DHT/PEX/LSD yet |
 | 19 | Web seeds | v0.2 | planned | verify | | | |
 | 20 | Peer ID conventions | v0.2 | planned | n/a | | | |
 | 42 | DHT security ext. | v0.3 | planned | verify | | | |

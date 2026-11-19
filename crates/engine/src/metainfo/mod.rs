@@ -11,7 +11,7 @@
 //! in the input. It is never computed from a re-encoding, because a lenient
 //! decode does not preserve dictionary key order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use sha1::{Digest, Sha1};
@@ -135,6 +135,7 @@ impl MetaInfo {
         }
 
         let name = required_utf8(info, b"name", "name")?;
+        validate_component(&name, "name")?;
         let piece_length = required_piece_length(info)?;
         let pieces = required_pieces(info)?;
 
@@ -172,6 +173,14 @@ impl MetaInfo {
                 (Mode::Multi, files, total_length)
             }
         };
+
+        let mut seen_paths = BTreeSet::new();
+        for file in &files {
+            let path = file.path.join("/");
+            if !seen_paths.insert(path.clone()) {
+                return Err(Error::DuplicatePath { path });
+            }
+        }
 
         let expected_pieces = total_length.div_ceil(piece_length);
         let found_pieces = (pieces.len() / PIECE_HASH_LENGTH) as u64;
@@ -253,6 +262,26 @@ pub enum Error {
     /// A `path` list is empty.
     #[error("`path` must not be empty")]
     EmptyPath,
+    /// A `name` or `path` component is empty.
+    #[error("`{field}` contains an empty component")]
+    EmptyPathComponent {
+        /// Field name used in the message.
+        field: &'static str,
+    },
+    /// A `name` or `path` component is not a single safe path element.
+    #[error("`{field}` contains an unsafe component: {component:?}")]
+    UnsafePathComponent {
+        /// Field name used in the message.
+        field: &'static str,
+        /// The offending component.
+        component: String,
+    },
+    /// Two files resolve to the same relative path.
+    #[error("duplicate file path: {path:?}")]
+    DuplicatePath {
+        /// The repeated path, joined with `/`.
+        path: String,
+    },
     /// `piece length` is zero or negative.
     #[error("`piece length` must be greater than zero")]
     ZeroPieceLength,
@@ -305,6 +334,27 @@ fn non_negative(value: &Value<'_>, field: &'static str) -> Result<u64, Error> {
     })
 }
 
+fn validate_component(component: &str, field: &'static str) -> Result<(), Error> {
+    if component.is_empty() {
+        return Err(Error::EmptyPathComponent { field });
+    }
+
+    // Windows-specific problems (backslashes, drive prefixes, reserved names,
+    // trailing dots/spaces) are left to the storage layer.
+    let unsafe_text = component == "."
+        || component == ".."
+        || component.contains('/')
+        || component.chars().any(|c| c.is_ascii_control());
+    if unsafe_text {
+        return Err(Error::UnsafePathComponent {
+            field,
+            component: component.to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
 fn entry_length(dict: &BTreeMap<&[u8], Value<'_>>) -> Result<u64, Error> {
     let value = dict
         .get(b"length".as_slice())
@@ -328,6 +378,7 @@ fn entry_path(dict: &BTreeMap<&[u8], Value<'_>>, name: &str) -> Result<Vec<Strin
             .as_bytes()
             .ok_or(Error::WrongType { field: "path" })?;
         let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8 { field: "path" })?;
+        validate_component(text, "path")?;
         path.push(text.to_owned());
     }
     Ok(path)

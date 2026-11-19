@@ -6,7 +6,7 @@ Status key: [ ] todo, [~] in progress, [x] done.
 BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 
 - [ ] 1. proto types and EngineClient trait (bootstrap)
-- [ ] 2. Bencode + metainfo parsing, fuzz targets
+- [x] 2. Bencode + metainfo parsing, fuzz targets
 - [ ] 3. Storage: file mapping, piece verification, resume data.
   Sanitize torrent paths per operating system before creating any file.
   Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
@@ -27,6 +27,7 @@ Linux and macOS, and survive restart.
 ## v0.2
 BEP 11, 14, 6, 27, 19, 20. Queue, sequential mode, labels, settings file.
 Daemon + remote TUI over local socket.
+Metainfo: `.utf-8` keys and legacy text encodings (see docs/BEP_STATUS.md).
 
 ## v0.3
 Encryption (MSE/PE), BEP 42, 32. IP blocklist, proxy, UPnP/NAT-PMP.

@@ -8,7 +8,7 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 - [ ] 1. proto types and EngineClient trait (bootstrap)
 - [x] 2. Bencode + metainfo parsing, fuzz targets
 - [ ] 3. Storage: file mapping, piece verification, resume data.
-  - [ ] 3a. Path sanitization and file layout mapping (pure, no I/O).
+  - [x] 3a. Path sanitization and file layout mapping (pure, no I/O).
     Sanitize torrent paths per operating system before creating any file.
     Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
     post-sanitization path collisions.

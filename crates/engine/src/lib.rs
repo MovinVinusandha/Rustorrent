@@ -2,6 +2,8 @@
 //!
 //! Protocol modules will be added incrementally behind this crate's public API.
 
+#![forbid(unsafe_code)]
+
 pub mod bencode;
 pub mod metainfo;
 pub mod storage;

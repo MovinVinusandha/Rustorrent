@@ -29,6 +29,7 @@ async-trait = "0.1"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 proptest = "1"
+tempfile = "3"
 
 bt-proto = { path = "crates/proto" }
 bt-engine = { path = "crates/engine" }

@@ -1,5 +1,9 @@
 //! OS-specific glue shared by the engine and daemon.
 
+#![forbid(unsafe_code)]
+
+pub mod file;
+
 /// Operating system family detected at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {

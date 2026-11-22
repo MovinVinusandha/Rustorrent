@@ -8,9 +8,16 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 - [ ] 1. proto types and EngineClient trait (bootstrap)
 - [x] 2. Bencode + metainfo parsing, fuzz targets
 - [ ] 3. Storage: file mapping, piece verification, resume data.
-  Sanitize torrent paths per operating system before creating any file.
-  Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
-  post-sanitization path collisions.
+  - [x] 3a. Path sanitization and file layout mapping (pure, no I/O).
+    Sanitize torrent paths per operating system before creating any file.
+    Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
+    post-sanitization path collisions.
+  - [ ] 3b. Storage backend: safe file creation, positioned reads/writes via
+    `crates/platform`, open-handle cap, preallocation policy.
+  - [ ] 3c. Piece verification: in-memory piece assembly, hash on the blocking
+    pool, write only verified pieces, full recheck.
+  - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
+    against files, fallback to recheck.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame

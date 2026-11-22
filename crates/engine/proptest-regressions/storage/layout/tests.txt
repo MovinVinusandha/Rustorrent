@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 509807e9635ff27160da0dcdefbc221d3aaf2657508047a810f37bbd4239c422 # shrinks to files = [(["é\u{7f}<0/\ta .\n:\u{301}a\"\0\0😀?*\u{7f}a~><\na"], 18), (["lpt9.tar.gz", "\"Z\n_\"\\ :|\t_|\u{7f}\u{7f}\\*/\u{301}é\t* \0é\0\0\u{7f}_\t___9/\0:\u{301}😀<\\\nZ\".\">😀/\u{301}a9.9_\n<ZZ\"😀Z\\Z_\0: |é_*\u{301}<\\\u{301}9_*0.\t0:\u{7f}\u{301}0\0\nZ\n\n9:\u{301}/Z?>~\n* é<\t:|.|\"?\té \"\"~\\?\\<:a/é\\😀*>09\u{301}|\n\\<\":😀\t9\\?<~.~\\*9\u{301}\u{7f}\t:😀_\u{301}Z\"a:"], 13)], piece_length = 2, start = 21, end = 75
+cc 575809536a761b0125a22e3acc1c8b6473e36991de9ce2e6b6bf8552270da81a # shrinks to files = [([" 9\0\"\ta0 \u{301}?é"], 8), (["\n\u{7f}>a*\"*😀\0~>99 :\n|\t\t_|:|__\"9\nZ\t\"é>\".a.:Zé ><\u{301}😀0Z|:>9\0 \u{301}~. >.\u{301}é.  a*\":/a__\u{7f}0~*|\u{7f}\n_\0:>~|😀\u{7f}a~?\\\"\\\u{7f}\n<0\" é\0\t\n\"😀😀\n~<\t|>\u{7f}Z\\\\*09\na_a0\t\"\u{7f}.>Z\tZ?~.~~>\u{7f}é\t😀/Z:\"</?a _Z\0?~\n9? |/😀/😀*"], 6)], piece_length = 2

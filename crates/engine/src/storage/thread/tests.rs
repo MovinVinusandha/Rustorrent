@@ -45,13 +45,18 @@ fn map_with(files: &[(&[&str], u64)]) -> Arc<FileMap> {
 }
 
 async fn open(root: &Path, map: Arc<FileMap>) -> StorageHandle {
-    StorageHandle::open(root.to_path_buf(), map, StorageConfig::default())
+    open_with_config(root, map, StorageConfig::default()).await
+}
+
+async fn open_with_config(root: &Path, map: Arc<FileMap>, config: StorageConfig) -> StorageHandle {
+    StorageHandle::open(root.to_path_buf(), map, config)
         .await
         .expect("open storage")
 }
 
 fn exit_receiver(handle: &StorageHandle) -> oneshot::Receiver<()> {
     handle
+        .state
         .exit
         .lock()
         .expect("lock exit hook")
@@ -294,4 +299,196 @@ async fn dropping_the_last_handle_closes_files() {
 
     assert_eq!(fs::read(root.join("a.bin")).expect("read file"), b"data");
     fs::remove_file(root.join("a.bin")).expect("remove after close");
+}
+
+#[tokio::test]
+async fn shutdown_closes_files_before_returning() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let handle = open(&root, map).await;
+
+    handle
+        .write_range(0, b"data".to_vec())
+        .await
+        .expect("write");
+    let receiver = exit_receiver(&handle);
+    handle.shutdown().await.expect("shutdown");
+
+    fs::remove_file(root.join("a.bin")).expect("remove after shutdown");
+    wait_for_exit(receiver).await;
+}
+
+#[tokio::test]
+async fn shutdown_drains_queued_writes_before_closing() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 8)]);
+    let handle = open(&root, map).await;
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    assert!(
+        handle
+            .tx
+            .try_send(Command::Hold {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .is_ok()
+    );
+    entered_rx.await.expect("worker entered hold");
+
+    let (first_reply, first_response) = oneshot::channel();
+    assert!(
+        handle
+            .tx
+            .try_send(Command::WriteRange {
+                offset: 0,
+                bytes: b"one ".to_vec(),
+                reply: first_reply,
+            })
+            .is_ok()
+    );
+    let (second_reply, second_response) = oneshot::channel();
+    assert!(
+        handle
+            .tx
+            .try_send(Command::WriteRange {
+                offset: 4,
+                bytes: b"two".to_vec(),
+                reply: second_reply,
+            })
+            .is_ok()
+    );
+
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished(), "shutdown must wait behind hold");
+    }
+
+    release_tx.send(()).expect("release hold");
+    first_response
+        .await
+        .expect("first reply")
+        .expect("first write");
+    second_response
+        .await
+        .expect("second reply")
+        .expect("second write");
+    shutdown.await.expect("join shutdown").expect("shutdown");
+
+    assert_eq!(fs::read(root.join("a.bin")).expect("read file"), b"one two");
+}
+
+#[tokio::test]
+async fn shutdown_reports_failed_sync_and_closes_files() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4), (&["b.bin"], 4)]);
+    let config = StorageConfig {
+        max_open_handles: 1,
+        ..StorageConfig::default()
+    };
+    let handle = open_with_config(&root, map, config).await;
+
+    handle
+        .write_range(0, b"aaaa".to_vec())
+        .await
+        .expect("write a");
+    handle
+        .write_range(4, b"bbbb".to_vec())
+        .await
+        .expect("write b");
+    fs::remove_file(root.join("a.bin")).expect("remove evicted dirty file");
+
+    match handle.shutdown().await {
+        Err(StorageHandleError::Storage(StorageError::Io { .. })) => {}
+        other => panic!("expected a failed sync, got {other:?}"),
+    }
+
+    assert!(handle.is_closed());
+    fs::remove_file(root.join("b.bin")).expect("remove after failed shutdown");
+    assert!(matches!(
+        handle.sync().await,
+        Err(StorageHandleError::ShuttingDown)
+    ));
+}
+
+#[tokio::test]
+async fn cancelled_shutdown_on_a_full_queue_keeps_the_handle_usable() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let handle = open(&root, map).await;
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    assert!(
+        handle
+            .tx
+            .try_send(Command::Hold {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .is_ok()
+    );
+    entered_rx.await.expect("worker entered hold");
+
+    for _ in 0..QUEUE_CAPACITY {
+        let (reply, _response) = oneshot::channel();
+        assert!(handle.tx.try_send(Command::Sync { reply }).is_ok());
+    }
+
+    let pending = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+        assert!(
+            !pending.is_finished(),
+            "shutdown must wait for a queue slot"
+        );
+    }
+    pending.abort();
+    let _ = pending.await;
+
+    release_tx.send(()).expect("release hold");
+    timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown timeout")
+        .expect("shutdown after cancelled attempt");
+    assert!(handle.is_closed());
+}
+
+#[tokio::test]
+async fn requests_after_shutdown_are_rejected() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let handle = open(&root, map).await;
+
+    handle.shutdown().await.expect("shutdown");
+    assert!(handle.is_closed());
+    assert!(matches!(
+        handle.read_range(0, 1).await,
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert!(matches!(
+        handle.write_range(0, vec![0]).await,
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert!(matches!(
+        handle.sync().await,
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert!(matches!(
+        handle.shutdown().await,
+        Err(StorageHandleError::ShuttingDown)
+    ));
 }

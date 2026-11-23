@@ -5,13 +5,21 @@
 //! writing verified pieces arrive in 3c-2b and depend on the storage worker.
 
 pub mod budget;
+pub mod buffer;
 pub mod spec;
 
 pub use budget::{
     BudgetError, DEFAULT_GLOBAL_BUDGET, MAX_TORRENT_SHARE, MemoryBudget, PieceReservation,
     TorrentBudget,
 };
+pub use buffer::{BlockError, InsertOutcome, PieceBuffer, PieceBufferError};
 pub use spec::{PieceSpec, PieceSpecError};
+
+/// Protocol block size: 16 KiB.
+///
+/// Every piece is split into blocks of this size. The final block of a piece
+/// is shorter when the piece length is not a multiple of it.
+pub const BLOCK_LEN: usize = 16 * 1024;
 
 /// Engine-assigned handle for one peer connection.
 ///

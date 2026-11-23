@@ -278,6 +278,10 @@ enum Command {
         reply: Reply<()>,
     },
     #[cfg(test)]
+    OpenHandles {
+        reply: Reply<usize>,
+    },
+    #[cfg(test)]
     Hold {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -295,6 +299,10 @@ fn reject(command: Command) {
         Command::WriteRange { reply, .. }
         | Command::Sync { reply }
         | Command::Shutdown { reply } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::OpenHandles { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
@@ -356,6 +364,10 @@ fn run_worker(
             Command::Shutdown { reply } => {
                 shutdown = Some(reply);
                 break;
+            }
+            #[cfg(test)]
+            Command::OpenHandles { reply } => {
+                let _ = reply.send(Ok(storage.open_handle_count()));
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

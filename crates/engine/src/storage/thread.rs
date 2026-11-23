@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use thiserror::Error;
@@ -41,6 +42,9 @@ pub enum StorageHandleError {
     /// The storage backend returned an error.
     #[error(transparent)]
     Storage(#[from] StorageError),
+    /// The worker is shutting down and no longer accepts requests.
+    #[error("storage worker is shutting down")]
+    ShuttingDown,
     /// The worker exited, so the request was not completed.
     ///
     /// This covers a worker panic in unwind builds, a dropped request
@@ -69,13 +73,18 @@ pub enum StorageHandleError {
 /// sender); requests from different clones are interleaved.
 ///
 /// Dropping the last handle closes the queue. The worker then performs a
-/// best-effort close and exits; that close has no error reporting. A
-/// reportable shutdown is added by the shutdown step.
+/// best-effort close and exits without reporting errors. Call
+/// [`StorageHandle::shutdown`] when the final sync result matters.
 #[derive(Clone)]
 pub struct StorageHandle {
     tx: mpsc::Sender<Command>,
+    state: Arc<State>,
+}
+
+struct State {
+    shutting_down: AtomicBool,
     #[cfg(test)]
-    exit: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    exit: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl StorageHandle {
@@ -108,8 +117,11 @@ impl StorageHandle {
         match open_rx.await {
             Ok(Ok(())) => Ok(Self {
                 tx,
-                #[cfg(test)]
-                exit: Arc::new(Mutex::new(Some(exit_rx))),
+                state: Arc::new(State {
+                    shutting_down: AtomicBool::new(false),
+                    #[cfg(test)]
+                    exit: Mutex::new(Some(exit_rx)),
+                }),
             }),
             Ok(Err(error)) => Err(StorageHandleError::Storage(error)),
             Err(_) => Err(StorageHandleError::WorkerStopped),
@@ -158,15 +170,71 @@ impl StorageHandle {
         self.send(|reply| Command::Sync { reply }).await
     }
 
-    async fn send<T>(
-        &self,
-        command: impl FnOnce(Reply<T>) -> Command,
-    ) -> Result<T, StorageHandleError> {
+    /// Returns `true` once shutdown has begun or the worker has exited.
+    pub fn is_closed(&self) -> bool {
+        self.state.shutting_down.load(Ordering::Acquire) || self.tx.is_closed()
+    }
+
+    /// Drains queued requests, syncs, closes every file, then exits the worker.
+    ///
+    /// A queue slot is reserved before the shutdown flag is set, so cancelling
+    /// this future while the queue is full leaves the handle usable. Once the
+    /// flag is set, new requests fail with [`StorageHandleError::ShuttingDown`];
+    /// requests already queued finish first.
+    ///
+    /// The worker drops the [`Storage`] before it replies, so all file handles
+    /// are closed when this returns. The return value is the final sync result:
+    /// a failure is reported and the worker still exits. Call [`sync`](Self::sync)
+    /// first when the caller needs to retry a failed flush.
+    pub async fn shutdown(&self) -> Result<(), StorageHandleError> {
+        if self.state.shutting_down.load(Ordering::Acquire) {
+            return Err(StorageHandleError::ShuttingDown);
+        }
+
+        // Reserve first: dropping this future while it waits for a slot must
+        // not set the flag or consume a slot.
         let permit = self
             .tx
             .reserve()
             .await
             .map_err(|_| StorageHandleError::WorkerStopped)?;
+
+        if self
+            .state
+            .shutting_down
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StorageHandleError::ShuttingDown);
+        }
+
+        let (reply, response) = oneshot::channel();
+        permit.send(Command::Shutdown { reply });
+
+        let result = response
+            .await
+            .map_err(|_| StorageHandleError::WorkerStopped)?;
+        result.map_err(StorageHandleError::Storage)
+    }
+
+    async fn send<T>(
+        &self,
+        command: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<T, StorageHandleError> {
+        if self.state.shutting_down.load(Ordering::Acquire) {
+            return Err(StorageHandleError::ShuttingDown);
+        }
+
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| StorageHandleError::WorkerStopped)?;
+
+        if self.state.shutting_down.load(Ordering::Acquire) {
+            return Err(StorageHandleError::ShuttingDown);
+        }
+
         let (reply, response) = oneshot::channel();
         permit.send(command(reply));
         response
@@ -191,6 +259,9 @@ enum Command {
     Sync {
         reply: Reply<()>,
     },
+    Shutdown {
+        reply: Reply<()>,
+    },
     #[cfg(test)]
     Hold {
         entered: oneshot::Sender<()>,
@@ -209,7 +280,7 @@ fn run_worker(
     open: oneshot::Sender<Result<(), StorageError>>,
     exit: Option<oneshot::Sender<()>>,
 ) {
-    let mut storage = match Storage::open(&root, map, config) {
+    let mut storage = Some(match Storage::open(&root, map, config) {
         Ok(storage) => {
             let _ = open.send(Ok(()));
             storage
@@ -218,11 +289,17 @@ fn run_worker(
             let _ = open.send(Err(error));
             return;
         }
-    };
+    });
 
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
+                let Some(storage) = storage.as_mut() else {
+                    let _ = reply.send(Err(StorageError::Internal {
+                        reason: "storage is already closed",
+                    }));
+                    continue;
+                };
                 let len = len.min(MAX_RANGE_LEN);
                 let mut buf = vec![0u8; len];
                 let result = storage.read_range(offset, &mut buf);
@@ -240,10 +317,33 @@ fn run_worker(
                 bytes,
                 reply,
             } => {
+                let Some(storage) = storage.as_mut() else {
+                    let _ = reply.send(Err(StorageError::Internal {
+                        reason: "storage is already closed",
+                    }));
+                    continue;
+                };
                 let _ = reply.send(storage.write_range(offset, &bytes));
             }
             Command::Sync { reply } => {
+                let Some(storage) = storage.as_mut() else {
+                    let _ = reply.send(Err(StorageError::Internal {
+                        reason: "storage is already closed",
+                    }));
+                    continue;
+                };
                 let _ = reply.send(storage.sync());
+            }
+            Command::Shutdown { reply } => {
+                let result = match storage.as_mut() {
+                    Some(storage) => storage.close(),
+                    None => Ok(()),
+                };
+                // Drop the storage so every file handle is closed before the
+                // caller observes the reply.
+                storage = None;
+                let _ = reply.send(result);
+                break;
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {
@@ -255,8 +355,10 @@ fn run_worker(
         }
     }
 
-    let _ = storage.close();
-    drop(storage);
+    if let Some(mut storage) = storage {
+        let _ = storage.close();
+        drop(storage);
+    }
 
     #[cfg(test)]
     if let Some(exit) = exit {

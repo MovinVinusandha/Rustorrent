@@ -199,6 +199,30 @@ fn clear_zeroes_bits_and_trailing_bytes() {
     assert_eq!(bitfield.as_bytes(), &[0, 0]);
 }
 
+#[test]
+fn a_full_final_byte_roundtrips_when_piece_count_is_a_multiple_of_eight() {
+    // Regression seed from `proptest-regressions/bitfield/tests.txt`:
+    // piece_count = 504, operations = [(496, true)]. 504 % 8 == 0, so the
+    // final byte is full and must keep a 0xFF trailing mask.
+    let mut bitfield = Bitfield::new(504).expect("bitfield");
+    bitfield.set(496, true).expect("set last byte's first bit");
+
+    assert_eq!(bitfield.byte_len(), 63);
+    assert_eq!(bitfield.as_bytes().last().copied(), Some(0b0000_0001));
+    assert_eq!(
+        Bitfield::from_bytes(bitfield.as_bytes(), 504).expect("roundtrip"),
+        bitfield
+    );
+    assert_eq!(
+        Bitfield::from_bytes(&[0x01], 8).expect("single full byte"),
+        {
+            let mut one = Bitfield::new(8).expect("bitfield");
+            one.set(0, true).expect("set");
+            one
+        }
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

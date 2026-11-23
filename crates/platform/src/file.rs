@@ -101,6 +101,18 @@ pub fn open_read(path: &Path) -> io::Result<File> {
     StdFile::open(path).map(File::new)
 }
 
+/// Opens an existing file for reading and writing.
+///
+/// Fails with `NotFound` instead of creating the file. Used to reopen a dirty
+/// file for syncing without recreating a file the user deleted.
+pub fn open_rw(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map(File::new)
+}
+
 /// Opens a file for reading and writing, creating it if missing.
 ///
 /// Never truncates an existing file.

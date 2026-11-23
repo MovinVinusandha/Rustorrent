@@ -121,6 +121,24 @@ fn open_write_creates_missing_file_without_truncating() {
 }
 
 #[test]
+fn open_rw_opens_existing_without_truncating() {
+    let dir = temp_dir();
+    let path = path_in(&dir, "data");
+    std::fs::write(&path, b"keep").expect("write file");
+
+    let file = open_rw(&path).expect("open");
+    write_all_at(&file, b"K", 0);
+    assert_eq!(std::fs::read(&path).expect("read file"), b"Keep");
+}
+
+#[test]
+fn open_rw_missing_file_returns_not_found() {
+    let dir = temp_dir();
+    let error = open_rw(&path_in(&dir, "missing")).expect_err("open must fail");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+}
+
+#[test]
 fn open_read_reads_existing_file() {
     let dir = temp_dir();
     let path = path_in(&dir, "data");

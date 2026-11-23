@@ -18,6 +18,7 @@
 //! statistical blame, not an immediate ban.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use thiserror::Error;
 
@@ -207,6 +208,18 @@ impl PieceBuffer {
             block,
             complete: self.is_complete(),
         })
+    }
+}
+
+impl fmt::Debug for PieceBuffer {
+    /// Shows the piece shape and progress, never the buffered bytes.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PieceBuffer")
+            .field("index", &self.spec.index())
+            .field("length", &self.spec.length())
+            .field("received", &self.received)
+            .finish_non_exhaustive()
     }
 }
 

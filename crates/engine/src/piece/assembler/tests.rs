@@ -211,15 +211,18 @@ fn slow_steady_progress_keeps_a_piece_alive() {
     let (mut assembler, _torrent, _spec) = setup_at(len, t0);
 
     let first = block_bytes(0, BLOCK_LEN);
-    assembler
-        .insert_at(
-            0,
-            PeerKey::from_raw(1),
-            0,
-            &first,
-            t0 + Duration::from_secs(29),
-        )
-        .expect("block 0");
+    assert!(matches!(
+        assembler
+            .insert_at(
+                0,
+                PeerKey::from_raw(1),
+                0,
+                &first,
+                t0 + Duration::from_secs(29),
+            )
+            .expect("block 0"),
+        InsertResult::Incomplete(_)
+    ));
     assert!(
         assembler
             .sweep_stalled(t0 + Duration::from_secs(58))
@@ -228,15 +231,18 @@ fn slow_steady_progress_keeps_a_piece_alive() {
     );
 
     let second = block_bytes(1, BLOCK_LEN);
-    assembler
-        .insert_at(
-            0,
-            PeerKey::from_raw(1),
-            block_offset(1),
-            &second,
-            t0 + Duration::from_secs(58),
-        )
-        .expect("block 1");
+    assert!(matches!(
+        assembler
+            .insert_at(
+                0,
+                PeerKey::from_raw(1),
+                block_offset(1),
+                &second,
+                t0 + Duration::from_secs(58),
+            )
+            .expect("block 1"),
+        InsertResult::Incomplete(_)
+    ));
     assert!(
         assembler
             .sweep_stalled(t0 + Duration::from_secs(87))
@@ -257,15 +263,18 @@ fn rejected_blocks_do_not_refresh_the_stall_deadline() {
     let (mut assembler, torrent, _spec) = setup_at(len, t0);
     let first = block_bytes(0, BLOCK_LEN);
 
-    assembler
-        .insert_at(
-            0,
-            PeerKey::from_raw(1),
-            0,
-            &first,
-            t0 + Duration::from_secs(10),
-        )
-        .expect("block 0");
+    assert!(matches!(
+        assembler
+            .insert_at(
+                0,
+                PeerKey::from_raw(1),
+                0,
+                &first,
+                t0 + Duration::from_secs(10),
+            )
+            .expect("block 0"),
+        InsertResult::Incomplete(_)
+    ));
     assert_eq!(
         assembler.last_progress(0),
         Some(t0 + Duration::from_secs(10))

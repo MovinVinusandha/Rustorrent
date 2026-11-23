@@ -41,6 +41,7 @@ struct InFlightPiece {
 }
 
 /// Result of a block insertion.
+#[must_use = "a completed piece is dropped, and its assembled bytes are lost, if the result is ignored"]
 pub enum InsertResult {
     /// The block was accepted and the piece is still incomplete.
     Incomplete(InsertOutcome),

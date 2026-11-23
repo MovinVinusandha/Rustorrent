@@ -343,6 +343,25 @@ fn rejected_blocks_leave_the_buffer_untouched() {
 }
 
 #[test]
+fn debug_shows_shape_only_never_the_data() {
+    let len = 2 * BLOCK_LEN;
+    let mut buffer = piece_buffer(len);
+
+    assert_eq!(
+        format!("{buffer:?}"),
+        "PieceBuffer { index: 0, length: 32768, received: 0, .. }"
+    );
+
+    buffer
+        .insert(PeerKey::from_raw(1), 0, &vec![0xAB; BLOCK_LEN])
+        .expect("block 0");
+    assert_eq!(
+        format!("{buffer:?}"),
+        "PieceBuffer { index: 0, length: 32768, received: 1, .. }"
+    );
+}
+
+#[test]
 fn contributors_are_sorted_and_deduplicated() {
     let len = 3 * BLOCK_LEN;
     let mut buffer = piece_buffer(len);

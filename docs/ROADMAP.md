@@ -14,8 +14,27 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     post-sanitization path collisions.
   - [x] 3b. Storage backend: safe file creation, positioned reads/writes via
     `crates/platform`, open-handle cap, preallocation policy.
-  - [ ] 3c. Piece verification: in-memory piece assembly, hash on the blocking
-    pool, write only verified pieces, full recheck.
+  - [ ] 3c. Piece verification, split into separately merged steps.
+    - [~] 3c-1. Storage thread: one owned `Storage` on a dedicated OS thread,
+      bounded request queue and a cloneable async handle (`ReadRange`,
+      `WriteRange`, `Sync`, `Shutdown`); typed errors when the worker is gone,
+      and a drain-then-sync-then-exit shutdown. On
+      `feat/engine-storage-thread`, not merged yet.
+    - [~] 3c-2a. Piece buffer: bounds-checked bitfield, memory budget with RAII
+      reservations, piece specs and peer keys, block assembly with peer
+      attribution, stall expiry, and block-insertion fuzzing. Pure in-memory:
+      it does not use `StorageHandle` and can merge before 3c-1.
+    - [ ] 3c-2b. Piece verification and write path: SHA-1 on the blocking pool
+      with a job cap, and writing verified pieces through
+      `StorageHandle::write_range` in chunks of at most 1 MiB. Planned API:
+      `store_verified(storage, VerifiedPiece) -> Result<StoredPiece, WriteError>`;
+      `StoredPiece` has no public constructor, and
+      `Bitfield::mark_stored(&StoredPiece)` sets the verified bit synchronously,
+      so no `&mut Bitfield` is held across an await. The bit stays false after a
+      failed chunk and becomes true only after `mark_stored`. Starts after 3c-1
+      merges; the ADR, roadmap status, and BEP notes land in that branch.
+    - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
+      the verified bitmap, treat missing or short data as absent.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files

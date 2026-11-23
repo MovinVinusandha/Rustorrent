@@ -64,7 +64,7 @@ Repair rules, applied per component, in order:
 | `/` or `\` | `_` |
 | ASCII control character, NUL, DEL | `_` |
 | `<` `>` `:` `"` `|` `?` `*` | `_` |
-| Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, case-insensitive, with or without extension) | prefix `_` |
+| Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `CLOCK$`, `COM1`-`COM9`, `LPT1`-`LPT9`, `COM¹`-`COM³`, `LPT¹`-`LPT³`, case-insensitive, with or without extension) | prefix `_` |
 | trailing dots or spaces | replaced with `_` |
 | component longer than 255 bytes | truncate at a UTF-8 boundary to 255 bytes minus suffix, append `~` plus 8 hex chars of SHA-1 of the original component |
 
@@ -147,17 +147,19 @@ No other module re-derives paths from `MetaInfo`.
   from torrent data.
 - `canonicalize()` is not used: it races and fails for files that do not exist
   yet.
-- 3b checks every torrent-derived component with `symlink_metadata` immediately
-  before creating or opening it and rejects symlinks and Windows reparse
-  points. The check runs per component, not only on the final path, so a
-  symlinked parent cannot redirect the join.
+- 3b re-checks every ancestor component with `symlink_metadata` on every open:
+  reads, writes, lazy creation, and the reopen that `sync` performs. Symlinks
+  and Windows reparse points are rejected, so a parent swapped after `open`
+  cannot redirect the join. On Unix the opened handle's `(dev, ino)` from
+  `fstat` must match the metadata that was just checked, which narrows the
+  check-then-open window. Nothing compares inode identity on Windows.
 - v0.1 deliberately does not use `openat`, `windows-sys`, or `unsafe` for
-  handle-relative traversal. `symlink_metadata` is check-then-use, so a local
-  attacker who can write to the download tree could swap a component between
-  the check and the open (TOCTOU). This is accepted for v0.1: the download
-  root is user-controlled, the check fails closed in every non-racing case,
-  and 3b repeats it before each create/open. Handle-relative traversal is a
-  later hardening item, not a v0.1 blocker.
+  handle-relative traversal. `symlink_metadata` plus the Unix `fstat` check is
+  still check-then-use, so an attacker who can write to the download tree could
+  swap a component between the check and the open (TOCTOU). This is out of
+  scope for v0.1: the download root is user-controlled, the check fails closed
+  in every non-racing case, and the backend repeats it before every open.
+  Handle-relative traversal is a later hardening item, not a v0.1 blocker.
 - A component that is a symlink/reparse point, or the wrong kind (file where a
   directory is expected, or vice versa), is a typed `Error::UnsafePath`.
 - Before creation, the joined relative path is checked: not absolute, no `..`,
@@ -213,12 +215,12 @@ down instead of growing memory.
 ### 5. Handles, preallocation, fsync, disk full
 
 - **Open handles:** LRU cache of at most 64 handles per session, configurable.
-  The cache tracks a dirty set: handles written since the last sync. Evicted
-  handles are closed. A dirty handle is `sync_data`-ed before eviction, or
-  reopened when a later sync needs it, so no dirty data is lost. Resume writes
-  cover all dirty files. A single piece write may touch several files and
-  temporarily exceed the cap by that number; the overshoot is bounded by the
-  number of files a piece spans.
+  The cache tracks a dirty set: files written since the last sync. Eviction
+  never fsyncs; the index is recorded and `sync` reopens it read-write later.
+  Reads open files read-only, and a cached handle is upgraded only when a write
+  or a pending sync needs one. Pieces are processed one segment at a time, so
+  the cache never holds more than the cap; a transient handle for a sync reopen
+  or a lazy create puts peak usage at `capacity + 1`.
 - **Preallocation:** optional policy, off by default. v0.1 does not rely on
   sparse files: on Windows, NTFS zero-fills a write far beyond EOF, so `set_len`
   does not guarantee sparse allocation. When enabled, 3b may `set_len` on Unix
@@ -226,8 +228,12 @@ down instead of growing memory.
   or short files mean those pieces are absent and are rechecked. Fragmentation
   is acceptable.
 - **fsync:** no per-piece fsync. `sync_data` runs on pause, stop, and graceful
-  shutdown. Every resume write first syncs all dirty files, reopening any that
-  were evicted. Resume files use temp file + `sync_all` + rename +
+  shutdown, and dropping a `Storage` performs no sync. 3d must call
+  `Storage::sync()` before every resume write. `sync` attempts every pending
+  file, clears only the ones that succeeded so a failure can be retried, and
+  returns the first error; `close` drops the cache only after a successful
+  sync. Every resume write therefore starts from a complete flush, reopening
+  any file that was evicted. Resume files use temp file + `sync_all` + rename +
   parent-directory sync.
 - **Disk full:** `ENOSPC` / `ERROR_DISK_FULL` / `ERROR_HANDLE_DISK_FULL` map to
   `Error::DiskFull`. The torrent stops writing, keeps the verified bitmap for
@@ -318,6 +324,53 @@ e
   release binary. Property tests use 64 cases per property to keep CI quick.
 - No other dependency is added for 3a; the layout uses `std` only.
 
+## Threat model
+
+In scope for v0.1:
+
+- a malicious `.torrent`: path traversal, absolute paths, drive and UNC syntax,
+  Windows device and reserved names, case and post-sanitization collisions,
+  oversized components;
+- a malicious peer or tracker: arbitrary piece payloads, malformed messages,
+  oversized, short, or zero-length ranges;
+- corrupt or truncated resume data: falls back to a recheck and never blocks the
+  torrent;
+- an existing on-disk tree: a symlink or reparse point anywhere below the
+  download root is rejected before any read or write through it, including a
+  component swapped after `open`.
+
+Out of scope for v0.1:
+
+- an attacker who can already write to the download directory. Such an attacker
+  can replace a component between the final check and the open (TOCTOU), or
+  plant a hard link in advance. Closing that window needs handle-relative
+  traversal (`openat`/`openat2` with `RESOLVE_BENEATH` on Linux, reparse-point
+  handles on Windows), which v0.1 does not use.
+- a compromised local account or a hostile kernel.
+
+## Known limitations
+
+- **Hard links are accepted.** The backend does not reject `nlink > 1`:
+  hard-linked media libraries are a common, legitimate setup. The device +
+  inode check only rejects two mapped paths that resolve to the same inode, so
+  a hard link inside the root that points at a file outside it is read and
+  written in place. On Linux `fs.protected_hardlinks=1` (the default on most
+  distributions) stops an unprivileged process from linking to a file it does
+  not own. Windows has no stable file-index accessor in `std`, so duplicate
+  hard links there are caught only by the case-folded layout keys.
+- **Peak handle usage is `capacity + 1`.** The cache itself never exceeds
+  `max_open_handles`, but a sync reopen and a lazy create each hold one
+  transient handle outside it.
+- **No implicit sync.** Dropping a `Storage` closes its handles without
+  flushing. Callers must call `sync` or `close`; 3d calls `sync` before every
+  resume write.
+- **`set_len` is not shrink-proof against a race.** Preallocation re-reads the
+  length from the opened handle and only extends a short file, but another
+  process can grow the file between that `fstat` and `set_len`.
+- **Unicode normalization is not applied.** An NFC/NFD pair can alias on macOS;
+  on Unix the inode check reports it as a typed error, and case folding is
+  `str::to_lowercase`.
+
 ## Consequences
 
 Positive:
@@ -366,9 +419,8 @@ Negative:
 ## Open questions
 
 - LRU handle cap 64: measure real usage with many-file torrents before fixing.
-- v0.1 accepts the `symlink_metadata` TOCTOU window. Revisit handle-relative
-  traversal (`openat` on Unix, reparse-point handles on Windows) if the threat
-  model changes.
+- Revisit handle-relative traversal (`openat` on Unix, reparse-point handles on
+  Windows) only if the threat model changes; see "Threat model" above.
 
 ## Implementation notes
 
@@ -390,12 +442,27 @@ where the code differs from the design above.
 - **The handle cap is strict.** The design allowed a piece write spanning
   several files to overshoot the cap by that many handles. 3b instead opens,
   uses, and releases one segment at a time, so the cache never holds more than
-  `max_open_handles`; the overshoot is zero.
+  `max_open_handles`. Transient handles are the exception: a sync reopen and a
+  lazy create each hold one outside the cache, so peak usage is `capacity + 1`.
 - **Eviction defers fsync.** Evicting a dirty handle never calls `sync_data`.
   The file index is recorded in a `needs_sync` set; `sync()` and `close()`
   flush cached dirty handles and reopen evicted ones read-write with `open_rw`
   before `sync_data`. Reopening a file the user deleted is a typed
-  `StorageError`, not a silent recreation.
+  `StorageError`, not a silent recreation. `sync` attempts every pending file,
+  removes only successes, and returns the first error; `close` drops the cache
+  only after a successful sync, so a failed flush can be retried.
+- **Ancestors are re-checked on every open.** `read_range`, the lazy create in
+  `write_range`, and the `sync` reopen walk every parent component with
+  `symlink_metadata` before opening, so a component swapped after `open` is
+  rejected. On Unix the opened handle's `(dev, ino)` is compared with the
+  metadata that was just checked; a mismatch is
+  `UnsafePath { reason: Changed }`.
+- **Reads are read-only.** `read_range` opens with `open_read`; a cached handle
+  is reopened read-write only when a write or a pending sync needs one, so a
+  read works on a file or mount without write permission.
+- **Preallocation re-reads the length.** `extend_if_short` takes the length
+  from the opened handle instead of the `lstat` that triggered it, so a stale
+  length cannot shrink a file.
 - **Preallocation `Off` is lazy.** Zero-length files and their parents are
   created during `open`; non-zero files and their parents are created on the
   first write. `SetLen` creates every file during `open` and extends only

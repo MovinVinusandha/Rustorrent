@@ -7,6 +7,9 @@ description: Use when writing code that creates, reads, writes, or deletes files
 - Every on-disk path is derived from sanitized components and verified to
   stay inside the download root after joining. Never join raw torrent strings.
 - Never follow a symlink out of the root. Check parents before creating files.
+- Re-validate every ancestor component with `symlink_metadata` on every file
+  open, not only during setup, and compare the opened handle's identity with
+  the metadata that was just checked.
 - Deleting torrent data deletes only files this torrent created, never
   directories outside the root.
 

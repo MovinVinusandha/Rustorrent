@@ -1,7 +1,9 @@
-//! On-disk storage layout.
+//! On-disk storage.
 //!
-//! Roadmap 3a is pure: it sanitizes torrent paths and maps files to byte and
-//! piece ranges without touching the filesystem. The storage backend is added
-//! in 3b.
+//! `layout` is pure path and range mapping. `backend` validates torrent paths
+//! under the download root and owns file I/O.
 
+pub mod backend;
 pub mod layout;
+
+pub use backend::{Preallocation, Storage, StorageConfig, StorageError, UnsafeReason};

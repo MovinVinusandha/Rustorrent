@@ -27,7 +27,7 @@ const MAX_COLLISION_ATTEMPTS: u32 = 10_000;
 /// The result is non-empty, at most [`MAX_COMPONENT_BYTES`] bytes, free of
 /// path separators and Windows-invalid characters, not a reserved device name,
 /// and does not end in a dot or space. The function is idempotent.
-fn sanitize_component(input: &str) -> String {
+pub(crate) fn sanitize_component(input: &str) -> String {
     let repaired = repair_component(input);
     if repaired.len() <= MAX_COMPONENT_BYTES {
         return repaired;
@@ -321,6 +321,22 @@ impl FileMap {
             piece_length: meta.piece_length,
             piece_count,
         })
+    }
+
+    /// Builds a map directly for tests that need unsanitized components.
+    #[cfg(test)]
+    pub(crate) fn from_mapped_files(
+        files: Vec<MappedFile>,
+        total_length: u64,
+        piece_length: u64,
+        piece_count: u32,
+    ) -> Self {
+        Self {
+            files,
+            total_length,
+            piece_length,
+            piece_count,
+        }
     }
 
     /// Files in torrent order.

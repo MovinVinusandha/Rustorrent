@@ -171,11 +171,16 @@ impl PieceBuffer {
             });
         }
 
-        if self
+        // Fetch the slot before touching the data so every rejection below is
+        // a pure read. `block_len` above already proved the index is in range.
+        let peer_slot = self
             .peers
-            .get(block_index)
-            .is_some_and(|peer| peer.is_some())
-        {
+            .get_mut(block_index)
+            .ok_or(BlockError::OutOfRange {
+                offset,
+                piece_len: self.spec.length(),
+            })?;
+        if peer_slot.is_some() {
             return Err(BlockError::Duplicate { block });
         }
 
@@ -193,14 +198,6 @@ impl PieceBuffer {
                 piece_len: self.spec.length(),
             })?;
         target.copy_from_slice(bytes);
-
-        let peer_slot = self
-            .peers
-            .get_mut(block_index)
-            .ok_or(BlockError::OutOfRange {
-                offset,
-                piece_len: self.spec.length(),
-            })?;
         *peer_slot = Some(peer);
         self.received = self.received.saturating_add(1);
 

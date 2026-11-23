@@ -20,6 +20,14 @@
 //! deadlock the budget: the largest accepted piece is `MAX_PIECE_LENGTH`
 //! (64 MiB), it fits in the default 128 MiB global budget, and a global budget
 //! smaller than one piece is rejected when the torrent budget is created.
+//!
+//! ## Counters are statistics
+//!
+//! [`MemoryBudget::in_use_bytes`], [`TorrentBudget::in_use_bytes`], and
+//! [`MemoryBudget::available_bytes`] are `Relaxed` counters for dashboards.
+//! They are decremented just before the permits are released, so they can
+//! transiently read zero while a waiter is still blocked. Admission is decided
+//! only by the semaphores; never gate work on these values.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

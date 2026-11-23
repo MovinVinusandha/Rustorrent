@@ -16,6 +16,14 @@
 //! Every block records an engine-assigned [`PeerKey`]. On a hash failure the
 //! engine re-requests the full piece; the contributor list is for later
 //! statistical blame, not an immediate ban.
+//!
+//! ## Memory accounting
+//!
+//! The [`PieceReservation`] covers the piece data only. The per-block peer
+//! array costs `size_of::<Option<PeerKey>>()` (16 bytes) per 16 KiB block, at
+//! most 64 KiB for a 64 MiB piece, and the 3c-2b verification path adds a
+//! chunked write copy of at most 1 MiB. Both are small, bounded, outside the
+//! budget, and never sized by peer input.
 
 use std::collections::BTreeSet;
 use std::fmt;

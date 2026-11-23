@@ -12,6 +12,11 @@
 //! blocks do not refresh the deadline, so a peer cannot keep a dead piece
 //! alive by resending junk.
 //!
+//! [`PieceAssembler::insert`] does not check the deadline, so a block arriving
+//! after it but before the next sweep is accepted and refreshes it. An engine
+//! that wants strict expiry must sweep before accepting blocks; either way it
+//! must sweep on a timer, because expiry happens only on an explicit call.
+//!
 //! Completing a piece removes its buffer from the assembler and returns it to
 //! the caller. A block that arrives after completion (or after stall expiry)
 //! is [`PieceError::NotStarted`], which is benign endgame/latency noise rather

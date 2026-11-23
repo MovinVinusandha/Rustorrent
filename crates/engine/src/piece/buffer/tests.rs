@@ -14,7 +14,7 @@ fn spec(length: usize) -> PieceSpec {
 fn torrent_budget(length: usize) -> TorrentBudget {
     let budget = MemoryBudget::new(128 * MIB).expect("memory budget");
     let declared = u64::try_from(length).expect("length fits u64");
-    budget.per_torrent(declared).expect("torrent budget")
+    budget.torrent_budget(declared).expect("torrent budget")
 }
 
 fn piece_buffer(length: usize) -> PieceBuffer {

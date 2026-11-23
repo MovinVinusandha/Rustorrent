@@ -1,7 +1,11 @@
 //! Byte budget for piece buffers.
 //!
-//! A session owns one [`MemoryBudget`] and each torrent gets a
-//! [`TorrentBudget`] derived from its piece length. A caller reserves the
+//! A session owns one [`MemoryBudget`] and each torrent gets one
+//! [`TorrentBudget`] derived from its piece length. Call
+//! [`MemoryBudget::torrent_budget`] **once per torrent** and clone the returned
+//! handle for every task that reserves buffers: each call creates independent
+//! slots and counters, so a second call for the same torrent doubles its
+//! per-torrent limits (the global budget still applies). A caller reserves the
 //! actual piece length before allocating a buffer; the returned
 //! [`PieceReservation`] releases both the per-torrent slot and the global bytes
 //! when it is dropped, on every path: successful write, hash failure,
@@ -65,21 +69,13 @@ pub enum BudgetError {
     /// A reservation was requested with zero bytes.
     #[error("piece reservation must be greater than zero bytes")]
     ZeroLength,
-    /// A reservation is larger than this torrent's share.
-    #[error("reservation of {requested} bytes exceeds the per-torrent share {share}")]
-    ExceedsShare {
+    /// A reservation is larger than one piece of this torrent.
+    #[error("reservation of {requested} bytes exceeds the piece length {piece_length}")]
+    ExceedsPieceLength {
         /// Requested bytes.
         requested: usize,
-        /// Per-torrent share in bytes.
-        share: u64,
-    },
-    /// A reservation is larger than the global budget.
-    #[error("reservation of {requested} bytes exceeds the global budget {global}")]
-    ExceedsGlobal {
-        /// Requested bytes.
-        requested: usize,
-        /// Global budget in bytes.
-        global: u64,
+        /// Piece length in bytes.
+        piece_length: u64,
     },
     /// A computed value does not fit the platform representation.
     #[error("piece budget value {value} does not fit this platform")]
@@ -136,13 +132,18 @@ impl MemoryBudget {
         self.capacity.saturating_sub(self.in_use_bytes())
     }
 
-    /// Derives the per-torrent budget for `piece_length`.
+    /// Creates the budget for one torrent.
+    ///
+    /// Call this **once per torrent** and clone the returned handle for every
+    /// task that reserves buffers. Each call creates independent slots and
+    /// counters, so calling it twice for the same torrent doubles that
+    /// torrent's limits; only the global budget still applies.
     ///
     /// The share is `min(2 * piece_length, 64 MiB)` and the number of
     /// concurrent buffers is `max(1, share / piece_length)`. A piece length
     /// larger than the global budget is rejected here, before any request can
     /// wait forever.
-    pub fn per_torrent(&self, piece_length: u64) -> Result<TorrentBudget, BudgetError> {
+    pub fn torrent_budget(&self, piece_length: u64) -> Result<TorrentBudget, BudgetError> {
         if piece_length == 0 {
             return Err(BudgetError::ZeroPieceLength);
         }
@@ -166,7 +167,6 @@ impl MemoryBudget {
 
         Ok(TorrentBudget {
             global: Arc::clone(&self.bytes),
-            global_capacity: self.capacity,
             global_in_use: Arc::clone(&self.in_use),
             torrent_in_use: Arc::new(AtomicUsize::new(0)),
             slots: Arc::new(Semaphore::new(slot_count)),
@@ -181,7 +181,6 @@ impl MemoryBudget {
 #[derive(Clone)]
 pub struct TorrentBudget {
     global: Arc<Semaphore>,
-    global_capacity: u64,
     global_in_use: Arc<AtomicUsize>,
     torrent_in_use: Arc<AtomicUsize>,
     slots: Arc<Semaphore>,
@@ -236,7 +235,11 @@ impl TorrentBudget {
         Ok(self.finish_reservation(bytes, slot, global))
     }
 
-    /// Per-torrent share in bytes.
+    /// Per-torrent concurrency share in bytes.
+    ///
+    /// This is `min(2 * piece_length, 64 MiB)` and caps the bytes the torrent
+    /// may hold across concurrent buffers. A single reservation is still
+    /// capped at one piece length by [`TorrentBudget::reserve`].
     pub fn share(&self) -> u64 {
         self.share
     }
@@ -268,16 +271,10 @@ impl TorrentBudget {
         }
         let requested =
             u64::try_from(bytes).map_err(|_| BudgetError::CountOverflow { value: u64::MAX })?;
-        if requested > self.share {
-            return Err(BudgetError::ExceedsShare {
+        if requested > self.piece_length {
+            return Err(BudgetError::ExceedsPieceLength {
                 requested: bytes,
-                share: self.share,
-            });
-        }
-        if requested > self.global_capacity {
-            return Err(BudgetError::ExceedsGlobal {
-                requested: bytes,
-                global: self.global_capacity,
+                piece_length: self.piece_length,
             });
         }
         u32::try_from(bytes).map_err(|_| BudgetError::CountOverflow { value: requested })

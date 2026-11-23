@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
 
     let budget = MemoryBudget::new(GLOBAL_BUDGET).expect("memory budget");
     let torrent = budget
-        .per_torrent(piece_len as u64)
+        .torrent_budget(piece_len as u64)
         .expect("torrent budget");
     let reservation = torrent.try_reserve(piece_len).expect("reservation");
     let spec = PieceSpec::new(0, 0, piece_len, [0; 20]).expect("piece spec");

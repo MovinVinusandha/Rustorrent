@@ -13,7 +13,9 @@ fn memory_budget(mib: u64) -> MemoryBudget {
 }
 
 fn torrent(budget: &MemoryBudget, piece_mib: u64) -> TorrentBudget {
-    budget.per_torrent(piece_mib * MIB).expect("torrent budget")
+    budget
+        .torrent_budget(piece_mib * MIB)
+        .expect("torrent budget")
 }
 
 fn bytes(mib: u64) -> usize {
@@ -38,7 +40,7 @@ fn memory_budget_rejects_invalid_capacity() {
 }
 
 #[test]
-fn per_torrent_share_and_slots_follow_the_adr() {
+fn torrent_budget_share_and_slots_follow_the_adr() {
     let budget = memory_budget(128);
     let cases = [
         (1u64, 2u64, 2usize),
@@ -63,11 +65,11 @@ fn per_torrent_share_and_slots_follow_the_adr() {
 fn torrent_budget_rejects_bad_piece_lengths() {
     let budget = memory_budget(128);
     assert_eq!(
-        budget.per_torrent(0).err(),
+        budget.torrent_budget(0).err(),
         Some(BudgetError::ZeroPieceLength)
     );
     assert!(matches!(
-        budget.per_torrent(MAX_PIECE_LENGTH + 1),
+        budget.torrent_budget(MAX_PIECE_LENGTH + 1),
         Err(BudgetError::PieceTooLarge {
             piece_length,
             max,
@@ -76,7 +78,7 @@ fn torrent_budget_rejects_bad_piece_lengths() {
 
     let small = memory_budget(1);
     assert!(matches!(
-        small.per_torrent(2 * MIB),
+        small.torrent_budget(2 * MIB),
         Err(BudgetError::GlobalTooSmall {
             piece_length,
             global,
@@ -121,20 +123,34 @@ async fn invalid_reservations_are_rejected_without_waiting() {
     let torrent = torrent(&budget, 1);
 
     assert_eq!(torrent.try_reserve(0).err(), Some(BudgetError::ZeroLength));
-    assert!(matches!(
-        torrent.try_reserve(bytes(3)),
-        Err(BudgetError::ExceedsShare { requested, share })
-            if requested == bytes(3) && share == 2 * MIB
-    ));
+    assert_eq!(
+        torrent.try_reserve(bytes(3)).err(),
+        Some(BudgetError::ExceedsPieceLength {
+            requested: bytes(3),
+            piece_length: MIB,
+        })
+    );
 
-    let small = MemoryBudget::new(MIB + MIB / 2).expect("small budget");
-    let small_torrent = small.per_torrent(MIB).expect("torrent");
-    assert!(matches!(
-        small_torrent.try_reserve(bytes(2)),
-        Err(BudgetError::ExceedsGlobal { requested, global })
-            if requested == bytes(2) && global == MIB + MIB / 2
-    ));
+    assert_eq!(budget.in_use_bytes(), 0);
+    assert_eq!(torrent.in_flight(), 0);
+}
 
+#[test]
+fn a_reservation_larger_than_one_piece_length_is_rejected() {
+    let budget = memory_budget(8);
+    let torrent = torrent(&budget, 1);
+
+    // The old cap was the share (two piece lengths), which let one buffer
+    // reserve twice the memory it can actually use.
+    for requested in [bytes(2), bytes(3)] {
+        assert_eq!(
+            torrent.try_reserve(requested).err(),
+            Some(BudgetError::ExceedsPieceLength {
+                requested,
+                piece_length: MIB,
+            })
+        );
+    }
     assert_eq!(budget.in_use_bytes(), 0);
     assert_eq!(torrent.in_flight(), 0);
 }
@@ -193,7 +209,7 @@ async fn global_budget_blocks_until_a_reservation_is_dropped() {
 }
 
 #[tokio::test]
-async fn per_torrent_slots_limit_a_third_buffer() {
+async fn torrent_slots_limit_a_third_buffer() {
     let budget = memory_budget(128);
     let torrent = torrent(&budget, 1);
 

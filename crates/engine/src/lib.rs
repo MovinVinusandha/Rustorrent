@@ -7,6 +7,7 @@
 pub mod bencode;
 pub mod bitfield;
 pub mod metainfo;
+pub mod piece;
 pub mod storage;
 
 /// Version of the engine API spoken by this build.

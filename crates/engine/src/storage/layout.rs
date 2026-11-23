@@ -71,11 +71,29 @@ fn is_reserved_name(component: &str) -> bool {
     let stem = stem.trim_end_matches([' ', '.']);
     let upper = stem.to_ascii_uppercase();
 
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.as_bytes()[3].is_ascii_digit()
-            && upper.as_bytes()[3] != b'0')
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || is_device_name(&upper)
+}
+
+/// Returns `true` for `COM`/`LPT` followed by one device number.
+///
+/// Windows reserves `COM1`-`COM9` and `LPT1`-`LPT9`, plus the superscript forms
+/// `COM¹`-`COM³` and `LPT¹`-`LPT³`.
+fn is_device_name(upper: &str) -> bool {
+    let Some(rest) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+
+    let mut characters = rest.chars();
+    matches!(
+        (characters.next(), characters.next()),
+        (Some('1'..='9' | '\u{00b9}' | '\u{00b2}' | '\u{00b3}'), None)
+    )
 }
 
 /// Truncates a repaired component to the cap and appends a deterministic hash

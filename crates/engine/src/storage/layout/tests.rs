@@ -17,6 +17,10 @@ fn adversarial_component() -> impl Strategy<Value = String> {
         Just("CON".to_owned()),
         Just("con.txt".to_owned()),
         Just("COM1".to_owned()),
+        Just("COM¹".to_owned()),
+        Just("lpt³".to_owned()),
+        Just("CONIN$".to_owned()),
+        Just("CLOCK$".to_owned()),
         Just("lpt9.tar.gz".to_owned()),
         Just("..".to_owned()),
         Just(".".to_owned()),
@@ -29,11 +33,25 @@ fn is_windows_reserved(component: &str) -> bool {
     let stem = component.split('.').next().unwrap_or(component);
     let stem = stem.trim_end_matches([' ', '.']);
     let upper = stem.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.as_bytes()[3].is_ascii_digit()
-            && upper.as_bytes()[3] != b'0')
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || is_windows_device_name(&upper)
+}
+
+fn is_windows_device_name(upper: &str) -> bool {
+    let Some(rest) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+
+    let mut characters = rest.chars();
+    matches!(
+        (characters.next(), characters.next()),
+        (Some('1'..='9' | '\u{00b9}' | '\u{00b2}' | '\u{00b3}'), None)
+    )
 }
 
 fn assert_windows_safe(component: &str) {
@@ -81,16 +99,25 @@ fn replaces_invalid_and_control_characters() {
 #[test]
 fn prefixes_windows_reserved_names() {
     for name in [
-        "CON", "con", "PRN", "aux", "NUL", "COM1", "com9", "LPT1", "lpt9",
+        "CON", "con", "PRN", "aux", "NUL", "COM1", "com9", "LPT1", "lpt9", "CONIN$", "conin$",
+        "CONOUT$", "CLOCK$", "clock$",
     ] {
+        let sanitized = sanitize_component(name);
+        assert_eq!(sanitized, format!("_{name}"));
+        assert_windows_safe(&sanitized);
+    }
+    for name in ["COM¹", "COM²", "COM³", "lpt¹", "LPT³"] {
         let sanitized = sanitize_component(name);
         assert_eq!(sanitized, format!("_{name}"));
         assert_windows_safe(&sanitized);
     }
     assert_eq!(sanitize_component("CON.txt"), "_CON.txt");
     assert_eq!(sanitize_component("con.tar.gz"), "_con.tar.gz");
+    assert_eq!(sanitize_component("CONIN$.txt"), "_CONIN$.txt");
     assert_eq!(sanitize_component("COM0"), "COM0");
     assert_eq!(sanitize_component("COM10"), "COM10");
+    assert_eq!(sanitize_component("COM⁴"), "COM⁴");
+    assert_eq!(sanitize_component("COM⁰"), "COM⁰");
 }
 
 #[test]
@@ -127,6 +154,10 @@ fn sanitization_is_idempotent() {
         "C:\\x",
         "C:x",
         "CON.txt",
+        "CONIN$",
+        "CLOCK$",
+        "COM¹",
+        "lpt³",
         "foo..  ",
         "é",
         "e\u{301}",

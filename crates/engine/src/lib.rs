@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bencode;
+pub mod bitfield;
 pub mod metainfo;
 pub mod storage;
 

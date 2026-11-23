@@ -486,26 +486,40 @@ where the code differs from the design above.
   hashing never runs on the storage thread. Piece writes are split into 1 MiB
   chunks, and a verified bit is set only after every chunk succeeds.
 - **The queue is bounded by count and payload.** Capacity is 64 requests and
-  every range is capped at 1 MiB, so queued request payload is at most 64 MiB.
-  A full queue leaves `send().await` pending; no runtime worker blocks. A
-  cancelled caller's enqueued write may still execute, and per-sender order is
-  FIFO, so retrying the same verified bytes at the same offset is safe.
+  every range is capped at 1 MiB, so queued write payload is at most 64 MiB.
+  The bound does not cover callers blocked in `reserve`, which each hold their
+  request buffer, nor read replies, which add up to 1 MiB each; 3c-2 must bound
+  its own concurrent callers. A full queue leaves `send().await` pending; no
+  runtime worker blocks. A cancelled caller's enqueued write may still execute,
+  and sequential requests from one handle keep FIFO order, so retrying the same
+  verified bytes at the same offset is safe.
 - **Shutdown reserves before it commits.** `shutdown()` reserves a queue slot,
   sets an atomic flag with `compare_exchange`, then sends `Shutdown` through
   the permit. Dropping the future while it waits for a slot leaves the handle
-  usable. After the flag is set, new requests fail with `ShuttingDown`; a
-  request that races past the flag and lands after `Shutdown` fails with
-  `WorkerStopped` when the channel is dropped.
-- **Shutdown drops the storage before replying.** The worker drains every
-  request queued before `Shutdown`, calls `Storage::close()`, sets the storage
-  to `None` so every file handle is closed, and only then replies. A failed
-  final sync is returned and the worker still exits; a caller that needs a
-  retry calls `sync()` first. Dropping the last handle is a best-effort close
-  with no error reporting; `shutdown()` is the reportable path.
+  usable; dropping it after the flag is set still shuts the worker down, and a
+  retry gets `ShuttingDown`. After the flag is set, new requests fail with
+  `ShuttingDown`.
+- **Requests behind `Shutdown` never execute.** The worker breaks out of the
+  receive loop, calls `Receiver::close()` (tokio still lets an outstanding
+  `Permit` append a message), then drains `try_recv()` and answers each
+  leftover with `ShuttingDown`. A request appended after the drain is dropped
+  with the queue and its caller gets `WorkerStopped`.
+- **Shutdown drops the storage before replying.** The worker drains queued
+  requests, calls `Storage::close()`, drops the `Storage` so every file handle
+  is closed, and only then replies. A failed final sync is returned and the
+  worker still exits; a caller that needs a retry calls `sync()` first.
+  Dropping the last handle is a best-effort close with no error reporting;
+  `shutdown()` is the reportable path.
 - **Worker panic policy.** In unwind builds a panic drops the receiver, and
-  pending and future requests get `WorkerStopped`. Release builds use
-  `panic = "abort"`, so a worker panic aborts the process. There is no
-  `catch_unwind`; this is accepted for v0.1.
+  pending and future requests get `WorkerStopped`. The panic unwinds past
+  `Storage::close()`, so dirty data is not flushed; release builds use
+  `panic = "abort"` and abort the process instead. There is no `catch_unwind`;
+  this is accepted for v0.1.
+- **No request timeouts.** A request waits for its reply indefinitely, and
+  `shutdown()` waits behind other requests like any caller. A syscall that
+  never returns (a hung mount, a removed USB disk) blocks the storage thread
+  and with it every request for that torrent. The item-10 session pool is the
+  mitigation for the session; per-request timeouts are not part of 3c-1.
 - **Thread and features.** The thread is named `bt-storage` and uses a 512 KiB
   stack. `bt-engine` enables only the tokio `sync` and `rt` features; `macros`
   and `time` are dev-dependencies. The stripped release `bt-tui` binary stayed

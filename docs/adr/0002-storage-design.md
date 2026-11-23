@@ -473,3 +473,54 @@ where the code differs from the design above.
   overflow `u64` or exceed the total length, and a failed write may leave a
   partial range on disk, so verified state is set only after a complete
   success.
+- **3c-1 worker scope is temporary.** There is one `Storage` and one
+  `bt-storage` thread per torrent for now, so the 64-handle cap is per torrent.
+  Ten torrents can hold 640 descriptors while macOS defaults to a soft limit of
+  256. Item 10 adds a session pool with a global handle budget; the
+  `StorageHandle` methods stay the same.
+- **Commands are range-based.** The worker accepts `ReadRange` (at most 1 MiB,
+  replying with a `Vec<u8>`), `WriteRange` (at most 1 MiB), `Sync`, and
+  `Shutdown`. `Open` is not a command: root, map, and config move into the
+  worker closure and `Storage::open` runs there. There is no `Recheck`
+  command; 3c-3 streams `ReadRange` chunks and hashes above the worker, so
+  hashing never runs on the storage thread. Piece writes are split into 1 MiB
+  chunks, and a verified bit is set only after every chunk succeeds.
+- **The queue is bounded by count and payload.** Capacity is 64 requests and
+  every range is capped at 1 MiB, so queued write payload is at most 64 MiB.
+  The bound does not cover callers blocked in `reserve`, which each hold their
+  request buffer, nor read replies, which add up to 1 MiB each; 3c-2 must bound
+  its own concurrent callers. A full queue leaves `send().await` pending; no
+  runtime worker blocks. A cancelled caller's enqueued write may still execute,
+  and sequential requests from one handle keep FIFO order, so retrying the same
+  verified bytes at the same offset is safe.
+- **Shutdown reserves before it commits.** `shutdown()` reserves a queue slot,
+  sets an atomic flag with `compare_exchange`, then sends `Shutdown` through
+  the permit. Dropping the future while it waits for a slot leaves the handle
+  usable; dropping it after the flag is set still shuts the worker down, and a
+  retry gets `ShuttingDown`. After the flag is set, new requests fail with
+  `ShuttingDown`.
+- **Requests behind `Shutdown` never execute.** The worker breaks out of the
+  receive loop, calls `Receiver::close()` (tokio still lets an outstanding
+  `Permit` append a message), then drains `try_recv()` and answers each
+  leftover with `ShuttingDown`. A request appended after the drain is dropped
+  with the queue and its caller gets `WorkerStopped`.
+- **Shutdown drops the storage before replying.** The worker drains queued
+  requests, calls `Storage::close()`, drops the `Storage` so every file handle
+  is closed, and only then replies. A failed final sync is returned and the
+  worker still exits; a caller that needs a retry calls `sync()` first.
+  Dropping the last handle is a best-effort close with no error reporting;
+  `shutdown()` is the reportable path.
+- **Worker panic policy.** In unwind builds a panic drops the receiver, and
+  pending and future requests get `WorkerStopped`. The panic unwinds past
+  `Storage::close()`, so dirty data is not flushed; release builds use
+  `panic = "abort"` and abort the process instead. There is no `catch_unwind`;
+  this is accepted for v0.1.
+- **No request timeouts.** A request waits for its reply indefinitely, and
+  `shutdown()` waits behind other requests like any caller. A syscall that
+  never returns (a hung mount, a removed USB disk) blocks the storage thread
+  and with it every request for that torrent. The item-10 session pool is the
+  mitigation for the session; per-request timeouts are not part of 3c-1.
+- **Thread and features.** The thread is named `bt-storage` and uses a 512 KiB
+  stack. `bt-engine` enables only the tokio `sync` and `rt` features; `macros`
+  and `time` are dev-dependencies. The stripped release `bt-tui` binary stayed
+  at 770,856 bytes.

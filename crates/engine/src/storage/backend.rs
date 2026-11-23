@@ -360,6 +360,12 @@ impl Storage {
         Ok(())
     }
 
+    /// Number of open file handles, so tests can see that eviction happened.
+    #[cfg(test)]
+    pub(super) fn open_handle_count(&self) -> usize {
+        self.handles.entries.len()
+    }
+
     /// Creates one file and its parents on first write, re-checking the path.
     ///
     /// Returns the identity of an existing file so the caller can verify the

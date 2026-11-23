@@ -15,11 +15,10 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
   - [x] 3b. Storage backend: safe file creation, positioned reads/writes via
     `crates/platform`, open-handle cap, preallocation policy.
   - [ ] 3c. Piece verification, split into separately merged steps.
-    - [~] 3c-1. Storage thread: one owned `Storage` on a dedicated OS thread,
-      bounded request queue and a cloneable async handle (`ReadRange`,
+    - [x] 3c-1. Storage thread: one owned `Storage` on a dedicated OS thread,
+      bounded request queue and a cloneable async handle (`Open`, `ReadRange`,
       `WriteRange`, `Sync`, `Shutdown`); typed errors when the worker is gone,
-      and a drain-then-sync-then-exit shutdown. On
-      `feat/engine-storage-thread`, not merged yet.
+      and a drain-then-sync-then-exit shutdown.
     - [x] 3c-2a. Piece buffer: bounds-checked bitfield, memory budget with RAII
       reservations, piece specs and peer keys, block assembly with peer
       attribution, stall expiry, and block-insertion fuzzing. Pure in-memory:
@@ -32,15 +31,17 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       `Bitfield::mark_stored(&StoredPiece)` sets the verified bit synchronously,
       so no `&mut Bitfield` is held across an await. The bit stays false after a
       failed chunk and becomes true only after `mark_stored`. The 1 MiB chunk
-      copy is outside the piece budget (bounded, not peer-sized). Starts after
-      3c-1 merges; the ADR, roadmap status, and BEP notes land in that branch.
+      copy is outside the piece budget (bounded, not peer-sized). The ADR,
+      roadmap status, and BEP notes land in that branch.
     - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
       the verified bitmap, treat missing or short data as absent.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
     recorded in the `FileMap`, never follow links, and never remove directories
-    outside the root. The API stub currently ignores `delete_files`.
+    outside the root. Route deletion through the storage worker as a command so
+    it runs on the storage thread and cannot race open handles. The API stub
+    currently ignores `delete_files`.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame
@@ -48,6 +49,10 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 - [ ] 8. Magnet + metadata fetch (BEP 9/10)
 - [ ] 9. DHT (BEP 5)
 - [ ] 10. Real in-process engine behind EngineClient + event stream
+  - [ ] Session storage pool with a global file-handle budget. One worker for
+    all torrents; the 64-handle cap is per `Storage` today, so N torrents can
+    hold N × 64 descriptors while macOS defaults to a 256 soft limit.
+    `StorageHandle` methods stay the same.
   - Must call `PieceAssembler::sweep_stalled` on a timer, and before accepting
     blocks when it wants strict expiry: expiry happens only on an explicit
     sweep.

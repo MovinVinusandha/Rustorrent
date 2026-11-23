@@ -77,6 +77,12 @@ async fn close(handle: StorageHandle) {
     wait_for_exit(receiver).await;
 }
 
+/// Queues a command on the worker channel directly, bypassing the handle's
+/// shutdown flag. Used to place requests behind `Shutdown` in the queue.
+fn enqueue(handle: &StorageHandle, command: Command) {
+    handle.tx.try_send(command).expect("queue capacity");
+}
+
 #[test]
 fn handle_is_clone_send_sync() {
     fn assert_traits<T: Clone + Send + Sync>() {}
@@ -464,6 +470,87 @@ async fn cancelled_shutdown_on_a_full_queue_keeps_the_handle_usable() {
         .expect("shutdown timeout")
         .expect("shutdown after cancelled attempt");
     assert!(handle.is_closed());
+}
+
+#[tokio::test]
+async fn requests_queued_behind_shutdown_are_rejected() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let handle = open(&root, map).await;
+
+    handle
+        .write_range(0, b"data".to_vec())
+        .await
+        .expect("write");
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    assert!(
+        handle
+            .tx
+            .try_send(Command::Hold {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .is_ok()
+    );
+    entered_rx.await.expect("worker entered hold");
+
+    // Shutdown is queued directly, so the flag stays unset and the channel
+    // still accepts everything that follows it.
+    let (shutdown_reply, shutdown_response) = oneshot::channel();
+    enqueue(
+        &handle,
+        Command::Shutdown {
+            reply: shutdown_reply,
+        },
+    );
+
+    let (write_reply, write_response) = oneshot::channel();
+    enqueue(
+        &handle,
+        Command::WriteRange {
+            offset: 0,
+            bytes: b"zzzz".to_vec(),
+            reply: write_reply,
+        },
+    );
+    let (read_reply, read_response) = oneshot::channel();
+    enqueue(
+        &handle,
+        Command::ReadRange {
+            offset: 0,
+            len: 4,
+            reply: read_reply,
+        },
+    );
+    let (sync_reply, sync_response) = oneshot::channel();
+    enqueue(&handle, Command::Sync { reply: sync_reply });
+
+    release_tx.send(()).expect("release hold");
+    shutdown_response
+        .await
+        .expect("shutdown reply")
+        .expect("shutdown");
+
+    assert!(matches!(
+        write_response.await.expect("write reply"),
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert!(matches!(
+        read_response.await.expect("read reply"),
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert!(matches!(
+        sync_response.await.expect("sync reply"),
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert_eq!(
+        fs::read(root.join("a.bin")).expect("read file"),
+        b"data",
+        "a write queued behind shutdown must not run"
+    );
 }
 
 #[tokio::test]

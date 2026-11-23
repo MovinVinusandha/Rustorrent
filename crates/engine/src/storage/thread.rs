@@ -34,8 +34,6 @@ pub const MAX_RANGE_LEN: usize = 1024 * 1024;
 const THREAD_NAME: &str = "bt-storage";
 const THREAD_STACK_SIZE: usize = 512 * 1024;
 
-type Reply<T> = oneshot::Sender<Result<T, StorageError>>;
-
 /// Errors returned by [`StorageHandle`].
 #[derive(Debug, Error)]
 pub enum StorageHandleError {
@@ -63,6 +61,8 @@ pub enum StorageHandleError {
     #[error("could not spawn the storage thread")]
     Spawn(#[source] std::io::Error),
 }
+
+type Reply<T> = oneshot::Sender<Result<T, StorageHandleError>>;
 
 /// Cloneable, `Send + Sync` handle to one storage worker.
 ///
@@ -179,8 +179,12 @@ impl StorageHandle {
     ///
     /// A queue slot is reserved before the shutdown flag is set, so cancelling
     /// this future while the queue is full leaves the handle usable. Once the
-    /// flag is set, new requests fail with [`StorageHandleError::ShuttingDown`];
-    /// requests already queued finish first.
+    /// flag is set, new requests fail with [`StorageHandleError::ShuttingDown`].
+    /// Requests queued before `Shutdown` still finish first; a request that
+    /// ends up behind it never executes and fails with
+    /// [`StorageHandleError::ShuttingDown`], or with
+    /// [`StorageHandleError::WorkerStopped`] when it arrives after the worker
+    /// closed the queue and its reply is dropped.
     ///
     /// The worker drops the [`Storage`] before it replies, so all file handles
     /// are closed when this returns. The return value is the final sync result:
@@ -211,10 +215,9 @@ impl StorageHandle {
         let (reply, response) = oneshot::channel();
         permit.send(Command::Shutdown { reply });
 
-        let result = response
+        response
             .await
-            .map_err(|_| StorageHandleError::WorkerStopped)?;
-        result.map_err(StorageHandleError::Storage)
+            .map_err(|_| StorageHandleError::WorkerStopped)?
     }
 
     async fn send<T>(
@@ -240,7 +243,6 @@ impl StorageHandle {
         response
             .await
             .map_err(|_| StorageHandleError::WorkerStopped)?
-            .map_err(StorageHandleError::Storage)
     }
 }
 
@@ -271,6 +273,24 @@ enum Command {
     Panic,
 }
 
+/// Answers a request that was queued at or after shutdown without running it.
+fn reject(command: Command) {
+    match command {
+        Command::ReadRange { reply, .. } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        Command::WriteRange { reply, .. }
+        | Command::Sync { reply }
+        | Command::Shutdown { reply } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::Hold { .. } => {}
+        #[cfg(test)]
+        Command::Panic => {}
+    }
+}
+
 /// Owns the storage and serves requests until the queue closes.
 fn run_worker(
     root: PathBuf,
@@ -280,7 +300,7 @@ fn run_worker(
     open: oneshot::Sender<Result<(), StorageError>>,
     exit: Option<oneshot::Sender<()>>,
 ) {
-    let mut storage = Some(match Storage::open(&root, map, config) {
+    let mut storage = match Storage::open(&root, map, config) {
         Ok(storage) => {
             let _ = open.send(Ok(()));
             storage
@@ -289,60 +309,39 @@ fn run_worker(
             let _ = open.send(Err(error));
             return;
         }
-    });
+    };
 
+    let mut shutdown = None;
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
-                let Some(storage) = storage.as_mut() else {
-                    let _ = reply.send(Err(StorageError::Internal {
-                        reason: "storage is already closed",
-                    }));
-                    continue;
-                };
                 let len = len.min(MAX_RANGE_LEN);
                 let mut buf = vec![0u8; len];
-                let result = storage.read_range(offset, &mut buf);
-                let reply_result = match result {
+                let result = match storage.read_range(offset, &mut buf) {
                     Ok(filled) => {
                         buf.truncate(filled);
                         Ok(buf)
                     }
                     Err(error) => Err(error),
                 };
-                let _ = reply.send(reply_result);
+                let _ = reply.send(result.map_err(StorageHandleError::Storage));
             }
             Command::WriteRange {
                 offset,
                 bytes,
                 reply,
             } => {
-                let Some(storage) = storage.as_mut() else {
-                    let _ = reply.send(Err(StorageError::Internal {
-                        reason: "storage is already closed",
-                    }));
-                    continue;
-                };
-                let _ = reply.send(storage.write_range(offset, &bytes));
+                let _ = reply.send(
+                    storage
+                        .write_range(offset, &bytes)
+                        .map_err(StorageHandleError::Storage),
+                );
             }
             Command::Sync { reply } => {
-                let Some(storage) = storage.as_mut() else {
-                    let _ = reply.send(Err(StorageError::Internal {
-                        reason: "storage is already closed",
-                    }));
-                    continue;
-                };
-                let _ = reply.send(storage.sync());
+                let _ = reply.send(storage.sync().map_err(StorageHandleError::Storage));
             }
             Command::Shutdown { reply } => {
-                let result = match storage.as_mut() {
-                    Some(storage) => storage.close(),
-                    None => Ok(()),
-                };
-                // Drop the storage so every file handle is closed before the
-                // caller observes the reply.
-                storage = None;
-                let _ = reply.send(result);
+                shutdown = Some(reply);
                 break;
             }
             #[cfg(test)]
@@ -355,9 +354,22 @@ fn run_worker(
         }
     }
 
-    if let Some(mut storage) = storage {
-        let _ = storage.close();
-        drop(storage);
+    // Stop accepting reservations, then answer everything that was queued
+    // behind `Shutdown`. Rejecting instead of running it keeps the "nothing
+    // queued after shutdown executes" guarantee for callers that raced with
+    // the flag.
+    rx.close();
+    while let Ok(command) = rx.try_recv() {
+        reject(command);
+    }
+
+    let result = storage.close().map_err(StorageHandleError::Storage);
+    // Drop the storage so every file handle is closed before the caller
+    // observes the reply.
+    drop(storage);
+
+    if let Some(reply) = shutdown {
+        let _ = reply.send(result);
     }
 
     #[cfg(test)]

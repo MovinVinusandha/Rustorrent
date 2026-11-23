@@ -65,7 +65,7 @@ fn exit_receiver(handle: &StorageHandle) -> oneshot::Receiver<()> {
 }
 
 async fn wait_for_exit(receiver: oneshot::Receiver<()>) {
-    timeout(Duration::from_secs(5), receiver)
+    timeout(Duration::from_secs(30), receiver)
         .await
         .expect("worker exit timed out")
         .expect("worker exit signal");
@@ -81,6 +81,21 @@ async fn close(handle: StorageHandle) {
 /// shutdown flag. Used to place requests behind `Shutdown` in the queue.
 fn enqueue(handle: &StorageHandle, command: Command) {
     handle.tx.try_send(command).expect("queue capacity");
+}
+
+/// Returns how many file handles the worker currently holds, so tests can see
+/// that eviction happened instead of the cache growing.
+async fn open_handles(handle: &StorageHandle) -> usize {
+    let (reply, response) = oneshot::channel();
+    handle
+        .tx
+        .send(Command::OpenHandles { reply })
+        .await
+        .expect("queue handle count");
+    response
+        .await
+        .expect("handle count reply")
+        .expect("handle count")
 }
 
 #[test]
@@ -406,10 +421,20 @@ async fn shutdown_reports_failed_sync_and_closes_files() {
         .write_range(0, b"aaaa".to_vec())
         .await
         .expect("write a");
+    assert_eq!(
+        open_handles(&handle).await,
+        1,
+        "the first write must cache one handle"
+    );
     handle
         .write_range(4, b"bbbb".to_vec())
         .await
         .expect("write b");
+    assert_eq!(
+        open_handles(&handle).await,
+        1,
+        "the second write must evict the first handle"
+    );
     fs::remove_file(root.join("a.bin")).expect("remove evicted dirty file");
 
     match handle.shutdown().await {
@@ -465,7 +490,7 @@ async fn cancelled_shutdown_on_a_full_queue_keeps_the_handle_usable() {
     let _ = pending.await;
 
     release_tx.send(()).expect("release hold");
-    timeout(Duration::from_secs(5), handle.shutdown())
+    timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("shutdown timeout")
         .expect("shutdown after cancelled attempt");

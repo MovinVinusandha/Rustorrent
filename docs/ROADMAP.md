@@ -14,8 +14,15 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     post-sanitization path collisions.
   - [x] 3b. Storage backend: safe file creation, positioned reads/writes via
     `crates/platform`, open-handle cap, preallocation policy.
-  - [ ] 3c. Piece verification: in-memory piece assembly, hash on the blocking
-    pool, write only verified pieces, full recheck.
+  - [ ] 3c. Piece verification, split into three separately merged steps.
+    - [ ] 3c-1. Storage thread: one owned `Storage` on a dedicated OS thread,
+      bounded request queue and a cloneable async handle (`Open`, `ReadRange`,
+      `WriteRange`, `Sync`, `Shutdown`); typed errors when the worker is gone,
+      and a drain-then-sync-then-exit shutdown.
+    - [ ] 3c-2. Piece assembly, verification, and memory budget: bounded piece
+      buffers, SHA-1 on the blocking pool, write only verified ranges.
+    - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
+      the verified bitmap, treat missing or short data as absent.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files

@@ -180,14 +180,19 @@ impl Storage {
             let index = segment.file_index;
             let path = self.files[index].path.clone();
 
-            let file_len = match fs::symlink_metadata(&path) {
-                Ok(metadata) => {
-                    check_file(&path, &metadata)?;
-                    metadata.len()
-                }
+            if !check_ancestors(&self.root, &map.files()[index].disk_components)? {
+                break;
+            }
+
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => break,
                 Err(source) => return Err(classify(&path, source)),
             };
+            check_file(&path, &metadata)?;
+
+            let file_len = metadata.len();
+            let expected = file_id(&metadata);
             if segment.offset_in_file >= file_len {
                 break;
             }
@@ -218,6 +223,7 @@ impl Storage {
                     }
                 },
                 false,
+                expected,
             )?;
 
             let read = read_up_to(
@@ -268,7 +274,7 @@ impl Storage {
         let mut written = 0usize;
         for segment in map.segments(offset..end) {
             let index = segment.file_index;
-            self.ensure_writable_file(index)?;
+            let expected = self.ensure_writable_file(index)?;
             let path = self.files[index].path.clone();
 
             let remaining = buf.len() - written;
@@ -285,7 +291,9 @@ impl Storage {
                 total_length,
             })?;
 
-            let file = self.handles.get_or_open(index, &path, open_write, true)?;
+            let file = self
+                .handles
+                .get_or_open(index, &path, open_write, true, expected)?;
             write_all_at(
                 |chunk, position| file.write_at(chunk, position),
                 &buf[written..written + to_write],
@@ -300,10 +308,12 @@ impl Storage {
 
     /// Flushes dirty data for cached and evicted files.
     ///
-    /// Evicted dirty files are reopened read-write and synced. A file that was
-    /// removed after eviction is a typed error.
+    /// Evicted dirty files are reopened read-write after their ancestors are
+    /// re-checked and synced. A file that was removed after eviction is a typed
+    /// error.
     pub fn sync(&mut self) -> Result<(), StorageError> {
-        self.handles.sync(&self.files)
+        self.handles
+            .sync(&self.root, self.map.as_ref(), &self.files)
     }
 
     /// Flushes dirty data and drops every open handle.
@@ -314,15 +324,32 @@ impl Storage {
     }
 
     /// Creates one file and its parents on first write, re-checking the path.
-    fn ensure_writable_file(&mut self, index: usize) -> Result<(), StorageError> {
+    ///
+    /// Returns the identity of an existing file so the caller can verify the
+    /// handle it opens.
+    fn ensure_writable_file(&mut self, index: usize) -> Result<Option<FileId>, StorageError> {
         let map = Arc::clone(&self.map);
         let mapped = &map.files()[index];
         let path = self.files[index].path.clone();
+        let parent_count = mapped.disk_components.len().saturating_sub(1);
+
+        if !check_ancestors(&self.root, &mapped.disk_components)? {
+            ensure_parent_dirs(&self.root, &mapped.disk_components[..parent_count])?;
+            return ensure_file(
+                &path,
+                mapped.length,
+                false,
+                self.config.preallocation,
+                &mut self.seen_inodes,
+            );
+        }
 
         match fs::symlink_metadata(&path) {
-            Ok(metadata) => check_file(&path, &metadata),
+            Ok(metadata) => {
+                check_file(&path, &metadata)?;
+                Ok(file_id(&metadata))
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let parent_count = mapped.disk_components.len().saturating_sub(1);
                 ensure_parent_dirs(&self.root, &mapped.disk_components[..parent_count])?;
                 ensure_file(
                     &path,
@@ -393,6 +420,7 @@ impl HandleCache {
         path: &Path,
         open: F,
         dirty: bool,
+        expected: Option<FileId>,
     ) -> Result<&mut File, StorageError>
     where
         F: FnOnce(&Path) -> io::Result<File>,
@@ -420,6 +448,7 @@ impl HandleCache {
         }
 
         let file = open(path).map_err(|source| classify(path, source))?;
+        verify_opened(path, &file, expected)?;
         self.entries.push(CacheEntry { index, file, dirty });
         self.entries
             .last_mut()
@@ -430,7 +459,12 @@ impl HandleCache {
     }
 
     /// Syncs dirty cached handles and reopens evicted ones.
-    fn sync(&mut self, files: &[PreparedFile]) -> Result<(), StorageError> {
+    fn sync(
+        &mut self,
+        root: &Path,
+        map: &FileMap,
+        files: &[PreparedFile],
+    ) -> Result<(), StorageError> {
         for entry in &mut self.entries {
             let pending = self.needs_sync.contains(&entry.index);
             if !entry.dirty && !pending {
@@ -458,7 +492,27 @@ impl HandleCache {
                     reason: "handle index is outside the file map",
                 },
             )?;
+            let components = map
+                .files()
+                .get(index)
+                .map(|file| file.disk_components.as_slice())
+                .ok_or(StorageError::InvalidConfig {
+                    reason: "handle index is outside the file map",
+                })?;
+
+            if !check_ancestors(root, components)? {
+                return Err(StorageError::Io {
+                    path: path.clone(),
+                    source: io::Error::from(io::ErrorKind::NotFound),
+                });
+            }
+
+            let metadata = fs::symlink_metadata(&path).map_err(|source| classify(&path, source))?;
+            check_file(&path, &metadata)?;
+            let expected = file_id(&metadata);
+
             let file = open_rw(&path).map_err(|source| classify(&path, source))?;
+            verify_opened(&path, &file, expected)?;
             file.sync_data().map_err(|source| classify(&path, source))?;
             self.needs_sync.remove(&index);
         }
@@ -560,7 +614,7 @@ fn prepare_files(
 
         let parent_count = file.disk_components.len().saturating_sub(1);
         ensure_parent_dirs(root, &file.disk_components[..parent_count])?;
-        ensure_file(
+        let _ = ensure_file(
             &prepared.path,
             file.length,
             prepared.existed,
@@ -579,7 +633,7 @@ fn ensure_parent_dirs(root: &Path, components: &[String]) -> Result<(), StorageE
     for component in components {
         if sanitize_component(component) != *component {
             return Err(StorageError::UnsafePath {
-                path: path.join(component),
+                path: path.clone(),
                 reason: UnsafeReason::InvalidComponent,
             });
         }
@@ -605,13 +659,16 @@ fn ensure_parent_dirs(root: &Path, components: &[String]) -> Result<(), StorageE
 }
 
 /// Creates or reuses one file and applies the preallocation policy.
+///
+/// Returns the identity of the resulting file, when the platform exposes one,
+/// so the caller can verify the handle it opens.
 fn ensure_file(
     path: &Path,
     expected_len: u64,
     existed: bool,
     preallocation: Preallocation,
     seen_inodes: &mut BTreeSet<FileId>,
-) -> Result<(), StorageError> {
+) -> Result<Option<FileId>, StorageError> {
     if existed {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
@@ -619,7 +676,7 @@ fn ensure_file(
                 if preallocation == Preallocation::SetLen {
                     extend_if_short(path, &metadata, expected_len)?;
                 }
-                return Ok(());
+                return Ok(file_id(&metadata));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(classify(path, source)),
@@ -634,7 +691,7 @@ fn ensure_file(
                 if preallocation == Preallocation::SetLen {
                     extend_if_short(path, &metadata, expected_len)?;
                 }
-                return Ok(());
+                return Ok(file_id(&metadata));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => match create_new(path) {
                 Ok(file) => {
@@ -645,7 +702,7 @@ fn ensure_file(
                         file.set_len(expected_len)
                             .map_err(|source| classify(path, source))?;
                     }
-                    return Ok(());
+                    return Ok(file_id(&metadata));
                 }
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => return Err(classify(path, source)),
@@ -670,6 +727,35 @@ fn extend_if_short(
         .map_err(|source| classify(path, source))
 }
 
+/// Re-checks every existing ancestor of one file below the root.
+///
+/// Returns `Ok(false)` when an ancestor is missing, which means the file cannot
+/// exist yet. Called before every open so a component swapped after
+/// [`Storage::open`] cannot redirect the join.
+fn check_ancestors(root: &Path, components: &[String]) -> Result<bool, StorageError> {
+    let parent_count = components.len().saturating_sub(1);
+    let mut path = root.to_path_buf();
+
+    for component in &components[..parent_count] {
+        if sanitize_component(component) != *component {
+            return Err(StorageError::UnsafePath {
+                path: path.clone(),
+                reason: UnsafeReason::InvalidComponent,
+            });
+        }
+
+        path.push(component);
+
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => check_directory(&path, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(classify(&path, source)),
+        }
+    }
+
+    Ok(true)
+}
+
 /// Resolves one mapped file and validates every existing ancestor.
 fn resolve_file_path(root: &Path, file: &MappedFile) -> Result<PathBuf, StorageError> {
     if file.disk_components.is_empty() {
@@ -686,7 +772,7 @@ fn resolve_file_path(root: &Path, file: &MappedFile) -> Result<PathBuf, StorageE
     for (index, component) in file.disk_components.iter().enumerate() {
         if sanitize_component(component) != *component {
             return Err(StorageError::UnsafePath {
-                path: path.join(component),
+                path: path.clone(),
                 reason: UnsafeReason::InvalidComponent,
             });
         }
@@ -799,6 +885,55 @@ fn record_inode(
     Ok(())
 }
 
+/// Returns the identity used to verify that an opened handle is the file that
+/// was checked. Always `None` off Unix.
+#[cfg(unix)]
+fn file_id(metadata: &fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(FileId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_id(_metadata: &fs::Metadata) -> Option<FileId> {
+    None
+}
+
+/// Verifies on Unix that the opened handle matches the checked metadata.
+///
+/// This narrows the window between `symlink_metadata` and the open: a component
+/// swapped in between yields a different device or inode.
+#[cfg(unix)]
+fn verify_opened(path: &Path, file: &File, expected: Option<FileId>) -> Result<(), StorageError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+
+    let metadata = file.metadata().map_err(|source| classify(path, source))?;
+    if metadata.dev() != expected.dev || metadata.ino() != expected.ino {
+        return Err(StorageError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: UnsafeReason::Changed,
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_opened(
+    _path: &Path,
+    _file: &File,
+    _expected: Option<FileId>,
+) -> Result<(), StorageError> {
+    Ok(())
+}
+
 /// Unix device and inode pair.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -816,6 +951,12 @@ struct FileId;
 fn classify(path: &Path, source: io::Error) -> StorageError {
     let kind = source.kind();
 
+    if kind == io::ErrorKind::NotADirectory {
+        return StorageError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: UnsafeReason::NotDirectory,
+        };
+    }
     if kind == io::ErrorKind::StorageFull
         || kind == io::ErrorKind::QuotaExceeded
         || is_disk_full(&source)
@@ -879,6 +1020,8 @@ pub enum UnsafeReason {
     NotFile,
     /// Two paths resolve to the same file.
     DuplicateFile,
+    /// A component changed between the check and the open.
+    Changed,
     /// The component is not in sanitized form.
     InvalidComponent,
 }
@@ -891,6 +1034,7 @@ impl fmt::Display for UnsafeReason {
             Self::NotDirectory => "component is not a directory",
             Self::NotFile => "component is not a regular file",
             Self::DuplicateFile => "path aliases another file",
+            Self::Changed => "component changed while opening",
             Self::InvalidComponent => "component is not sanitized",
         };
         formatter.write_str(text)

@@ -113,6 +113,59 @@ fn create_file_symlink(original: &Path, link: &Path) -> bool {
     }
 }
 
+/// One entry of a directory snapshot.
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+/// Records every path, kind, and byte below `root`, sorted by path.
+///
+/// Tests compare two snapshots to prove that nothing outside the download root
+/// was created, removed, or modified.
+fn snapshot(root: &Path) -> Vec<(PathBuf, SnapshotEntry)> {
+    let mut entries = Vec::new();
+    collect_snapshot(root, root, &mut entries);
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+fn collect_snapshot(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, SnapshotEntry)>) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => panic!("snapshot {path:?}: {error}"),
+    };
+    let relative = path
+        .strip_prefix(root)
+        .expect("snapshot path is below its root")
+        .to_path_buf();
+
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path).expect("read link");
+        entries.push((relative, SnapshotEntry::Symlink(target)));
+        return;
+    }
+
+    if metadata.is_dir() {
+        entries.push((relative, SnapshotEntry::Directory));
+        let mut children: Vec<PathBuf> = fs::read_dir(path)
+            .expect("read dir")
+            .map(|entry| entry.expect("dir entry").path())
+            .collect();
+        children.sort();
+        for child in children {
+            collect_snapshot(root, &child, entries);
+        }
+        return;
+    }
+
+    let bytes = fs::read(path).expect("read file");
+    entries.push((relative, SnapshotEntry::File(bytes)));
+}
+
 #[test]
 fn open_rejects_relative_root() {
     let map = map_with(&[(&["a"], 0)]);
@@ -194,6 +247,7 @@ fn rejects_symlinked_directory() {
         return;
     }
 
+    let before = snapshot(&outside);
     let error = open(&root, map_with(&[(&["top", "x"], 0)])).expect_err("symlink must fail");
     assert!(matches!(
         error,
@@ -202,7 +256,7 @@ fn rejects_symlinked_directory() {
             ..
         }
     ));
-    assert!(!outside.join("x").exists());
+    assert_eq!(snapshot(&outside), before);
 }
 
 #[test]
@@ -216,6 +270,7 @@ fn rejects_symlinked_file() {
         return;
     }
 
+    let before = snapshot(&outside);
     let error = open(&root, map_with(&[(&["top", "a"], 6)])).expect_err("symlink must fail");
     assert!(matches!(
         error,
@@ -224,7 +279,7 @@ fn rejects_symlinked_file() {
             ..
         }
     ));
-    assert_eq!(fs::read(&outside).expect("read outside"), b"secret");
+    assert_eq!(snapshot(&outside), before);
 }
 
 #[test]
@@ -465,6 +520,7 @@ fn ensure_parent_dirs_rejects_symlink() {
         return;
     }
 
+    let before = snapshot(&outside);
     let error = ensure_parent_dirs(&root, &["a".to_owned()]).expect_err("symlink parent must fail");
     assert!(matches!(
         error,
@@ -473,6 +529,7 @@ fn ensure_parent_dirs_rejects_symlink() {
             ..
         }
     ));
+    assert_eq!(snapshot(&outside), before);
 }
 
 #[test]
@@ -709,6 +766,7 @@ fn read_range_rejects_symlink_swapped_file() {
         return;
     }
 
+    let before = snapshot(&outside);
     let mut buf = [0u8; 4];
     let error = storage
         .read_range(0, &mut buf)
@@ -717,6 +775,163 @@ fn read_range_rejects_symlink_swapped_file() {
         error,
         StorageError::UnsafePath {
             reason: UnsafeReason::Symlink,
+            ..
+        }
+    ));
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn write_range_rejects_symlinked_parent() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let mut storage = open(&root, map_with(&[(&["a", "data"], 4)])).expect("open");
+
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("data"), b"keep").expect("write outside");
+    if !create_dir_symlink(&outside, &root.join("a")) {
+        return;
+    }
+
+    let before = snapshot(&outside);
+    let error = storage
+        .write_range(0, b"evil")
+        .expect_err("symlinked parent must fail");
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::Symlink,
+            ..
+        }
+    ));
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn read_range_rejects_swapped_parent() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a", "one"], 4), (&["b", "two"], 4)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"abcdefgh").expect("write");
+    assert!(storage.handles.needs_sync.contains(&0));
+
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("one"), b"evil").expect("write outside");
+    fs::remove_dir_all(root.join("a")).expect("remove parent");
+    if !create_dir_symlink(&outside, &root.join("a")) {
+        return;
+    }
+
+    let before = snapshot(&outside);
+    let mut buf = [0u8; 4];
+    let error = storage
+        .read_range(0, &mut buf)
+        .expect_err("swapped parent must fail");
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::Symlink,
+            ..
+        }
+    ));
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn sync_reopen_revalidates_ancestors() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a", "one"], 4), (&["b", "two"], 4)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"abcdefgh").expect("write");
+    assert!(storage.handles.needs_sync.contains(&0));
+
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("one"), b"evil").expect("write outside");
+    fs::remove_dir_all(root.join("a")).expect("remove parent");
+    if !create_dir_symlink(&outside, &root.join("a")) {
+        return;
+    }
+
+    let before = snapshot(&outside);
+    let error = storage.sync().expect_err("swapped parent must fail");
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::Symlink,
+            ..
+        }
+    ));
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn invalid_component_error_stays_under_root() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+
+    for component in ["..", "/etc/passwd", "C:\\Windows"] {
+        let error = open(&root, raw_map(&[component])).expect_err("unsafe component must fail");
+        match error {
+            StorageError::UnsafePath { path, reason } => {
+                assert_eq!(reason, UnsafeReason::InvalidComponent, "{component:?}");
+                assert_eq!(path, root, "{component:?}");
+            }
+            other => panic!("unexpected error for {component:?}: {other:?}"),
+        }
+    }
+
+    let error = ensure_parent_dirs(&root, &["..".to_owned()]).expect_err("raw component must fail");
+    match error {
+        StorageError::UnsafePath { path, reason } => {
+            assert_eq!(reason, UnsafeReason::InvalidComponent);
+            assert_eq!(path, root);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_opened_rejects_a_different_inode() {
+    let dir = temp_dir();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    fs::write(&first, b"a").expect("write first");
+    fs::write(&second, b"b").expect("write second");
+
+    let metadata = fs::symlink_metadata(&first).expect("metadata");
+    let expected = file_id(&metadata);
+    assert!(expected.is_some());
+
+    let file = open_read(&second).expect("open second");
+    let error = verify_opened(&second, &file, expected).expect_err("mismatch must fail");
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::Changed,
+            ..
+        }
+    ));
+
+    let file = open_read(&first).expect("open first");
+    verify_opened(&first, &file, expected).expect("same inode");
+}
+
+#[test]
+fn classify_maps_not_a_directory() {
+    let error = classify(
+        Path::new("file"),
+        io::Error::from(io::ErrorKind::NotADirectory),
+    );
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::NotDirectory,
             ..
         }
     ));

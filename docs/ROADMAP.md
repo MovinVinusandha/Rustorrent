@@ -20,19 +20,20 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       `WriteRange`, `Sync`, `Shutdown`); typed errors when the worker is gone,
       and a drain-then-sync-then-exit shutdown. On
       `feat/engine-storage-thread`, not merged yet.
-    - [~] 3c-2a. Piece buffer: bounds-checked bitfield, memory budget with RAII
+    - [x] 3c-2a. Piece buffer: bounds-checked bitfield, memory budget with RAII
       reservations, piece specs and peer keys, block assembly with peer
       attribution, stall expiry, and block-insertion fuzzing. Pure in-memory:
       it does not use `StorageHandle` and can merge before 3c-1.
     - [ ] 3c-2b. Piece verification and write path: SHA-1 on the blocking pool
       with a job cap, and writing verified pieces through
       `StorageHandle::write_range` in chunks of at most 1 MiB. Planned API:
-      `store_verified(storage, VerifiedPiece) -> Result<StoredPiece, WriteError>`;
-      `StoredPiece` has no public constructor, and
+      `store_verified(storage, VerifiedPiece) -> Result<StoredPiece, WriteError>`
+      returns a `StoredPiece` with no public constructor, and
       `Bitfield::mark_stored(&StoredPiece)` sets the verified bit synchronously,
       so no `&mut Bitfield` is held across an await. The bit stays false after a
-      failed chunk and becomes true only after `mark_stored`. Starts after 3c-1
-      merges; the ADR, roadmap status, and BEP notes land in that branch.
+      failed chunk and becomes true only after `mark_stored`. The 1 MiB chunk
+      copy is outside the piece budget (bounded, not peer-sized). Starts after
+      3c-1 merges; the ADR, roadmap status, and BEP notes land in that branch.
     - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
       the verified bitmap, treat missing or short data as absent.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
@@ -47,6 +48,11 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 - [ ] 8. Magnet + metadata fetch (BEP 9/10)
 - [ ] 9. DHT (BEP 5)
 - [ ] 10. Real in-process engine behind EngineClient + event stream
+  - Must call `PieceAssembler::sweep_stalled` on a timer, and before accepting
+    blocks when it wants strict expiry: expiry happens only on an explicit
+    sweep.
+  - Must own one `PieceAssembler` and one `TorrentBudget` handle per torrent,
+    dropping both when the torrent is removed.
 - [ ] 11. TUI: list, add, details, limits
 - [ ] 12. Cross-platform CI green, tag v0.1.0
 

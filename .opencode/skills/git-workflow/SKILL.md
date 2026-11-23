@@ -24,3 +24,11 @@ Small commits, each building and passing tests.
 ## Never
 Force-push main, commit secrets, commit target/ or downloaded data,
 bypass CI.
+
+## Pull requests
+- One PR per roadmap item or split step; open it when the branch is
+  review-ready: local checks green and the reviewer agent's blockers and
+  majors fixed. Never stack new work on an unmerged branch.
+- The agent drafts the PR text but never pushes. The human pushes, opens
+  the PR, waits for CI on all three OSes, and merges with --ff-only.
+- Keep commits separate; do not squash.

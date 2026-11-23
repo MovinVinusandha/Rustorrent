@@ -369,3 +369,40 @@ Negative:
 - v0.1 accepts the `symlink_metadata` TOCTOU window. Revisit handle-relative
   traversal (`openat` on Unix, reparse-point handles on Windows) if the threat
   model changes.
+
+## Implementation notes
+
+Roadmap 3b was implemented after this ADR was accepted. These notes record
+where the code differs from the design above.
+
+- **Storage thread deferred to 3c.** 3b is a synchronous, single-owner
+  `Storage`: callers pass a byte range and get the result on the same thread.
+  The handle cache and every file handle live inside `Storage`, and a
+  compile-time assertion keeps `Storage: Send` so 3c can move it to the
+  dedicated storage thread without changing the type. The bounded queue and
+  the `Open`/`WritePiece`/`ReadPiece`/`Sync`/`Shutdown` messages are not built
+  yet.
+- **Windows duplicate-inode check skipped.** `std` exposes no stable
+  volume/file-index pair on Windows. The backend relies on the case-folded
+  `FileMap` keys and on `create_new` returning `AlreadyExists`; the Unix
+  `(dev, ino)` check is implemented. The macOS NFC/NFD alias is therefore
+  caught on Unix but not on Windows.
+- **The handle cap is strict.** The design allowed a piece write spanning
+  several files to overshoot the cap by that many handles. 3b instead opens,
+  uses, and releases one segment at a time, so the cache never holds more than
+  `max_open_handles`; the overshoot is zero.
+- **Eviction defers fsync.** Evicting a dirty handle never calls `sync_data`.
+  The file index is recorded in a `needs_sync` set; `sync()` and `close()`
+  flush cached dirty handles and reopen evicted ones read-write with `open_rw`
+  before `sync_data`. Reopening a file the user deleted is a typed
+  `StorageError`, not a silent recreation.
+- **Preallocation `Off` is lazy.** Zero-length files and their parents are
+  created during `open`; non-zero files and their parents are created on the
+  first write. `SetLen` creates every file during `open` and extends only
+  short files, never truncating.
+- **Range semantics.** `read_range` returns only the leading contiguous bytes
+  and stops at the first missing or short file; it never skips a gap and never
+  reads a file past its mapped length. `write_range` rejects ranges that
+  overflow `u64` or exceed the total length, and a failed write may leave a
+  partial range on disk, so verified state is set only after a complete
+  success.

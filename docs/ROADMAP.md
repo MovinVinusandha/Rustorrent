@@ -12,12 +12,15 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     Sanitize torrent paths per operating system before creating any file.
     Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
     post-sanitization path collisions.
-  - [ ] 3b. Storage backend: safe file creation, positioned reads/writes via
+  - [x] 3b. Storage backend: safe file creation, positioned reads/writes via
     `crates/platform`, open-handle cap, preallocation policy.
   - [ ] 3c. Piece verification: in-memory piece assembly, hash on the blocking
     pool, write only verified pieces, full recheck.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck.
+  - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
+    recorded in the `FileMap`, never follow links, and never remove directories
+    outside the root. The API stub currently ignores `delete_files`.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame

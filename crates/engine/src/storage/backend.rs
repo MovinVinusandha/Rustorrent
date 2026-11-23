@@ -53,6 +53,10 @@ impl Default for StorageConfig {
 }
 
 /// A validated torrent storage layout rooted at an absolute directory.
+///
+/// Dirty data is flushed by [`Storage::sync`] and [`Storage::close`]. Dropping
+/// a `Storage` performs no sync and loses any pending flush, so a caller that
+/// needs durability must call `sync` or `close` explicitly.
 #[derive(Debug)]
 pub struct Storage {
     root: PathBuf,
@@ -209,22 +213,11 @@ impl Storage {
                 break;
             }
 
-            // A file with pending synced data is reopened read-write so a
-            // later sync works on every platform.
-            let needs_sync = self.handles.needs_sync(index);
-            let file = self.handles.get_or_open(
-                index,
-                &path,
-                |path| {
-                    if needs_sync {
-                        open_rw(path)
-                    } else {
-                        open_read(path)
-                    }
-                },
-                false,
-                expected,
-            )?;
+            // Reads never require write access. A pending sync upgrades the
+            // cached handle to read-write when the flush actually runs.
+            let file = self
+                .handles
+                .get_or_open(index, &path, open_read, false, false, expected)?;
 
             let read = read_up_to(
                 |chunk, position| file.read_at(chunk, position),
@@ -293,7 +286,7 @@ impl Storage {
 
             let file = self
                 .handles
-                .get_or_open(index, &path, open_write, true, expected)?;
+                .get_or_open(index, &path, open_write, true, true, expected)?;
             write_all_at(
                 |chunk, position| file.write_at(chunk, position),
                 &buf[written..written + to_write],
@@ -317,10 +310,14 @@ impl Storage {
     }
 
     /// Flushes dirty data and drops every open handle.
+    ///
+    /// The cache is cleared only when the flush succeeds. On failure the cache
+    /// and the pending-sync set are kept so the caller can retry, and the
+    /// first error is returned.
     pub fn close(&mut self) -> Result<(), StorageError> {
-        let result = self.sync();
+        self.sync()?;
         self.handles.clear();
-        result
+        Ok(())
     }
 
     /// Creates one file and its parents on first write, re-checking the path.
@@ -374,6 +371,9 @@ const _: fn() = || {
 ///
 /// The cache never holds more than `capacity` handles and processes one
 /// segment at a time, so a piece spanning several files cannot exceed the cap.
+/// Transient handles are the exception: [`HandleCache::sync`] opens one
+/// read-write handle per pending file outside the cache, and lazy creation
+/// opens a file before it is cached, so peak usage is `capacity + 1`.
 #[derive(Debug)]
 struct HandleCache {
     capacity: usize,
@@ -383,12 +383,13 @@ struct HandleCache {
     needs_sync: BTreeSet<usize>,
 }
 
-/// One open handle and whether it was written since the last sync.
+/// One open handle, whether it can write, and whether it is dirty.
 #[derive(Debug)]
 struct CacheEntry {
     index: usize,
     file: File,
     dirty: bool,
+    writable: bool,
 }
 
 impl HandleCache {
@@ -406,20 +407,18 @@ impl HandleCache {
         })
     }
 
-    fn needs_sync(&self, index: usize) -> bool {
-        self.needs_sync.contains(&index)
-    }
-
     /// Returns a handle, evicting the least recently used entry when full.
     ///
     /// Eviction never syncs. A dirty entry is recorded in `needs_sync` so a
-    /// later [`Storage::sync`] can reopen and flush it.
+    /// later [`Storage::sync`] can reopen and flush it. A cached read-only
+    /// handle is reopened for writing when `writable` is requested.
     fn get_or_open<F>(
         &mut self,
         index: usize,
         path: &Path,
         open: F,
         dirty: bool,
+        writable: bool,
         expected: Option<FileId>,
     ) -> Result<&mut File, StorageError>
     where
@@ -428,6 +427,13 @@ impl HandleCache {
         if let Some(position) = self.entries.iter().position(|entry| entry.index == index) {
             if dirty {
                 self.entries[position].dirty = true;
+            }
+            if writable && !self.entries[position].writable {
+                let file = open(path).map_err(|source| classify(path, source))?;
+                verify_opened(path, &file, expected)?;
+                let entry = &mut self.entries[position];
+                entry.file = file;
+                entry.writable = true;
             }
             if position + 1 != self.entries.len() {
                 let entry = self.entries.remove(position);
@@ -449,7 +455,12 @@ impl HandleCache {
 
         let file = open(path).map_err(|source| classify(path, source))?;
         verify_opened(path, &file, expected)?;
-        self.entries.push(CacheEntry { index, file, dirty });
+        self.entries.push(CacheEntry {
+            index,
+            file,
+            dirty,
+            writable,
+        });
         self.entries
             .last_mut()
             .map(|entry| &mut entry.file)
@@ -458,71 +469,124 @@ impl HandleCache {
             })
     }
 
-    /// Syncs dirty cached handles and reopens evicted ones.
+    /// Flushes every dirty or pending file.
+    ///
+    /// Every file is attempted; only the ones that succeed leave
+    /// `needs_sync`, so a caller can retry after a failure. The first error is
+    /// returned.
     fn sync(
         &mut self,
         root: &Path,
         map: &FileMap,
         files: &[PreparedFile],
     ) -> Result<(), StorageError> {
+        let mut first_error = None;
+
         for entry in &mut self.entries {
             let pending = self.needs_sync.contains(&entry.index);
             if !entry.dirty && !pending {
                 continue;
             }
 
-            let path = files
-                .get(entry.index)
-                .map(|file| file.path.as_path())
-                .ok_or(StorageError::InvalidConfig {
-                    reason: "handle index is outside the file map",
-                })?;
-            entry
-                .file
-                .sync_data()
-                .map_err(|source| classify(path, source))?;
-            entry.dirty = false;
-            self.needs_sync.remove(&entry.index);
+            let path = match files.get(entry.index) {
+                Some(file) => file.path.as_path(),
+                None => {
+                    record_first(
+                        &mut first_error,
+                        StorageError::InvalidConfig {
+                            reason: "handle index is outside the file map",
+                        },
+                    );
+                    continue;
+                }
+            };
+
+            if !entry.writable {
+                match open_rw(path) {
+                    Ok(file) => {
+                        entry.file = file;
+                        entry.writable = true;
+                    }
+                    Err(source) => {
+                        record_first(&mut first_error, classify(path, source));
+                        continue;
+                    }
+                }
+            }
+
+            match entry.file.sync_data() {
+                Ok(()) => {
+                    entry.dirty = false;
+                    self.needs_sync.remove(&entry.index);
+                }
+                Err(source) => record_first(&mut first_error, classify(path, source)),
+            }
         }
 
         let pending: Vec<usize> = self.needs_sync.iter().copied().collect();
         for index in pending {
-            let path = files.get(index).map(|file| file.path.clone()).ok_or(
-                StorageError::InvalidConfig {
-                    reason: "handle index is outside the file map",
-                },
-            )?;
-            let components = map
-                .files()
-                .get(index)
-                .map(|file| file.disk_components.as_slice())
-                .ok_or(StorageError::InvalidConfig {
-                    reason: "handle index is outside the file map",
-                })?;
-
-            if !check_ancestors(root, components)? {
-                return Err(StorageError::Io {
-                    path: path.clone(),
-                    source: io::Error::from(io::ErrorKind::NotFound),
-                });
+            match sync_pending(root, map, files, index) {
+                Ok(()) => {
+                    self.needs_sync.remove(&index);
+                }
+                Err(error) => record_first(&mut first_error, error),
             }
-
-            let metadata = fs::symlink_metadata(&path).map_err(|source| classify(&path, source))?;
-            check_file(&path, &metadata)?;
-            let expected = file_id(&metadata);
-
-            let file = open_rw(&path).map_err(|source| classify(&path, source))?;
-            verify_opened(&path, &file, expected)?;
-            file.sync_data().map_err(|source| classify(&path, source))?;
-            self.needs_sync.remove(&index);
         }
 
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
         self.needs_sync.clear();
+    }
+}
+
+/// Reopens one evicted file after re-checking its ancestors and syncs it.
+fn sync_pending(
+    root: &Path,
+    map: &FileMap,
+    files: &[PreparedFile],
+    index: usize,
+) -> Result<(), StorageError> {
+    let path =
+        files
+            .get(index)
+            .map(|file| file.path.clone())
+            .ok_or(StorageError::InvalidConfig {
+                reason: "handle index is outside the file map",
+            })?;
+    let components = map
+        .files()
+        .get(index)
+        .map(|file| file.disk_components.as_slice())
+        .ok_or(StorageError::InvalidConfig {
+            reason: "handle index is outside the file map",
+        })?;
+
+    if !check_ancestors(root, components)? {
+        return Err(StorageError::Io {
+            path,
+            source: io::Error::from(io::ErrorKind::NotFound),
+        });
+    }
+
+    let metadata = fs::symlink_metadata(&path).map_err(|source| classify(&path, source))?;
+    check_file(&path, &metadata)?;
+    let expected = file_id(&metadata);
+
+    let file = open_rw(&path).map_err(|source| classify(&path, source))?;
+    verify_opened(&path, &file, expected)?;
+    file.sync_data().map_err(|source| classify(&path, source))
+}
+
+/// Keeps the first error of a multi-file sync and ignores later ones.
+fn record_first(slot: &mut Option<StorageError>, error: StorageError) {
+    if slot.is_none() {
+        *slot = Some(error);
     }
 }
 

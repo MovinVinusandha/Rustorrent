@@ -686,6 +686,24 @@ fn write_range_rejects_out_of_range_and_overflow() {
 }
 
 #[test]
+fn read_then_write_reuses_a_writable_handle() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let mut storage = open(&root, map_with(&[(&["a", "data"], 4)])).expect("open");
+    storage.write_range(0, b"abcd").expect("write");
+    storage.close().expect("close");
+
+    let mut buf = [0u8; 4];
+    assert_eq!(storage.read_range(0, &mut buf).expect("read"), 4);
+    storage.write_range(0, b"wxyz").expect("write after read");
+
+    assert_eq!(
+        fs::read(root.join("a").join("data")).expect("read"),
+        b"wxyz"
+    );
+}
+
+#[test]
 fn read_range_does_not_create_missing_files() {
     let dir = temp_dir();
     let root = root_in(&dir);
@@ -734,6 +752,110 @@ fn sync_reopens_evicted_dirty_file() {
         error,
         StorageError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
     ));
+}
+
+#[test]
+fn sync_attempts_every_file_and_keeps_failures() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a", "one"], 4), (&["b", "two"], 4)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"abcdefgh").expect("write");
+    assert!(storage.handles.needs_sync.contains(&0));
+
+    fs::remove_file(root.join("a").join("one")).expect("remove evicted file");
+
+    let error = storage.sync().expect_err("reopen must fail");
+    assert!(matches!(
+        error,
+        StorageError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(
+        storage.handles.needs_sync.contains(&0),
+        "failed file must stay pending"
+    );
+    assert!(
+        !storage.handles.entries[0].dirty,
+        "the cached file must still be flushed"
+    );
+
+    fs::write(root.join("a").join("one"), b"safe").expect("restore file");
+    storage.sync().expect("retry must succeed");
+    assert!(storage.handles.needs_sync.is_empty());
+}
+
+#[test]
+fn close_keeps_state_when_the_flush_fails() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a", "one"], 4), (&["b", "two"], 4)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"abcdefgh").expect("write");
+
+    fs::remove_file(root.join("a").join("one")).expect("remove evicted file");
+
+    let error = storage.close().expect_err("close must fail");
+    assert!(matches!(
+        error,
+        StorageError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
+    ));
+    assert!(
+        storage.handles.needs_sync.contains(&0),
+        "pending file must survive a failed close"
+    );
+    assert_eq!(
+        storage.handles.entries.len(),
+        1,
+        "cache must survive a failed close"
+    );
+
+    fs::write(root.join("a").join("one"), b"safe").expect("restore file");
+    storage.close().expect("retry must succeed");
+    assert!(storage.handles.entries.is_empty());
+    assert!(storage.handles.needs_sync.is_empty());
+}
+
+#[test]
+fn sync_upgrades_a_read_only_handle_for_a_pending_file() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a", "one"], 4), (&["b", "two"], 4)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"abcdefgh").expect("write");
+
+    let mut buf = [0u8; 4];
+    assert_eq!(storage.read_range(0, &mut buf).expect("read"), 4);
+    assert!(storage.handles.needs_sync.contains(&0));
+    assert_eq!(storage.handles.entries[0].index, 0);
+    assert!(!storage.handles.entries[0].writable);
+
+    storage.sync().expect("sync");
+    assert!(storage.handles.needs_sync.is_empty());
+    assert!(storage.handles.entries[0].writable);
+    assert!(!storage.handles.entries[0].dirty);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_range_does_not_require_write_access_to_pending_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a", "one"], 4), (&["b", "two"], 4)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"abcdefgh").expect("write");
+    assert!(storage.handles.needs_sync.contains(&0));
+
+    fs::set_permissions(
+        root.join("a").join("one"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .expect("make read-only");
+
+    let mut buf = [0u8; 4];
+    assert_eq!(storage.read_range(0, &mut buf).expect("read"), 4);
+    assert_eq!(&buf, b"abcd");
 }
 
 #[test]

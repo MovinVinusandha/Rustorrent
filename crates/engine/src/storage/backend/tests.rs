@@ -466,6 +466,21 @@ fn set_len_does_not_truncate_longer_file() {
 }
 
 #[test]
+fn extend_if_short_never_shrinks() {
+    let dir = temp_dir();
+    let path = dir.path().join("file");
+    fs::write(&path, b"0123456789").expect("write");
+
+    extend_if_short(&path, 5).expect("short expectation is a no-op");
+    assert_eq!(fs::read(&path).expect("read"), b"0123456789");
+
+    extend_if_short(&path, 12).expect("extend");
+    let bytes = fs::read(&path).expect("read");
+    assert_eq!(&bytes[..10], b"0123456789");
+    assert_eq!(&bytes[10..], &[0, 0]);
+}
+
+#[test]
 fn existing_zero_length_file_is_never_truncated() {
     let dir = temp_dir();
     let root = root_in(&dir);

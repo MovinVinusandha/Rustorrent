@@ -9,7 +9,7 @@
 //! cursor. Handles live in a strict LRU cache; evicted dirty files are flushed
 //! by [`Storage::sync`] and [`Storage::close`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -182,9 +182,17 @@ impl Storage {
         let mut filled = 0usize;
         for segment in map.segments(offset..end) {
             let index = segment.file_index;
-            let path = self.files[index].path.clone();
+            let path = self
+                .files
+                .get(index)
+                .map(|file| file.path.clone())
+                .ok_or_else(|| internal("file index is outside the file map"))?;
+            let mapped = map
+                .files()
+                .get(index)
+                .ok_or_else(|| internal("file index is outside the file map"))?;
 
-            if !check_ancestors(&self.root, &map.files()[index].disk_components)? {
+            if !check_ancestors(&self.root, &mapped.disk_components)? {
                 break;
             }
 
@@ -202,7 +210,14 @@ impl Storage {
             }
 
             let available_in_file = file_len - segment.offset_in_file;
-            let remaining = requested - filled as u64;
+            let remaining =
+                requested
+                    .checked_sub(filled as u64)
+                    .ok_or(StorageError::OutOfRange {
+                        offset,
+                        len: requested,
+                        total_length,
+                    })?;
             let to_read = segment.len.min(available_in_file).min(remaining);
             let to_read = usize::try_from(to_read).map_err(|_| StorageError::OutOfRange {
                 offset,
@@ -212,6 +227,12 @@ impl Storage {
             if to_read == 0 {
                 break;
             }
+            let read_end = filled
+                .checked_add(to_read)
+                .ok_or_else(|| internal("read cursor overflowed the buffer"))?;
+            let target = buf
+                .get_mut(filled..read_end)
+                .ok_or_else(|| internal("read range is outside the buffer"))?;
 
             // Reads never require write access. A pending sync upgrades the
             // cached handle to read-write when the flush actually runs.
@@ -221,11 +242,13 @@ impl Storage {
 
             let read = read_up_to(
                 |chunk, position| file.read_at(chunk, position),
-                &mut buf[filled..filled + to_read],
+                target,
                 segment.offset_in_file,
             )
             .map_err(|source| classify(&path, source))?;
-            filled += read;
+            filled = filled
+                .checked_add(read)
+                .ok_or_else(|| internal("read count is outside the buffer"))?;
 
             if read < to_read || (to_read as u64) < segment.len {
                 break;
@@ -268,9 +291,20 @@ impl Storage {
         for segment in map.segments(offset..end) {
             let index = segment.file_index;
             let expected = self.ensure_writable_file(index)?;
-            let path = self.files[index].path.clone();
+            let path = self
+                .files
+                .get(index)
+                .map(|file| file.path.clone())
+                .ok_or_else(|| internal("file index is outside the file map"))?;
 
-            let remaining = buf.len() - written;
+            let remaining = buf
+                .len()
+                .checked_sub(written)
+                .ok_or(StorageError::OutOfRange {
+                    offset,
+                    len,
+                    total_length,
+                })?;
             let to_write = segment.len.min(u64::try_from(remaining).map_err(|_| {
                 StorageError::OutOfRange {
                     offset,
@@ -283,17 +317,23 @@ impl Storage {
                 len,
                 total_length,
             })?;
+            let write_end = written
+                .checked_add(to_write)
+                .ok_or_else(|| internal("write cursor overflowed the buffer"))?;
+            let source = buf
+                .get(written..write_end)
+                .ok_or_else(|| internal("write range is outside the buffer"))?;
 
             let file = self
                 .handles
                 .get_or_open(index, &path, open_write, true, true, expected)?;
             write_all_at(
                 |chunk, position| file.write_at(chunk, position),
-                &buf[written..written + to_write],
+                source,
                 segment.offset_in_file,
             )
             .map_err(|source| classify(&path, source))?;
-            written += to_write;
+            written = write_end;
         }
 
         Ok(())
@@ -326,8 +366,15 @@ impl Storage {
     /// handle it opens.
     fn ensure_writable_file(&mut self, index: usize) -> Result<Option<FileId>, StorageError> {
         let map = Arc::clone(&self.map);
-        let mapped = &map.files()[index];
-        let path = self.files[index].path.clone();
+        let mapped = map
+            .files()
+            .get(index)
+            .ok_or_else(|| internal("file index is outside the file map"))?;
+        let path = self
+            .files
+            .get(index)
+            .map(|file| file.path.clone())
+            .ok_or_else(|| internal("file index is outside the file map"))?;
         let parent_count = mapped.disk_components.len().saturating_sub(1);
 
         if !check_ancestors(&self.root, &mapped.disk_components)? {
@@ -378,7 +425,7 @@ const _: fn() = || {
 struct HandleCache {
     capacity: usize,
     /// Least recently used first.
-    entries: Vec<CacheEntry>,
+    entries: VecDeque<CacheEntry>,
     /// Files whose dirty handle was evicted and still need a sync.
     needs_sync: BTreeSet<usize>,
 }
@@ -402,7 +449,7 @@ impl HandleCache {
 
         Ok(Self {
             capacity,
-            entries: Vec::new(),
+            entries: VecDeque::new(),
             needs_sync: BTreeSet::new(),
         })
     }
@@ -425,29 +472,40 @@ impl HandleCache {
         F: FnOnce(&Path) -> io::Result<File>,
     {
         if let Some(position) = self.entries.iter().position(|entry| entry.index == index) {
-            if dirty {
-                self.entries[position].dirty = true;
-            }
-            if writable && !self.entries[position].writable {
-                let file = open(path).map_err(|source| classify(path, source))?;
-                verify_opened(path, &file, expected)?;
-                let entry = &mut self.entries[position];
-                entry.file = file;
-                entry.writable = true;
+            {
+                let entry = self
+                    .entries
+                    .get_mut(position)
+                    .ok_or_else(|| internal("handle cache entry vanished"))?;
+                if dirty {
+                    entry.dirty = true;
+                }
+                if writable && !entry.writable {
+                    let file = open(path).map_err(|source| classify(path, source))?;
+                    verify_opened(path, &file, expected)?;
+                    entry.file = file;
+                    entry.writable = true;
+                }
             }
             if position + 1 != self.entries.len() {
-                let entry = self.entries.remove(position);
-                self.entries.push(entry);
+                let entry = self
+                    .entries
+                    .remove(position)
+                    .ok_or_else(|| internal("handle cache entry vanished"))?;
+                self.entries.push_back(entry);
             }
-            return self.entries.last_mut().map(|entry| &mut entry.file).ok_or(
-                StorageError::InvalidConfig {
-                    reason: "handle cache lost its most recent entry",
-                },
-            );
+            return self
+                .entries
+                .back_mut()
+                .map(|entry| &mut entry.file)
+                .ok_or_else(|| internal("handle cache lost its most recent entry"));
         }
 
         if self.entries.len() >= self.capacity {
-            let evicted = self.entries.remove(0);
+            let evicted = self
+                .entries
+                .pop_front()
+                .ok_or_else(|| internal("handle cache is full but has no entry"))?;
             if evicted.dirty {
                 self.needs_sync.insert(evicted.index);
             }
@@ -455,18 +513,16 @@ impl HandleCache {
 
         let file = open(path).map_err(|source| classify(path, source))?;
         verify_opened(path, &file, expected)?;
-        self.entries.push(CacheEntry {
+        self.entries.push_back(CacheEntry {
             index,
             file,
             dirty,
             writable,
         });
         self.entries
-            .last_mut()
+            .back_mut()
             .map(|entry| &mut entry.file)
-            .ok_or(StorageError::InvalidConfig {
-                reason: "handle cache is empty after insert",
-            })
+            .ok_or_else(|| internal("handle cache is empty after insert"))
     }
 
     /// Flushes every dirty or pending file.
@@ -493,9 +549,7 @@ impl HandleCache {
                 None => {
                     record_first(
                         &mut first_error,
-                        StorageError::InvalidConfig {
-                            reason: "handle index is outside the file map",
-                        },
+                        internal("handle index is outside the file map"),
                     );
                     continue;
                 }
@@ -552,20 +606,15 @@ fn sync_pending(
     files: &[PreparedFile],
     index: usize,
 ) -> Result<(), StorageError> {
-    let path =
-        files
-            .get(index)
-            .map(|file| file.path.clone())
-            .ok_or(StorageError::InvalidConfig {
-                reason: "handle index is outside the file map",
-            })?;
+    let path = files
+        .get(index)
+        .map(|file| file.path.clone())
+        .ok_or_else(|| internal("handle index is outside the file map"))?;
     let components = map
         .files()
         .get(index)
         .map(|file| file.disk_components.as_slice())
-        .ok_or(StorageError::InvalidConfig {
-            reason: "handle index is outside the file map",
-        })?;
+        .ok_or_else(|| internal("handle index is outside the file map"))?;
 
     if !check_ancestors(root, components)? {
         return Err(StorageError::Io {
@@ -738,7 +787,7 @@ fn ensure_file(
             Ok(metadata) => {
                 check_file(path, &metadata)?;
                 if preallocation == Preallocation::SetLen {
-                    extend_if_short(path, &metadata, expected_len)?;
+                    extend_if_short(path, expected_len)?;
                 }
                 return Ok(file_id(&metadata));
             }
@@ -753,7 +802,7 @@ fn ensure_file(
                 check_file(path, &metadata)?;
                 record_inode(path, &metadata, seen_inodes)?;
                 if preallocation == Preallocation::SetLen {
-                    extend_if_short(path, &metadata, expected_len)?;
+                    extend_if_short(path, expected_len)?;
                 }
                 return Ok(file_id(&metadata));
             }
@@ -777,16 +826,22 @@ fn ensure_file(
 }
 
 /// Extends an existing file when preallocation is enabled. Never truncates.
-fn extend_if_short(
-    path: &Path,
-    metadata: &fs::Metadata,
-    expected_len: u64,
-) -> Result<(), StorageError> {
-    if metadata.len() >= expected_len {
+///
+/// The current length is read from the opened handle, so a stale `lstat` made
+/// before the open cannot shrink a file that another process already grew. A
+/// narrow race remains between that `fstat` and `set_len`; v0.1 accepts it
+/// because preallocation runs before this torrent writes anything and no
+/// other component of the client grows these files.
+fn extend_if_short(path: &Path, expected_len: u64) -> Result<(), StorageError> {
+    let file = open_write(path).map_err(|source| classify(path, source))?;
+    let current = file
+        .metadata()
+        .map_err(|source| classify(path, source))?
+        .len();
+    if current >= expected_len {
         return Ok(());
     }
 
-    let file = open_write(path).map_err(|source| classify(path, source))?;
     file.set_len(expected_len)
         .map_err(|source| classify(path, source))
 }
@@ -1011,6 +1066,11 @@ struct FileId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct FileId;
 
+/// Builds a typed error for a broken internal invariant.
+fn internal(reason: &'static str) -> StorageError {
+    StorageError::Internal { reason }
+}
+
 /// Maps I/O failures to typed storage errors.
 fn classify(path: &Path, source: io::Error) -> StorageError {
     let kind = source.kind();
@@ -1166,6 +1226,12 @@ pub enum StorageError {
     #[error("invalid storage config: {reason}")]
     InvalidConfig {
         /// What is wrong.
+        reason: &'static str,
+    },
+    /// An internal invariant was violated.
+    #[error("internal storage invariant: {reason}")]
+    Internal {
+        /// Which invariant.
         reason: &'static str,
     },
 }

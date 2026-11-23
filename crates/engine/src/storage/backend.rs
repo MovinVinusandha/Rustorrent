@@ -1,9 +1,9 @@
-//! Storage backend: validates torrent paths under a download root.
+//! Storage backend: validates torrent paths and creates files under a root.
 //!
-//! Roadmap 3b creates files in two steps. This module first resolves every
-//! torrent-derived path below the root and rejects symlinks, reparse points,
-//! wrong file types, unsanitized components, and duplicate inodes. The next
-//! step creates directories and files.
+//! The backend first resolves every torrent-derived path below the root and
+//! rejects symlinks, reparse points, wrong file types, unsanitized components,
+//! and duplicate inodes. It then creates directories, eager zero-length files,
+//! and preallocated files according to [`Preallocation`].
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bt_platform::file::{create_new, open_write};
 use thiserror::Error;
 
 use super::layout::{FileMap, MappedFile, sanitize_component};
@@ -53,7 +54,7 @@ pub struct Storage {
     root: PathBuf,
     map: Arc<FileMap>,
     config: StorageConfig,
-    files: Vec<PathBuf>,
+    files: Vec<PreparedFile>,
 }
 
 impl Storage {
@@ -90,18 +91,20 @@ impl Storage {
 
         for file in map.files() {
             let path = resolve_file_path(root, file)?;
-
-            match fs::symlink_metadata(&path) {
+            let existed = match fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     check_file(&path, &metadata)?;
                     record_inode(&path, &metadata, &mut seen_inodes)?;
+                    true
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
                 Err(source) => return Err(classify(&path, source)),
-            }
+            };
 
-            files.push(path);
+            files.push(PreparedFile { path, existed });
         }
+
+        prepare_files(root, map.as_ref(), &config, &files, &mut seen_inodes)?;
 
         Ok(Self {
             root: root.to_path_buf(),
@@ -133,7 +136,7 @@ impl Storage {
 
     /// Absolute path of one file, if the index is valid.
     pub fn file_path(&self, index: usize) -> Option<&Path> {
-        self.files.get(index).map(PathBuf::as_path)
+        self.files.get(index).map(|file| file.path.as_path())
     }
 }
 
@@ -142,6 +145,139 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Storage>();
 };
+
+/// A resolved file path and whether it existed before creation.
+#[derive(Debug)]
+struct PreparedFile {
+    path: PathBuf,
+    existed: bool,
+}
+
+/// Creates the paths required by the preallocation policy.
+fn prepare_files(
+    root: &Path,
+    map: &FileMap,
+    config: &StorageConfig,
+    files: &[PreparedFile],
+    seen_inodes: &mut BTreeSet<FileId>,
+) -> Result<(), StorageError> {
+    for (file, prepared) in map.files().iter().zip(files) {
+        let needed = file.length == 0 || config.preallocation == Preallocation::SetLen;
+        if !needed {
+            continue;
+        }
+
+        let parent_count = file.disk_components.len().saturating_sub(1);
+        ensure_parent_dirs(root, &file.disk_components[..parent_count])?;
+        ensure_file(
+            &prepared.path,
+            file.length,
+            prepared.existed,
+            config.preallocation,
+            seen_inodes,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Creates missing parent directories, re-checking every existing component.
+fn ensure_parent_dirs(root: &Path, components: &[String]) -> Result<(), StorageError> {
+    let mut path = root.to_path_buf();
+
+    for component in components {
+        if sanitize_component(component) != *component {
+            return Err(StorageError::UnsafePath {
+                path: path.join(component),
+                reason: UnsafeReason::InvalidComponent,
+            });
+        }
+
+        path.push(component);
+
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => check_directory(&path, &metadata)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata =
+                        fs::symlink_metadata(&path).map_err(|source| classify(&path, source))?;
+                    check_directory(&path, &metadata)?;
+                }
+                Err(source) => return Err(classify(&path, source)),
+            },
+            Err(source) => return Err(classify(&path, source)),
+        }
+    }
+
+    Ok(())
+}
+
+/// Creates or reuses one file and applies the preallocation policy.
+fn ensure_file(
+    path: &Path,
+    expected_len: u64,
+    existed: bool,
+    preallocation: Preallocation,
+    seen_inodes: &mut BTreeSet<FileId>,
+) -> Result<(), StorageError> {
+    if existed {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                check_file(path, &metadata)?;
+                if preallocation == Preallocation::SetLen {
+                    extend_if_short(path, &metadata, expected_len)?;
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(classify(path, source)),
+        }
+    }
+
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                check_file(path, &metadata)?;
+                record_inode(path, &metadata, seen_inodes)?;
+                if preallocation == Preallocation::SetLen {
+                    extend_if_short(path, &metadata, expected_len)?;
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match create_new(path) {
+                Ok(file) => {
+                    let metadata = file.metadata().map_err(|source| classify(path, source))?;
+                    check_file(path, &metadata)?;
+                    record_inode(path, &metadata, seen_inodes)?;
+                    if preallocation == Preallocation::SetLen && expected_len > 0 {
+                        file.set_len(expected_len)
+                            .map_err(|source| classify(path, source))?;
+                    }
+                    return Ok(());
+                }
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => return Err(classify(path, source)),
+            },
+            Err(source) => return Err(classify(path, source)),
+        }
+    }
+}
+
+/// Extends an existing file when preallocation is enabled. Never truncates.
+fn extend_if_short(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_len: u64,
+) -> Result<(), StorageError> {
+    if metadata.len() >= expected_len {
+        return Ok(());
+    }
+
+    let file = open_write(path).map_err(|source| classify(path, source))?;
+    file.set_len(expected_len)
+        .map_err(|source| classify(path, source))
+}
 
 /// Resolves one mapped file and validates every existing ancestor.
 fn resolve_file_path(root: &Path, file: &MappedFile) -> Result<PathBuf, StorageError> {

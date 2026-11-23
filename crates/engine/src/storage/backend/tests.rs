@@ -61,6 +61,21 @@ fn open(root: &Path, map: Arc<FileMap>) -> Result<Storage, StorageError> {
     Storage::open(root, map, StorageConfig::default())
 }
 
+fn open_with(
+    root: &Path,
+    map: Arc<FileMap>,
+    config: StorageConfig,
+) -> Result<Storage, StorageError> {
+    Storage::open(root, map, config)
+}
+
+fn set_len_config() -> StorageConfig {
+    StorageConfig {
+        preallocation: Preallocation::SetLen,
+        ..StorageConfig::default()
+    }
+}
+
 #[cfg(unix)]
 fn create_dir_symlink(original: &Path, link: &Path) -> bool {
     std::os::unix::fs::symlink(original, link).expect("create directory symlink");
@@ -313,6 +328,144 @@ fn accepts_existing_distinct_files() {
     let map = map_with(&[(&["top", "a"], 1), (&["top", "b"], 1)]);
     let storage = open(&root, map).expect("distinct files are ok");
     assert_eq!(storage.file_count(), 2);
+}
+
+#[test]
+fn off_creates_zero_length_files_and_parents() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+
+    open(&root, map_with(&[(&["a", "empty"], 0)])).expect("open");
+
+    let path = root.join("a").join("empty");
+    assert!(path.is_file());
+    assert_eq!(fs::metadata(&path).expect("metadata").len(), 0);
+}
+
+#[test]
+fn off_leaves_nonzero_files_and_parents_missing() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+
+    open(&root, map_with(&[(&["a", "data"], 10)])).expect("open");
+
+    assert!(!root.join("a").exists());
+    assert!(!root.join("a").join("data").exists());
+}
+
+#[test]
+fn off_preserves_existing_file_content() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    fs::create_dir_all(root.join("a")).expect("create dirs");
+    fs::write(root.join("a").join("data"), b"keep").expect("write data");
+
+    open(&root, map_with(&[(&["a", "data"], 10)])).expect("open");
+
+    assert_eq!(
+        fs::read(root.join("a").join("data")).expect("read"),
+        b"keep"
+    );
+}
+
+#[test]
+fn set_len_creates_all_files_and_extends() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    fs::create_dir_all(root.join("a")).expect("create dirs");
+    fs::write(root.join("a").join("data"), b"abc").expect("write data");
+
+    let map = map_with(&[(&["a", "data"], 5), (&["a", "empty"], 0)]);
+    open_with(&root, map, set_len_config()).expect("open");
+
+    let data = root.join("a").join("data");
+    assert_eq!(fs::metadata(&data).expect("metadata").len(), 5);
+    let bytes = fs::read(&data).expect("read data");
+    assert_eq!(&bytes[..3], b"abc");
+    assert_eq!(&bytes[3..], &[0, 0]);
+
+    let empty = root.join("a").join("empty");
+    assert_eq!(fs::metadata(&empty).expect("metadata").len(), 0);
+}
+
+#[test]
+fn set_len_does_not_truncate_longer_file() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    fs::create_dir_all(root.join("a")).expect("create dirs");
+    fs::write(root.join("a").join("data"), b"0123456789").expect("write data");
+
+    open_with(&root, map_with(&[(&["a", "data"], 5)]), set_len_config()).expect("open");
+
+    assert_eq!(
+        fs::read(root.join("a").join("data")).expect("read"),
+        b"0123456789"
+    );
+}
+
+#[test]
+fn existing_zero_length_file_is_never_truncated() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    fs::create_dir_all(root.join("a")).expect("create dirs");
+    fs::write(root.join("a").join("empty"), b"keep").expect("write file");
+
+    open_with(&root, map_with(&[(&["a", "empty"], 0)]), set_len_config()).expect("open");
+
+    assert_eq!(
+        fs::read(root.join("a").join("empty")).expect("read"),
+        b"keep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn created_files_have_no_execute_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    open(&root, map_with(&[(&["a", "empty"], 0)])).expect("open");
+
+    let path = root.join("a").join("empty");
+    let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+    assert_eq!(mode & 0o111, 0);
+}
+
+#[test]
+fn ensure_parent_dirs_rejects_file_component() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    fs::write(root.join("a"), b"x").expect("write file");
+
+    let error = ensure_parent_dirs(&root, &["a".to_owned()]).expect_err("file parent must fail");
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::NotDirectory,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ensure_parent_dirs_rejects_symlink() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    if !create_dir_symlink(&outside, &root.join("a")) {
+        return;
+    }
+
+    let error = ensure_parent_dirs(&root, &["a".to_owned()]).expect_err("symlink parent must fail");
+    assert!(matches!(
+        error,
+        StorageError::UnsafePath {
+            reason: UnsafeReason::Symlink,
+            ..
+        }
+    ));
 }
 
 #[test]

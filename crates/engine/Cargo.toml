@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+bt-platform.workspace = true
 bt-proto.workspace = true
 sha1.workspace = true
 thiserror.workspace = true

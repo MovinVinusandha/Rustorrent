@@ -140,6 +140,16 @@ fn open_read_missing_file_returns_not_found() {
 }
 
 #[test]
+fn metadata_matches_len() {
+    let dir = temp_dir();
+    let file = create_new(&path_in(&dir, "data")).expect("create");
+    write_all_at(&file, b"abc", 0);
+
+    assert_eq!(file.metadata().expect("metadata").len(), 3);
+    assert_eq!(file.len().expect("len"), 3);
+}
+
+#[test]
 fn empty_file_reports_empty() {
     let dir = temp_dir();
     let file = create_new(&path_in(&dir, "data")).expect("create");

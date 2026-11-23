@@ -177,6 +177,7 @@ dependencies = [
 name = "bt-engine"
 version = "0.1.0"
 dependencies = [
+ "bt-platform",
  "bt-proto",
  "proptest",
  "sha1",

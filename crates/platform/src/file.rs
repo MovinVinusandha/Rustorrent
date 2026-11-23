@@ -5,7 +5,7 @@
 //! used. Handles are not shared across threads because the Windows calls also
 //! move the file cursor.
 
-use std::fs::{File as StdFile, OpenOptions};
+use std::fs::{File as StdFile, Metadata, OpenOptions};
 use std::io;
 use std::path::Path;
 
@@ -65,9 +65,14 @@ impl File {
         }
     }
 
+    /// Returns metadata for this open file.
+    pub fn metadata(&self) -> io::Result<Metadata> {
+        self.inner.metadata()
+    }
+
     /// Returns the current file length.
     pub fn len(&self) -> io::Result<u64> {
-        self.inner.metadata().map(|metadata| metadata.len())
+        self.metadata().map(|metadata| metadata.len())
     }
 
     /// Returns `true` when the file length is zero.

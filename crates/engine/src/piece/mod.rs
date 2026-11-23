@@ -23,6 +23,14 @@ pub use spec::{PieceSpec, PieceSpecError};
 /// is shorter when the piece length is not a multiple of it.
 pub const BLOCK_LEN: usize = 16 * 1024;
 
+/// Asserts that every byte and slot allocated through `torrent` is released.
+#[cfg(test)]
+pub(crate) fn assert_budget_idle(budget: &MemoryBudget, torrent: &TorrentBudget) {
+    assert_eq!(budget.in_use_bytes(), 0, "global budget leaked bytes");
+    assert_eq!(torrent.in_use_bytes(), 0, "torrent budget leaked bytes");
+    assert_eq!(torrent.in_flight(), 0, "torrent budget leaked a slot");
+}
+
 /// Engine-assigned handle for one peer connection.
 ///
 /// This is deliberately not the 20-byte BitTorrent peer ID from the wire. The

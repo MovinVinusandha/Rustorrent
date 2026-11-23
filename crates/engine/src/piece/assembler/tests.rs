@@ -1,14 +1,17 @@
 use super::*;
 use crate::metainfo::PIECE_HASH_LENGTH;
-use crate::piece::{BLOCK_LEN, MemoryBudget, PeerKey, PieceSpec, TorrentBudget};
+use crate::piece::{
+    BLOCK_LEN, MemoryBudget, PeerKey, PieceSpec, TorrentBudget, assert_budget_idle,
+};
 
 const MIB: u64 = 1024 * 1024;
 const HASH: [u8; PIECE_HASH_LENGTH] = [0x5A; PIECE_HASH_LENGTH];
 
-fn torrent_budget(length: usize) -> TorrentBudget {
+fn budgets(length: usize) -> (MemoryBudget, TorrentBudget) {
     let budget = MemoryBudget::new(128 * MIB).expect("memory budget");
     let declared = u64::try_from(length).expect("length fits u64");
-    budget.torrent_budget(declared).expect("torrent budget")
+    let torrent = budget.torrent_budget(declared).expect("torrent budget");
+    (budget, torrent)
 }
 
 fn start_piece(
@@ -25,12 +28,15 @@ fn start_piece(
     assembler.start_at(spec, reservation, now).expect("start");
 }
 
-fn setup_at(length: usize, now: Instant) -> (PieceAssembler, TorrentBudget, PieceSpec) {
-    let torrent = torrent_budget(length);
+fn setup_at(
+    length: usize,
+    now: Instant,
+) -> (PieceAssembler, MemoryBudget, TorrentBudget, PieceSpec) {
+    let (budget, torrent) = budgets(length);
     let spec = PieceSpec::new(0, 0, length, HASH).expect("piece spec");
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
     start_piece(&mut assembler, &torrent, 0, length, now);
-    (assembler, torrent, spec)
+    (assembler, budget, torrent, spec)
 }
 
 fn block_bytes(block: u32, len: usize) -> Vec<u8> {
@@ -50,7 +56,7 @@ fn block_offset(block: u32) -> u32 {
 fn completing_a_piece_returns_the_buffer_and_releases_the_slot() {
     let t0 = Instant::now();
     let len = 2 * BLOCK_LEN;
-    let (mut assembler, torrent, spec) = setup_at(len, t0);
+    let (mut assembler, budget, torrent, spec) = setup_at(len, t0);
     let len_u64 = u64::try_from(len).expect("len fits u64");
 
     assert!(assembler.is_in_flight(0));
@@ -101,21 +107,23 @@ fn completing_a_piece_returns_the_buffer_and_releases_the_slot() {
 
     assert!(!assembler.is_in_flight(0));
     assert_eq!(assembler.in_flight(), 0);
-    assert_eq!(torrent.in_use_bytes(), 0);
-    assert_eq!(torrent.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
 fn a_late_block_after_completion_is_not_started_and_benign() {
     let t0 = Instant::now();
     let len = BLOCK_LEN;
-    let (mut assembler, _torrent, _spec) = setup_at(len, t0);
+    let (mut assembler, budget, torrent, _spec) = setup_at(len, t0);
     let bytes = block_bytes(0, len);
 
-    let result = assembler
+    match assembler
         .insert_at(0, PeerKey::from_raw(1), 0, &bytes, t0)
-        .expect("complete");
-    assert!(matches!(result, InsertResult::Complete(_)));
+        .expect("complete")
+    {
+        InsertResult::Complete(buffer) => drop(buffer),
+        InsertResult::Incomplete(_) => panic!("single block did not complete the piece"),
+    }
 
     let error = assembler
         .insert_at(0, PeerKey::from_raw(2), 0, &bytes, t0)
@@ -123,6 +131,7 @@ fn a_late_block_after_completion_is_not_started_and_benign() {
         .expect("late block error");
     assert_eq!(error, PieceError::NotStarted { piece: 0 });
     assert!(!error.is_protocol_violation());
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
@@ -143,7 +152,7 @@ fn inserting_an_unknown_piece_is_not_started() {
 fn starting_an_in_flight_piece_is_rejected_without_leaking() {
     let t0 = Instant::now();
     let len = BLOCK_LEN;
-    let (mut assembler, torrent, spec) = setup_at(len, t0);
+    let (mut assembler, budget, torrent, spec) = setup_at(len, t0);
     let len_u64 = u64::try_from(len).expect("len fits u64");
 
     let reservation = torrent.try_reserve(len).expect("reservation");
@@ -154,6 +163,7 @@ fn starting_an_in_flight_piece_is_rejected_without_leaking() {
     assert_eq!(assembler.in_flight(), 1);
     assert_eq!(torrent.in_use_bytes(), len_u64);
     assert_eq!(torrent.in_flight(), 1);
+    assert_eq!(budget.in_use_bytes(), len_u64);
 }
 
 #[test]
@@ -168,7 +178,7 @@ fn a_zero_stall_timeout_is_rejected() {
 fn stalled_pieces_expire_and_release_their_budget() {
     let t0 = Instant::now();
     let len = 2 * BLOCK_LEN;
-    let (mut assembler, torrent, _spec) = setup_at(len, t0);
+    let (mut assembler, budget, torrent, _spec) = setup_at(len, t0);
     let len_u64 = u64::try_from(len).expect("len fits u64");
 
     assert!(
@@ -186,9 +196,7 @@ fn stalled_pieces_expire_and_release_their_budget() {
 
     assert_eq!(assembler.sweep_stalled(t0 + DEFAULT_STALL_TIMEOUT), vec![0]);
     assert!(!assembler.is_in_flight(0));
-    assert_eq!(assembler.in_flight(), 0);
-    assert_eq!(torrent.in_use_bytes(), 0);
-    assert_eq!(torrent.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 
     let bytes = block_bytes(0, BLOCK_LEN);
     let error = assembler
@@ -205,10 +213,25 @@ fn stalled_pieces_expire_and_release_their_budget() {
 }
 
 #[test]
+fn dropping_the_assembler_releases_in_flight_pieces() {
+    let t0 = Instant::now();
+    let len = 2 * BLOCK_LEN;
+    let (assembler, budget, torrent, _spec) = setup_at(len, t0);
+    let len_u64 = u64::try_from(len).expect("len fits u64");
+
+    assert_eq!(assembler.in_flight(), 1);
+    assert_eq!(torrent.in_use_bytes(), len_u64);
+    assert_eq!(torrent.in_flight(), 1);
+
+    drop(assembler);
+    assert_budget_idle(&budget, &torrent);
+}
+
+#[test]
 fn slow_steady_progress_keeps_a_piece_alive() {
     let t0 = Instant::now();
     let len = 3 * BLOCK_LEN;
-    let (mut assembler, _torrent, _spec) = setup_at(len, t0);
+    let (mut assembler, budget, torrent, _spec) = setup_at(len, t0);
 
     let first = block_bytes(0, BLOCK_LEN);
     assert!(matches!(
@@ -254,13 +277,14 @@ fn slow_steady_progress_keeps_a_piece_alive() {
         vec![0],
         "30 seconds without progress must expire"
     );
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
 fn rejected_blocks_do_not_refresh_the_stall_deadline() {
     let t0 = Instant::now();
     let len = 2 * BLOCK_LEN;
-    let (mut assembler, torrent, _spec) = setup_at(len, t0);
+    let (mut assembler, budget, torrent, _spec) = setup_at(len, t0);
     let first = block_bytes(0, BLOCK_LEN);
 
     assert!(matches!(
@@ -337,14 +361,14 @@ fn rejected_blocks_do_not_refresh_the_stall_deadline() {
         vec![0],
         "the deadline is measured from the last valid block"
     );
-    assert_eq!(torrent.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
 fn pieces_expire_independently_in_piece_order() {
     let t0 = Instant::now();
     let len = BLOCK_LEN;
-    let torrent = torrent_budget(len);
+    let (budget, torrent) = budgets(len);
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
 
     start_piece(&mut assembler, &torrent, 0, len, t0);
@@ -377,13 +401,14 @@ fn pieces_expire_independently_in_piece_order() {
         vec![3, 5],
         "expired pieces are reported in ascending order"
     );
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
 fn starting_with_a_mismatched_reservation_is_a_buffer_error() {
     let t0 = Instant::now();
     let len = 4096;
-    let torrent = torrent_budget(len);
+    let (budget, torrent) = budgets(len);
     let spec = PieceSpec::new(0, 0, len, HASH).expect("spec");
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
 
@@ -400,7 +425,7 @@ fn starting_with_a_mismatched_reservation_is_a_buffer_error() {
     );
     assert!(!error.is_protocol_violation());
     assert_eq!(assembler.in_flight(), 0);
-    assert_eq!(torrent.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
@@ -443,7 +468,7 @@ fn only_wrapped_block_violations_are_protocol_violations() {
 #[test]
 fn public_start_and_insert_use_the_current_time() {
     let len = BLOCK_LEN;
-    let torrent = torrent_budget(len);
+    let (budget, torrent) = budgets(len);
     let spec = PieceSpec::new(0, 0, len, HASH).expect("spec");
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
 
@@ -460,5 +485,5 @@ fn public_start_and_insert_use_the_current_time() {
         }
         InsertResult::Incomplete(_) => panic!("single-block piece did not complete"),
     }
-    assert_eq!(assembler.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 }

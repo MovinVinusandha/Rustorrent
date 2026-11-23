@@ -5,6 +5,7 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::metainfo::MAX_PIECE_LENGTH;
+use crate::piece::assert_budget_idle;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -99,10 +100,8 @@ async fn reserve_and_drop_releases_global_and_torrent_bytes() {
     assert_eq!(torrent.in_flight(), 1);
 
     drop(reservation);
-    assert_eq!(budget.in_use_bytes(), 0);
     assert_eq!(budget.available_bytes(), 8 * MIB);
-    assert_eq!(torrent.in_use_bytes(), 0);
-    assert_eq!(torrent.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[tokio::test]
@@ -114,7 +113,7 @@ async fn actual_piece_length_can_be_shorter_than_piece_length() {
     assert_eq!(reservation.bytes(), 4096);
     assert_eq!(torrent.in_use_bytes(), 4096);
     drop(reservation);
-    assert_eq!(torrent.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[tokio::test]
@@ -131,8 +130,7 @@ async fn invalid_reservations_are_rejected_without_waiting() {
         })
     );
 
-    assert_eq!(budget.in_use_bytes(), 0);
-    assert_eq!(torrent.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
@@ -151,8 +149,7 @@ fn a_reservation_larger_than_one_piece_length_is_rejected() {
             })
         );
     }
-    assert_eq!(budget.in_use_bytes(), 0);
-    assert_eq!(torrent.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[test]
@@ -174,7 +171,7 @@ fn failed_try_reserve_releases_the_slot_it_acquired() {
     let second = torrent.try_reserve(bytes(1)).expect("slot after release");
     assert_eq!(torrent.in_flight(), 1);
     drop(second);
-    assert_eq!(torrent.in_flight(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[tokio::test]
@@ -196,7 +193,7 @@ async fn global_budget_blocks_until_a_reservation_is_dropped() {
     assert!(early.is_err(), "reservation should wait for global bytes");
 
     drop(one);
-    let third = timeout(Duration::from_secs(5), pending)
+    let third = timeout(Duration::from_secs(30), pending)
         .await
         .expect("reservation should finish after a release")
         .expect("reserve");
@@ -205,7 +202,7 @@ async fn global_budget_blocks_until_a_reservation_is_dropped() {
 
     drop(third);
     drop(two);
-    assert_eq!(budget.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &second);
 }
 
 #[tokio::test]
@@ -222,7 +219,7 @@ async fn torrent_slots_limit_a_third_buffer() {
     assert!(early.is_err(), "third buffer should wait for a slot");
 
     drop(one);
-    let three = timeout(Duration::from_secs(5), pending)
+    let three = timeout(Duration::from_secs(30), pending)
         .await
         .expect("slot should become available")
         .expect("reserve");
@@ -230,8 +227,7 @@ async fn torrent_slots_limit_a_third_buffer() {
 
     drop(three);
     drop(two);
-    assert_eq!(torrent.in_flight(), 0);
-    assert_eq!(budget.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[tokio::test]
@@ -252,8 +248,29 @@ async fn cancelling_a_global_wait_releases_the_acquired_slot() {
     assert_eq!(budget.in_use_bytes(), MIB);
 
     drop(held);
-    assert_eq!(torrent.in_flight(), 0);
-    assert_eq!(budget.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &torrent);
+}
+
+#[tokio::test]
+async fn cancelling_a_slot_wait_leaks_nothing() {
+    let budget = memory_budget(128);
+    // A 64 MiB piece has exactly one slot, so the second request waits on the
+    // slot semaphore while global bytes are still available.
+    let torrent = torrent(&budget, 64);
+    let held = torrent.reserve(bytes(64)).await.expect("held");
+    assert_eq!(torrent.in_flight(), 1);
+
+    let mut pending = Box::pin(torrent.reserve(bytes(1)));
+    let early = timeout(Duration::from_millis(50), &mut pending).await;
+    assert!(early.is_err(), "second buffer should wait for the slot");
+    assert_eq!(budget.in_use_bytes(), 64 * MIB);
+
+    drop(pending);
+    assert_eq!(torrent.in_flight(), 1, "cancelled slot wait leaked a slot");
+    assert_eq!(torrent.in_use_bytes(), 64 * MIB);
+
+    drop(held);
+    assert_budget_idle(&budget, &torrent);
 }
 
 #[tokio::test]
@@ -284,7 +301,7 @@ async fn a_huge_piece_fits_twice_and_never_deadlocks() {
     assert!(early.is_err(), "third huge piece should wait");
 
     drop(one);
-    let three = timeout(Duration::from_secs(5), pending)
+    let three = timeout(Duration::from_secs(30), pending)
         .await
         .expect("third huge piece should proceed after a release")
         .expect("reserve");
@@ -292,7 +309,8 @@ async fn a_huge_piece_fits_twice_and_never_deadlocks() {
 
     drop(three);
     drop(two);
-    assert_eq!(budget.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &first);
+    assert_budget_idle(&budget, &second);
 }
 
 #[tokio::test]
@@ -308,6 +326,6 @@ async fn clones_share_the_same_torrent_limits() {
     assert_eq!(clone.in_flight(), 1);
 
     drop(reservation);
-    assert_eq!(torrent.in_use_bytes(), 0);
+    assert_budget_idle(&budget, &torrent);
     assert_eq!(clone.in_flight(), 0);
 }

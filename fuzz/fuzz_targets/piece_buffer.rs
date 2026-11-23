@@ -87,6 +87,26 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
         }
+
+        // Compare every block with the accepted model after each record, so a
+        // silent overwrite is caught even in a piece that never completes.
+        for block in 0..blocks {
+            let start = usize::try_from(block).expect("block fits usize") * BLOCK_LEN;
+            if filled[block as usize] {
+                let len = buffer.block_len(block).expect("in-range block");
+                assert_eq!(
+                    buffer.block_bytes(block),
+                    Some(&expected[start..start + len]),
+                    "block {block} changed after a later insert"
+                );
+            } else {
+                assert_eq!(
+                    buffer.block_bytes(block),
+                    None,
+                    "unfilled block {block} has bytes"
+                );
+            }
+        }
     }
 
     let received = filled.iter().filter(|filled| **filled).count() as u32;

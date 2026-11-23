@@ -121,6 +121,21 @@ impl PieceBuffer {
         self.peers.get(index).copied().flatten()
     }
 
+    /// Bytes accepted for `block`, or `None` if it has not been received.
+    ///
+    /// Verification and the block-insertion fuzz model compare these bytes
+    /// after every insert; the whole piece is exposed only through
+    /// [`PieceBuffer::complete_bytes`].
+    pub fn block_bytes(&self, block: u32) -> Option<&[u8]> {
+        let index = usize::try_from(block).ok()?;
+        if self.peers.get(index)?.is_none() {
+            return None;
+        }
+        let start = index.checked_mul(BLOCK_LEN)?;
+        let end = start.checked_add(self.block_len(block)?)?;
+        self.data.get(start..end)
+    }
+
     /// Sorted, deduplicated peers that supplied at least one block.
     ///
     /// Used for diagnostics after a hash failure. No banning happens here.

@@ -343,6 +343,22 @@ fn rejected_blocks_leave_the_buffer_untouched() {
 }
 
 #[test]
+fn block_bytes_returns_only_received_blocks() {
+    let len = 2 * BLOCK_LEN;
+    let mut buffer = piece_buffer(len);
+
+    assert_eq!(buffer.block_bytes(0), None);
+    assert_eq!(buffer.block_bytes(2), None);
+
+    let first = block_bytes(0, BLOCK_LEN);
+    buffer
+        .insert(PeerKey::from_raw(1), 0, &first)
+        .expect("block 0");
+    assert_eq!(buffer.block_bytes(0), Some(first.as_slice()));
+    assert_eq!(buffer.block_bytes(1), None);
+}
+
+#[test]
 fn the_largest_piece_uses_the_maximum_block_count() {
     let max = usize::try_from(MAX_PIECE_LENGTH).expect("max piece fits usize");
     let buffer = piece_buffer(max);

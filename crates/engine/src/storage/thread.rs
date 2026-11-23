@@ -1,9 +1,15 @@
 //! Dedicated storage worker thread and its cloneable async handle.
 //!
-//! One worker owns one [`Storage`] for its whole life. Every blocking file
+//! One worker owns one [`Storage`] until shutdown. Every blocking file
 //! operation runs on that thread, never on a runtime worker. Callers use
 //! [`StorageHandle`] from async tasks, and the bounded request queue turns a
 //! slow disk into backpressure instead of growing memory.
+//!
+//! The bound covers queued payload only: at most
+//! `QUEUE_CAPACITY * MAX_RANGE_LEN` bytes of write data. A caller blocked in
+//! `reserve` still holds its own request buffer (up to 1 MiB), and each read
+//! reply adds up to 1 MiB, so callers that issue many concurrent requests must
+//! bound their own in-flight work.
 //!
 //! Requests are positioned byte ranges. Piece assembly, hashing, and recheck
 //! live above this module and never run on the storage thread.
@@ -28,7 +34,7 @@ pub const QUEUE_CAPACITY: usize = 64;
 /// [`StorageHandle::write_range`] request.
 ///
 /// Piece writes are split into chunks of this size, so the queue holds at most
-/// `QUEUE_CAPACITY * MAX_RANGE_LEN` bytes of request payload.
+/// `QUEUE_CAPACITY * MAX_RANGE_LEN` bytes of write payload.
 pub const MAX_RANGE_LEN: usize = 1024 * 1024;
 
 const THREAD_NAME: &str = "bt-storage";
@@ -68,9 +74,9 @@ type Reply<T> = oneshot::Sender<Result<T, StorageHandleError>>;
 ///
 /// All methods are async and never block a runtime worker. A request is
 /// enqueued when a queue slot becomes available; a caller that is cancelled
-/// while waiting for a reply may still have its request executed. Requests
-/// from one handle are processed in the order they were sent (FIFO per
-/// sender); requests from different clones are interleaved.
+/// while waiting for a reply may still have its request executed. Sequential
+/// requests from one handle are processed in order; requests from different
+/// clones are interleaved.
 ///
 /// Dropping the last handle closes the queue. The worker then performs a
 /// best-effort close and exits without reporting errors. Call
@@ -108,6 +114,9 @@ impl StorageHandle {
         #[cfg(not(test))]
         let exit = None;
 
+        // The thread is detached: nothing joins it, so a panic in the worker is
+        // observable only as `WorkerStopped` on a later request (unwind
+        // builds; release builds abort on panic).
         let _join = thread::Builder::new()
             .name(THREAD_NAME.to_owned())
             .stack_size(THREAD_STACK_SIZE)
@@ -185,6 +194,10 @@ impl StorageHandle {
     /// [`StorageHandleError::ShuttingDown`], or with
     /// [`StorageHandleError::WorkerStopped`] when it arrives after the worker
     /// closed the queue and its reply is dropped.
+    ///
+    /// Cancelling this future after the flag is set does not undo the shutdown:
+    /// the worker still closes and exits, and a retry fails with
+    /// [`StorageHandleError::ShuttingDown`].
     ///
     /// The worker drops the [`Storage`] before it replies, so all file handles
     /// are closed when this returns. The return value is the final sync result:

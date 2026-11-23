@@ -21,7 +21,12 @@ use crate::metainfo::PIECE_HASH_LENGTH;
 /// that string at [`MAX_STRING_BYTES`] and every hash occupies
 /// [`PIECE_HASH_LENGTH`] bytes, so no valid metainfo can declare more pieces
 /// than this.
-pub const MAX_PIECE_COUNT: u32 = (MAX_STRING_BYTES as u32) / (PIECE_HASH_LENGTH as u32);
+pub const MAX_PIECE_COUNT: u32 = (MAX_STRING_BYTES / PIECE_HASH_LENGTH) as u32;
+
+// `MetaInfo::parse` enforces `MAX_STRING_BYTES` on every bencode string, so the
+// derived count always fits in `u32`. Pinned here so raising the string limit
+// cannot silently truncate it.
+const _: () = assert!(MAX_STRING_BYTES / PIECE_HASH_LENGTH <= u32::MAX as usize);
 
 /// Errors returned by [`Bitfield`].
 #[derive(Debug, Error, PartialEq, Eq)]

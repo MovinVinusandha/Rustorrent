@@ -23,6 +23,12 @@ use std::fmt;
 use thiserror::Error;
 
 use super::{BLOCK_LEN, PeerKey, PieceReservation, PieceSpec};
+use crate::metainfo::MAX_PIECE_LENGTH;
+
+// `PieceSpec` rejects any piece above `MAX_PIECE_LENGTH`, and 64 MiB / 16 KiB
+// is 4096 blocks, so the block count always fits in `u32`. Pinned here so a
+// future limit change cannot silently truncate it.
+const _: () = assert!(MAX_PIECE_LENGTH.div_ceil(BLOCK_LEN as u64) <= u32::MAX as u64);
 
 /// A buffer that assembles one piece from blocks.
 pub struct PieceBuffer {
@@ -49,10 +55,10 @@ impl PieceBuffer {
         }
 
         let blocks = spec.length().div_ceil(BLOCK_LEN);
-        let block_count =
-            u32::try_from(blocks).map_err(|_| PieceBufferError::TooManyBlocks { blocks })?;
+        // The const assertion above proves this conversion cannot truncate.
+        let block_count = blocks as u32;
         let data = allocate_zeroed(spec.length())?;
-        let peers = allocate_peers(block_count)?;
+        let peers = allocate_peers(blocks)?;
 
         Ok(Self {
             spec,
@@ -292,12 +298,6 @@ pub enum PieceBufferError {
         /// Required bytes.
         needed: usize,
     },
-    /// The block count does not fit `u32`.
-    #[error("piece has {blocks} blocks, which does not fit u32")]
-    TooManyBlocks {
-        /// Computed block count.
-        blocks: usize,
-    },
     /// The data allocation failed.
     #[error("could not allocate {bytes} bytes for a piece buffer")]
     Allocation {
@@ -314,9 +314,7 @@ fn allocate_zeroed(len: usize) -> Result<Box<[u8]>, PieceBufferError> {
     Ok(data.into_boxed_slice())
 }
 
-fn allocate_peers(block_count: u32) -> Result<Box<[Option<PeerKey>]>, PieceBufferError> {
-    let count = usize::try_from(block_count)
-        .map_err(|_| PieceBufferError::TooManyBlocks { blocks: usize::MAX })?;
+fn allocate_peers(count: usize) -> Result<Box<[Option<PeerKey>]>, PieceBufferError> {
     let bytes = count.saturating_mul(std::mem::size_of::<Option<PeerKey>>());
     let mut peers = Vec::new();
     peers

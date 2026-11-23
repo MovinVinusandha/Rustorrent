@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::metainfo::PIECE_HASH_LENGTH;
+use crate::metainfo::{MAX_PIECE_LENGTH, PIECE_HASH_LENGTH};
 use crate::piece::{MemoryBudget, TorrentBudget};
 
 const MIB: u64 = 1024 * 1024;
@@ -340,6 +340,16 @@ fn rejected_blocks_leave_the_buffer_untouched() {
             PeerKey::from_raw(9)
         ]
     );
+}
+
+#[test]
+fn the_largest_piece_uses_the_maximum_block_count() {
+    let max = usize::try_from(MAX_PIECE_LENGTH).expect("max piece fits usize");
+    let buffer = piece_buffer(max);
+
+    assert_eq!(buffer.block_count(), 4096);
+    assert_eq!(buffer.block_len(4095), Some(BLOCK_LEN));
+    assert_eq!(buffer.block_len(4096), None);
 }
 
 #[test]

@@ -6,7 +6,7 @@ use super::*;
 fn max_piece_count_is_derived_from_metainfo_limits() {
     assert_eq!(
         MAX_PIECE_COUNT,
-        MAX_STRING_BYTES as u32 / PIECE_HASH_LENGTH as u32
+        (MAX_STRING_BYTES / PIECE_HASH_LENGTH) as u32
     );
 }
 

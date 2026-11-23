@@ -27,7 +27,9 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     against files, fallback to recheck.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
     recorded in the `FileMap`, never follow links, and never remove directories
-    outside the root. The API stub currently ignores `delete_files`.
+    outside the root. Route deletion through the storage worker as a command so
+    it runs on the storage thread and cannot race open handles. The API stub
+    currently ignores `delete_files`.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame
@@ -35,6 +37,10 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 - [ ] 8. Magnet + metadata fetch (BEP 9/10)
 - [ ] 9. DHT (BEP 5)
 - [ ] 10. Real in-process engine behind EngineClient + event stream
+  - [ ] Session storage pool with a global file-handle budget. One worker for
+    all torrents; the 64-handle cap is per `Storage` today, so N torrents can
+    hold N × 64 descriptors while macOS defaults to a 256 soft limit.
+    `StorageHandle` methods stay the same.
 - [ ] 11. TUI: list, add, details, limits
 - [ ] 12. Cross-platform CI green, tag v0.1.0
 

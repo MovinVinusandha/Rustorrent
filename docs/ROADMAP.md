@@ -37,11 +37,26 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       (bounded, not peer-sized). The bitfield's generic setter is private;
       invalidation uses `clear_piece`. See ADR 0002 for the implementation
       notes.
-    - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
-      the verified bitmap, treat missing or short data as absent.
+    - [x] 3c-3. Streaming recheck: `Rechecker::run(selection, base, cancel,
+      progress)` reads existing data through `StorageHandle::read_range` in
+      256 KiB chunks, hashes 1 MiB batches on the shared `HashPool` with an
+      incremental SHA-1 state, and reads the next batch while the current one
+      hashes (at most two batches in memory). `RecheckSelection` is `All` or a
+      strictly increasing `Only(&[u32])`; an empty selection returns the base.
+      Selected bits are cleared before checking and set again only after a hash
+      match, so damage, missing files, short reads, cancellation, and storage
+      errors never publish a bit. Missing or short data is absent and abandoned
+      on the first short read; other storage errors stop the run as typed
+      errors. Cancellation is a shared `RecheckCancel` checked before each chunk
+      and hash job; dropping the future releases the run lease. Progress is an
+      advisory `try_send` snapshot per piece. One recheck runs per torrent,
+      exclusive with same-torrent writes. See ADR 0002 for the implementation
+      notes.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck. Persist verified bits only after
-    `Storage::sync()` succeeds or a recheck confirms the data.
+    `Storage::sync()` succeeds or a recheck confirms the data. When a file
+    changed, 3d builds the recheck `Only` list from `FileMap` file piece ranges
+    (`MappedFile` first and last piece), so only those pieces are re-hashed.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
     recorded in the `FileMap`, never follow links, and never remove directories
     outside the root. Route deletion through the storage worker as a command so
@@ -68,6 +83,12 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     `TorrentBudget` handle, and the spec factory, and carries the info-hash.
     `mark_stored` checks that hash, so a `StoredPiece` from one torrent cannot
     set a bit in another torrent's bitfield.
+  - Must model a `Checking` state that excludes `Downloading`. A recheck reads
+    the torrent's files, so the session must keep the torrent out of the
+    download scheduler while `Rechecker::run` is active and drop any queued
+    piece stores for it. `Rechecker` already rejects a second concurrent run
+    for the same torrent, and resume-data validation (3d) uses the same
+    exclusion.
 - [ ] 11. TUI: list, add, details, limits
 - [ ] 12. Cross-platform CI green, tag v0.1.0
 

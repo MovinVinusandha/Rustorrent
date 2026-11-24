@@ -259,6 +259,20 @@ impl StorageHandle {
     }
 }
 
+#[cfg(test)]
+impl StorageHandle {
+    /// Arms a one-shot injected failure for the write after `writes`
+    /// successful writes.
+    ///
+    /// The worker answers with a real [`StorageError::DiskFull`], so tests
+    /// exercise the same mapping as a full device. This hook is compiled out
+    /// of release builds.
+    pub(crate) async fn fail_write_after(&self, writes: usize) -> Result<(), StorageHandleError> {
+        self.send(|reply| Command::FailWriteAfter { writes, reply })
+            .await
+    }
+}
+
 /// One request in the worker queue.
 enum Command {
     ReadRange {
@@ -282,6 +296,11 @@ enum Command {
         reply: Reply<usize>,
     },
     #[cfg(test)]
+    FailWriteAfter {
+        writes: usize,
+        reply: Reply<()>,
+    },
+    #[cfg(test)]
     Hold {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -303,6 +322,10 @@ fn reject(command: Command) {
         }
         #[cfg(test)]
         Command::OpenHandles { reply } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::FailWriteAfter { reply, .. } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
@@ -333,6 +356,8 @@ fn run_worker(
     };
 
     let mut shutdown = None;
+    #[cfg(test)]
+    let mut fail_write_after: Option<usize> = None;
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
@@ -352,6 +377,19 @@ fn run_worker(
                 bytes,
                 reply,
             } => {
+                #[cfg(test)]
+                if fail_write_after == Some(0) {
+                    fail_write_after = None;
+                    let _ = reply.send(Err(StorageHandleError::Storage(StorageError::DiskFull {
+                        path: PathBuf::from("<injected>"),
+                        source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                    })));
+                    continue;
+                }
+                #[cfg(test)]
+                if let Some(remaining) = fail_write_after.as_mut() {
+                    *remaining -= 1;
+                }
                 let _ = reply.send(
                     storage
                         .write_range(offset, &bytes)
@@ -368,6 +406,11 @@ fn run_worker(
             #[cfg(test)]
             Command::OpenHandles { reply } => {
                 let _ = reply.send(Ok(storage.open_handle_count()));
+            }
+            #[cfg(test)]
+            Command::FailWriteAfter { writes, reply } => {
+                fail_write_after = Some(writes);
+                let _ = reply.send(Ok(()));
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

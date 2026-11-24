@@ -152,21 +152,6 @@ async fn read_all(storage: &StorageHandle, offset: u64, len: usize) -> Vec<u8> {
     bytes
 }
 
-/// Polls the store future once, then drops it, simulating cancellation while
-/// the first chunk is in flight.
-async fn poll_store_once(storage: &StorageHandle, verified: &VerifiedPiece) {
-    let mut future = pin!(store_verified(storage, verified));
-    let mut polled = false;
-    std::future::poll_fn(|context| {
-        if !polled {
-            polled = true;
-            let _ = future.as_mut().poll(context);
-        }
-        Poll::Ready(())
-    })
-    .await;
-}
-
 #[tokio::test]
 async fn two_and_a_half_mib_piece_round_trips() {
     let dir = temp_dir();
@@ -263,8 +248,33 @@ async fn a_cancelled_store_leaves_the_piece_usable() {
 
     let data = test_bytes(len);
     let verified = verified_piece(0, 0, &data, 5 * MIB / 2).await;
+    let chunk_len = usize::try_from(MIB).expect("mib");
 
-    poll_store_once(&storage, &verified.piece).await;
+    // Hold the worker so the first write stays queued; polling once enqueues
+    // it, then dropping the future cancels the store with the write pending.
+    let release = storage.hold().await.expect("hold worker");
+    {
+        let mut future = pin!(store_verified(&storage, &verified.piece));
+        let mut polled = false;
+        std::future::poll_fn(|context| {
+            if !polled {
+                polled = true;
+                assert!(
+                    future.as_mut().poll(context).is_pending(),
+                    "the held worker keeps the first chunk pending"
+                );
+            }
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    release.send(()).expect("release worker");
+    assert_eq!(
+        read_all(&storage, 0, chunk_len).await,
+        &data[..chunk_len],
+        "the cancelled store left its first chunk queued"
+    );
     assert_eq!(
         verified.torrent.in_use_bytes(),
         u64::try_from(len).expect("length"),
@@ -280,6 +290,19 @@ async fn a_cancelled_store_leaves_the_piece_usable() {
     drop(verified.piece);
     assert_budget_idle(&verified.budget, &verified.torrent);
     storage.shutdown().await.expect("shutdown");
+}
+
+#[test]
+fn chunk_offset_overflow_is_reported() {
+    let piece = test_spec(5, u64::MAX - MIB, 1, hash_of(b"overflow")).expect("piece spec");
+
+    match chunk_offset(piece, 2) {
+        Err(WriteError::OffsetOverflow { piece, chunk_index }) => {
+            assert_eq!(piece, 5);
+            assert_eq!(chunk_index, 2);
+        }
+        other => panic!("expected an offset overflow, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -392,6 +415,11 @@ async fn last_short_piece_round_trips() {
     assert_eq!(stored.length(), last_len);
 
     assert_eq!(read_all(&storage, 2 * MIB, last_len).await, data);
+    assert_eq!(
+        fs::metadata(root.join("a.bin")).expect("metadata").len(),
+        total,
+        "the short last piece leaves the file at the torrent length"
+    );
 
     drop(verified.piece);
     assert_budget_idle(&verified.budget, &verified.torrent);

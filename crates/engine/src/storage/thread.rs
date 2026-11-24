@@ -271,6 +271,28 @@ impl StorageHandle {
         self.send(|reply| Command::FailWriteAfter { writes, reply })
             .await
     }
+
+    /// Blocks the worker once this command reaches the front of the queue.
+    ///
+    /// Returns after the worker has entered the hold, with a sender that
+    /// releases it. This hook is compiled out of release builds.
+    pub(crate) async fn hold(&self) -> Result<oneshot::Sender<()>, StorageHandleError> {
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| StorageHandleError::WorkerStopped)?;
+        permit.send(Command::Hold {
+            entered,
+            release: release_rx,
+        });
+        entered_rx
+            .await
+            .map_err(|_| StorageHandleError::WorkerStopped)?;
+        Ok(release)
+    }
 }
 
 /// One request in the worker queue.

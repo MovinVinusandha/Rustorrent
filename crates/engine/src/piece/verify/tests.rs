@@ -1,4 +1,7 @@
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 use sha1::{Digest, Sha1};
@@ -81,6 +84,11 @@ async fn correct_hash_produces_a_verified_piece() {
         u64::try_from(len).expect("length"),
         "the verified piece keeps the memory reservation"
     );
+    assert_eq!(
+        pool.available_jobs(),
+        DEFAULT_MAX_HASH_JOBS,
+        "the hash permit is released before the piece is dropped"
+    );
 
     drop(verified);
     assert_budget_idle(&fixture.budget, &fixture.torrent);
@@ -114,6 +122,11 @@ async fn wrong_hash_returns_the_contributors() {
         other => panic!("expected a hash mismatch, got {other:?}"),
     }
 
+    assert_eq!(
+        pool.available_jobs(),
+        DEFAULT_MAX_HASH_JOBS,
+        "a mismatch releases the hash permit"
+    );
     assert_budget_idle(&fixture.budget, &fixture.torrent);
 }
 
@@ -240,13 +253,17 @@ async fn cancelling_while_waiting_for_a_permit_releases_the_reservation() {
         .expect("first job entered the gate")
         .expect("gate entry");
 
-    let second_job = tokio::spawn({
-        let pool = Arc::clone(&pool);
-        async move { pool.verify(second_buffer).await }
-    });
-    tokio::task::yield_now().await;
-    second_job.abort();
-    let _ = second_job.await;
+    // The first job holds the only permit and is stuck in the gate. Polling
+    // the second future once must leave it waiting for a permit; dropping it
+    // (at the end of this block) then cancels that wait deterministically.
+    {
+        let mut second = pin!(pool.verify(second_buffer));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+            second.as_mut().poll(&mut context).is_pending(),
+            "the second verify waits for the only permit"
+        );
+    }
 
     assert_budget_idle(&second.budget, &second.torrent);
     assert_eq!(

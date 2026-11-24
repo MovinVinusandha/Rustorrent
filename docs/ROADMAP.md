@@ -52,11 +52,22 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       advisory `try_send` snapshot per piece. One recheck runs per `Rechecker`
       (the session owns one per torrent), exclusive with same-torrent writes.
       See ADR 0002 for the implementation notes.
-  - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
+  - [x] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck. Persist verified bits only after
     `Storage::sync()` succeeds or a recheck confirms the data. When a file
     changed, 3d builds the recheck `Only` list from `FileMap` file piece ranges
     (`MappedFile` first and last piece), so only those pieces are re-hashed.
+    The version 1 document is canonical bencode with a 16 MiB cap, a layout
+    fingerprint instead of stored paths, and exact observed size/mtime per
+    file. Save takes the bitfield by value, flushes storage, observes files,
+    and writes through a per-torrent lease and the atomic file writer. Restore
+    clears stale and unreadable pieces without reading them, checks a spread
+    sample of up to five verified pieces (all of them for small torrents), and
+    falls back to a full recheck on a failed sample or an invalid document.
+    Missing, corrupt, and mismatched documents never block a torrent, and
+    resume files are not deleted. A future optional mode may trust size/mtime
+    only and skip the sample, trading detection for a faster start; save
+    triggers belong to item 10. See ADR 0002.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
     recorded in the `FileMap`, never follow links, and never remove directories
     outside the root. Route deletion through the storage worker as a command so

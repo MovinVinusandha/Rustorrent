@@ -15,6 +15,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bt_platform::file::{File, create_new, open_read, open_rw, open_write};
 use thiserror::Error;
@@ -23,6 +24,30 @@ use super::layout::{FileMap, MappedFile, sanitize_component};
 
 /// Default maximum number of open file handles.
 pub const DEFAULT_MAX_OPEN_HANDLES: usize = 64;
+
+/// Maximum number of files observed by one storage worker command.
+///
+/// Resume saves observe every file. Chunking keeps a large torrent from
+/// occupying the worker queue for the whole pass, so reads and writes for
+/// other torrents can interleave.
+pub const OBSERVE_CHUNK_FILES: usize = 256;
+
+/// Metadata observed for one mapped file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedFile {
+    /// The file exists and is a regular file.
+    Present {
+        /// Current file size in bytes.
+        size: u64,
+        /// Modification time in nanoseconds since the Unix epoch.
+        ///
+        /// `None` means the platform could not report it or the value does not
+        /// fit in `i64`; callers must treat the file as unverifiable.
+        mtime_ns: Option<i64>,
+    },
+    /// The file or one of its parent directories does not exist.
+    Missing,
+}
 
 /// Preallocation policy for newly created files.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -359,6 +384,30 @@ impl Storage {
     pub fn sync(&mut self) -> Result<(), StorageError> {
         self.handles
             .sync(&self.root, self.map.as_ref(), &self.files)
+    }
+
+    /// Observes size and modification time for a slice of the file map.
+    ///
+    /// `start` is clamped to the map length and `count` bounds the number of
+    /// files, so a chunk can never read outside the map. Missing files are
+    /// reported as [`ObservedFile::Missing`], not as errors. Ancestors and the
+    /// final path are checked with the same symlink rules as every other
+    /// storage operation; a symlinked file is a typed error.
+    pub fn observe_files(
+        &self,
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<ObservedFile>, StorageError> {
+        let files = self.map.files();
+        let begin = start.min(files.len());
+        let end = begin.saturating_add(count).min(files.len());
+        let mut observed = Vec::with_capacity(end - begin);
+
+        for file in &files[begin..end] {
+            observed.push(observe_file(&self.root, file)?);
+        }
+
+        Ok(observed)
     }
 
     /// Flushes dirty data and drops every open handle.
@@ -891,6 +940,38 @@ fn check_ancestors(root: &Path, components: &[String]) -> Result<bool, StorageEr
     }
 
     Ok(true)
+}
+
+/// Observes one mapped file after validating its ancestors.
+fn observe_file(root: &Path, file: &MappedFile) -> Result<ObservedFile, StorageError> {
+    let path = resolve_file_path(root, file)?;
+
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            check_file(&path, &metadata)?;
+            Ok(ObservedFile::Present {
+                size: metadata.len(),
+                mtime_ns: metadata.modified().ok().and_then(system_time_ns),
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ObservedFile::Missing),
+        Err(source) => Err(classify(&path, source)),
+    }
+}
+
+/// Converts a `SystemTime` to nanoseconds since the Unix epoch.
+///
+/// Returns `None` when the value is outside the `i64` nanosecond range, which
+/// is roughly 1677-2262. Callers treat that as an unavailable mtime instead of
+/// panicking or saturating to a value that could compare equal by accident.
+fn system_time_ns(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).ok(),
+        Err(error) => {
+            let nanos = i64::try_from(error.duration().as_nanos()).ok()?;
+            Some(-nanos)
+        }
+    }
 }
 
 /// Resolves one mapped file and validates every existing ancestor.

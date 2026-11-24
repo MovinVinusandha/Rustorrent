@@ -24,7 +24,7 @@ use std::thread;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use super::backend::{Storage, StorageConfig, StorageError};
+use super::backend::{OBSERVE_CHUNK_FILES, ObservedFile, Storage, StorageConfig, StorageError};
 use super::layout::FileMap;
 
 /// Maximum number of requests waiting in the worker queue.
@@ -179,6 +179,34 @@ impl StorageHandle {
         self.send(|reply| Command::Sync { reply }).await
     }
 
+    /// Observes size and modification time for every mapped file.
+    ///
+    /// The map is walked in [`OBSERVE_CHUNK_FILES`] chunks, one worker command
+    /// per chunk, so a large torrent does not hold the queue for the whole
+    /// pass. The result is in file-map order. Missing files are reported as
+    /// [`ObservedFile::Missing`]; symlinked paths are typed errors.
+    pub async fn observe_files(&self) -> Result<Vec<ObservedFile>, StorageHandleError> {
+        let mut observed = Vec::new();
+        let mut start = 0usize;
+
+        loop {
+            let chunk = self
+                .send(|reply| Command::ObserveFiles {
+                    start,
+                    count: OBSERVE_CHUNK_FILES,
+                    reply,
+                })
+                .await?;
+            let done = chunk.len() < OBSERVE_CHUNK_FILES;
+            observed.extend(chunk);
+
+            if done {
+                return Ok(observed);
+            }
+            start = start.saturating_add(OBSERVE_CHUNK_FILES);
+        }
+    }
+
     /// Returns `true` once shutdown has begun or the worker has exited.
     pub fn is_closed(&self) -> bool {
         self.state.shutting_down.load(Ordering::Acquire) || self.tx.is_closed()
@@ -288,6 +316,12 @@ impl StorageHandle {
         self.send(|reply| Command::ReadCount { reply }).await
     }
 
+    /// Number of observe-file commands the worker has processed. Test-only.
+    #[cfg(test)]
+    pub(crate) async fn observe_count(&self) -> Result<usize, StorageHandleError> {
+        self.send(|reply| Command::ObserveCount { reply }).await
+    }
+
     /// Blocks the worker once this command reaches the front of the queue.
     ///
     /// Returns after the worker has entered the hold, with a sender that
@@ -326,6 +360,11 @@ enum Command {
     Sync {
         reply: Reply<()>,
     },
+    ObserveFiles {
+        start: usize,
+        count: usize,
+        reply: Reply<Vec<ObservedFile>>,
+    },
     Shutdown {
         reply: Reply<()>,
     },
@@ -348,6 +387,10 @@ enum Command {
         reply: Reply<usize>,
     },
     #[cfg(test)]
+    ObserveCount {
+        reply: Reply<usize>,
+    },
+    #[cfg(test)]
     Hold {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -367,6 +410,9 @@ fn reject(command: Command) {
         | Command::Shutdown { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
+        Command::ObserveFiles { reply, .. } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
         #[cfg(test)]
         Command::OpenHandles { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
@@ -381,6 +427,10 @@ fn reject(command: Command) {
         }
         #[cfg(test)]
         Command::ReadCount { reply } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::ObserveCount { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
@@ -417,6 +467,8 @@ fn run_worker(
     let mut fail_read_after: Option<usize> = None;
     #[cfg(test)]
     let mut reads = 0usize;
+    #[cfg(test)]
+    let mut observe_requests = 0usize;
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
@@ -477,6 +529,21 @@ fn run_worker(
             Command::Sync { reply } => {
                 let _ = reply.send(storage.sync().map_err(StorageHandleError::Storage));
             }
+            Command::ObserveFiles {
+                start,
+                count,
+                reply,
+            } => {
+                #[cfg(test)]
+                {
+                    observe_requests = observe_requests.saturating_add(1);
+                }
+                let _ = reply.send(
+                    storage
+                        .observe_files(start, count)
+                        .map_err(StorageHandleError::Storage),
+                );
+            }
             Command::Shutdown { reply } => {
                 shutdown = Some(reply);
                 break;
@@ -498,6 +565,10 @@ fn run_worker(
             #[cfg(test)]
             Command::ReadCount { reply } => {
                 let _ = reply.send(Ok(reads));
+            }
+            #[cfg(test)]
+            Command::ObserveCount { reply } => {
+                let _ = reply.send(Ok(observe_requests));
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

@@ -32,6 +32,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "resume"
+path = "fuzz_targets/resume.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 [profile.release]

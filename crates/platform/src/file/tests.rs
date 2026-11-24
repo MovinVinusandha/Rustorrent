@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
@@ -203,6 +203,95 @@ fn sync_methods_succeed() {
 
     file.sync_data().expect("sync_data");
     file.sync_all().expect("sync_all");
+}
+
+#[test]
+fn write_atomic_creates_target_without_leaving_a_temp_file() {
+    let dir = temp_dir();
+    let target = path_in(&dir, "0000.resume");
+
+    write_atomic(&target, b"first").expect("write atomic");
+
+    assert_eq!(std::fs::read(&target).expect("read target"), b"first");
+    assert!(!target.with_file_name("0000.resume.tmp").exists());
+}
+
+#[test]
+fn write_atomic_replaces_an_existing_target() {
+    let dir = temp_dir();
+    let target = path_in(&dir, "0000.resume");
+    std::fs::write(&target, b"old").expect("write old target");
+
+    write_atomic(&target, b"new").expect("write atomic");
+
+    assert_eq!(std::fs::read(&target).expect("read target"), b"new");
+}
+
+#[test]
+fn write_atomic_overwrites_a_leftover_truncated_temp_file() {
+    let dir = temp_dir();
+    let target = path_in(&dir, "0000.resume");
+    let temp = path_in(&dir, "0000.resume.tmp");
+    std::fs::write(&target, b"old").expect("write old target");
+    std::fs::write(&temp, b"d3:cor").expect("write leftover temp");
+
+    // A leftover temp file must never change what the target contains.
+    assert_eq!(std::fs::read(&target).expect("read target"), b"old");
+
+    write_atomic(&target, b"new").expect("write atomic");
+
+    assert_eq!(std::fs::read(&target).expect("read target"), b"new");
+    assert!(!temp.exists());
+}
+
+#[test]
+fn write_atomic_failure_keeps_the_target_and_removes_the_temp() {
+    let dir = temp_dir();
+    let target = path_in(&dir, "target");
+    std::fs::create_dir(&target).expect("create target directory");
+    let temp = path_in(&dir, "target.tmp");
+
+    let result = write_atomic(&target, b"new");
+
+    assert!(result.is_err(), "rename over a directory must fail");
+    assert!(target.is_dir(), "target directory must be unchanged");
+    assert!(!temp.exists(), "failed write must clean up its temp file");
+}
+
+#[test]
+fn write_atomic_empty_contents() {
+    let dir = temp_dir();
+    let target = path_in(&dir, "0000.resume");
+    std::fs::write(&target, b"old").expect("write old target");
+
+    write_atomic(&target, b"").expect("write atomic");
+
+    assert_eq!(std::fs::read(&target).expect("read target"), b"");
+}
+
+#[test]
+fn write_atomic_rejects_a_path_without_a_file_name() {
+    let error = write_atomic(Path::new(""), b"data").expect_err("must fail");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn temp_path_appends_the_suffix_to_the_full_name() {
+    let path = Path::new("/tmp/abc.resume");
+
+    assert_eq!(
+        temp_path(path).expect("temp path"),
+        Path::new("/tmp/abc.resume.tmp")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_sharing_violations_are_retryable() {
+    assert!(is_sharing_violation(&std::io::Error::from_raw_os_error(32)));
+    assert!(is_sharing_violation(&std::io::Error::from_raw_os_error(33)));
+    assert!(!is_sharing_violation(&std::io::Error::from_raw_os_error(5)));
 }
 
 #[test]

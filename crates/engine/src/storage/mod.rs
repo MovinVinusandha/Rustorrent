@@ -8,5 +8,8 @@ pub mod backend;
 pub mod layout;
 pub mod thread;
 
-pub use backend::{Preallocation, Storage, StorageConfig, StorageError, UnsafeReason};
+pub use backend::{
+    OBSERVE_CHUNK_FILES, ObservedFile, Preallocation, Storage, StorageConfig, StorageError,
+    UnsafeReason,
+};
 pub use thread::{MAX_RANGE_LEN, QUEUE_CAPACITY, StorageHandle, StorageHandleError};

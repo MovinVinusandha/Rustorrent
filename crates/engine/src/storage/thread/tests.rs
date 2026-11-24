@@ -608,6 +608,97 @@ async fn requests_queued_behind_shutdown_are_rejected() {
 }
 
 #[tokio::test]
+async fn observe_files_reports_present_and_missing() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 3), (&["missing.bin"], 4), (&["empty.bin"], 0)]);
+    let handle = open(&root, map).await;
+    fs::write(root.join("a.bin"), b"abc").expect("write file");
+
+    let observed = handle.observe_files().await.expect("observe files");
+
+    assert_eq!(observed.len(), 3);
+    assert!(matches!(
+        observed[0],
+        ObservedFile::Present {
+            size: 3,
+            mtime_ns: Some(_)
+        }
+    ));
+    assert_eq!(observed[1], ObservedFile::Missing);
+    assert!(matches!(
+        observed[2],
+        ObservedFile::Present {
+            size: 0,
+            mtime_ns: Some(_)
+        }
+    ));
+}
+
+#[tokio::test]
+async fn observe_files_chunks_large_maps() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let names: Vec<String> = (0..OBSERVE_CHUNK_FILES + 1)
+        .map(|index| format!("f{index}.bin"))
+        .collect();
+    let components: Vec<Vec<&str>> = names.iter().map(|name| vec![name.as_str()]).collect();
+    let entries: Vec<(&[&str], u64)> = components
+        .iter()
+        .map(|components| (components.as_slice(), 0))
+        .collect();
+    let map = map_with(&entries);
+    let handle = open(&root, map).await;
+
+    let observed = handle.observe_files().await.expect("observe files");
+
+    assert_eq!(observed.len(), OBSERVE_CHUNK_FILES + 1);
+    assert_eq!(
+        handle.observe_count().await.expect("observe count"),
+        2,
+        "a 257-file map must be observed in two worker commands"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn observe_files_rejects_a_symlinked_file() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let handle = open(&root, map).await;
+    let outside = dir.path().join("outside.bin");
+    fs::write(&outside, b"data").expect("write outside file");
+    symlink(&outside, root.join("a.bin")).expect("create symlink");
+
+    match handle.observe_files().await {
+        Err(StorageHandleError::Storage(StorageError::UnsafePath { .. })) => {}
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn observe_files_rejects_a_symlinked_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["sub", "a.bin"], 4)]);
+    let handle = open(&root, map).await;
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).expect("create outside dir");
+    symlink(&outside, root.join("sub")).expect("create symlink");
+
+    match handle.observe_files().await {
+        Err(StorageHandleError::Storage(StorageError::UnsafePath { .. })) => {}
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn requests_after_shutdown_are_rejected() {
     let dir = temp_dir();
     let root = root_in(&dir);
@@ -626,6 +717,10 @@ async fn requests_after_shutdown_are_rejected() {
     ));
     assert!(matches!(
         handle.sync().await,
+        Err(StorageHandleError::ShuttingDown)
+    ));
+    assert!(matches!(
+        handle.observe_files().await,
         Err(StorageHandleError::ShuttingDown)
     ));
     assert!(matches!(

@@ -265,53 +265,107 @@ Piece assembly belongs to 3c; storage never allocates piece-sized buffers.
 
 ### 7. Resume data
 
-- Format: bencode via `engine::bencode`, versioned.
-- Location: `directories::BaseDirs::data_local_dir()/resume/<info-hash-hex>.resume`,
-  never inside the download directory, never absolute paths inside the file.
+- Format: canonical bencode via `engine::bencode`, version 1, encoded and
+  decoded by `engine::resume`. Canonical means sorted dictionary keys with no
+  duplicates, so equal documents have equal bytes.
+- Location: the engine takes an explicit resume directory. The daemon will
+  pass `directories::BaseDirs::data_local_dir()/resume` when item 10 wires the
+  session; the engine never chooses an OS path and never stores an absolute
+  path in the file. A resume file is never inside the download directory.
+- File names: `<info-hash-hex>.resume` for the document and
+  `<info-hash-hex>.resume.tmp` for the one temporary file, both in the resume
+  directory.
 - Version 1 fields:
 
 ```text
 d
-  7:version i1e
+  8:bitfield <ceil(piece_count/8) bytes>
+  5:files l d 6:length i<n>e
+               8:mtime_ns i<n>e
+               13:observed_size i<n>e e ... e
   9:info_hash 20:<bytes>
+  11:layout_hash 20:<bytes>
+  11:piece_count i<n>e
   12:piece_length i<n>e
   12:total_length i<n>e
-  11:piece_count i<n>e
-  8:bitfield <ceil(piece_count/8) bytes>
-  5:files l d 4:path l <original components> e
-               9:disk_path l <sanitized components> e
-               6:length i<n>e
-               13:observed_size i<n>e
-               8:mtime_ns i<n>e e ... e
   10:updated_at i<unix seconds>e
+  7:version i1e
 e
 ```
 
-- Each resume write records the observed size and mtime (nanoseconds since the
-  Unix epoch) of every file after syncing it, so the next load can detect
-  external changes cheaply.
+- File entries are in `FileMap` order and carry no path components. Path
+  components are compared indirectly through `layout_hash`, a SHA-1 over the
+  file count, every sanitized disk component (length-prefixed), and every
+  nominal file length, all in map order. The download root is not hashed: the
+  same torrent in another directory still matches. A rename, a split component,
+  an added or removed file, or a changed nominal length invalidates the whole
+  document and triggers a full recheck.
+- Integers are limited to the bencode `i64` range. A file entry stores the
+  nominal `length`, the exact `observed_size`, and `mtime_ns` in nanoseconds
+  since the Unix epoch. `MTIME_UNAVAILABLE` (the smallest `i64`) means the
+  platform could not report a time; such an entry never matches an observed
+  time and its pieces are rechecked. The exact size and mtime comparison has no
+  tolerance and no "newer than" guard.
+- Size limit: one document is at most `MAX_RESUME_BYTES` (16 MiB). The limit is
+  checked from the file metadata before any read, and the read is capped in
+  case the file grows, so a hostile file cannot force an unbounded allocation.
 - Validation before use:
   - known version;
-  - `info_hash`, `piece_length`, `total_length`, `piece_count` match the loaded
-    metainfo;
-  - bitfield length is exact and trailing bits are zero;
-  - stored `disk_path`s equal the current `FileMap` paths;
-  - each file's `observed_size` and `mtime_ns` match the file on disk; a
-    mismatch rechecks only that file's pieces and keeps the rest of the
-    bitfield;
-  - a structural mismatch (version, info-hash, piece length, counts, bitfield,
-    disk paths) discards the resume file and triggers a full recheck;
-  - after validation, re-hash the first, last, and up to 3 random verified
-    pieces (deduplicated); any failure triggers a full recheck.
-- Zero-length files are created eagerly by the backend, created if missing, and
-  an existing file is never truncated.
-- Atomic write: temp file in the same directory, `sync_all`, rename over the
-  target, then sync the directory on Unix. On Windows, retry the rename, then
-  replace.
-- Corruption fallback: parse error, unknown version, truncated file, bad
-  bitfield, or structural validation failure logs a warning, discards the file,
-  and runs a recheck. It never blocks the torrent.
-- Writes are throttled: every 30 seconds and on pause/stop, not per piece.
+  - `info_hash`, `piece_length`, `total_length`, `piece_count`, and
+    `layout_hash` match the loaded metainfo and current `FileMap`;
+  - the file entry count matches the map, and the bitfield length is exact
+    with zero trailing bits;
+  - structural mismatch means the document is ignored and every readable
+    piece is rechecked. Resume files are never deleted, so a bad document does
+    not destroy evidence and a later build can read it.
+- Per-file changes: a file whose observed size or mtime differs, or whose entry
+  is `MTIME_UNAVAILABLE`, clears the pieces it covers. Those pieces are
+  rechecked with `RecheckSelection::Only`; verified pieces in unchanged files
+  keep their bits. Missing or short files are marked absent without a read,
+  including when no usable document exists, and only the remaining readable
+  pieces are put in the `Only` list.
+- Spot check: after per-file validation, up to `SPOT_CHECK_PIECES` (5)
+  verified pieces are sampled evenly across the verified range, always
+  including the first and last. A torrent with five or fewer verified pieces
+  checks all of them. The sampled pieces are cleared and added to the `Only`
+  list, so an unchanged torrent reads only the sample. If any sample fails,
+  every readable piece is rechecked with `RecheckSelection::All`; a failure
+  proves metadata no longer describes the bytes, so the remaining saved bits
+  cannot be trusted.
+- External-modification window: the size/mtime check catches ordinary edits,
+  truncation, and replacement, but a change that preserves both size and mtime
+  is invisible. The five-piece sample makes silent corruption unlikely to
+  survive, but it does not prove unsampled pieces. A future, optional lighter
+  mode could trust size/mtime only and skip the sample, trading that detection
+  for a faster start on very large torrents; it is not in v0.1.
+- Crash-recheck cost: a document describes the last successful save, so an
+  unclean shutdown loses up to one save interval of verified bits. Pieces
+  downloaded after that save are cleared and downloaded again. A file whose
+  size grew during the interval is stale and is rechecked, which may recover
+  some of them, but correctness never depends on it. The five-piece sample
+  bounds the normal start cost; a failed sample or structural mismatch costs
+  one full recheck of the readable pieces.
+- Save ordering: take the bitfield snapshot by value, call
+  `Storage::sync()`, observe every mapped file, encode, and write atomically.
+  Syncing before observing guarantees every recorded bit was written before
+  the flush began. The snapshot is consumed so a later bitfield change cannot
+  leak into an earlier document. A per-torrent save lease rejects a second
+  concurrent save with `AlreadySaving`. The blocking write task owns the
+  lease, so dropping the save future cannot admit a second writer; the lease
+  is released when the write finishes or fails.
+- Atomic write: create the resume directory in the blocking task, write the
+  temporary file in the same directory, `sync_all`, rename over the target,
+  then sync the parent directory on Unix. On Windows, the rename replaces an
+  existing target and retries sharing or lock violations. A failed save
+  leaves the previous document untouched.
+- Blocking I/O: the load, directory creation, and write all run on
+  `spawn_blocking`; no file operation runs on a runtime worker. A missing file
+  is `Ok(None)`, and a corrupt or oversized file is a typed decode error; both
+  fall back in `restore` and never block the torrent. The caller receives a
+  typed `RestoreSource` describing which path was taken, for the session to
+  log once logging exists.
+- Save triggers are not wired yet. Item 10 owns them: every 30 seconds while
+  active, and on pause, stop, and graceful shutdown. Saves are not per piece.
 
 ### 8. Dependencies
 

@@ -7,7 +7,8 @@
 
 use std::fs::{File as StdFile, Metadata, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// A file handle with positioned reads and writes.
 #[derive(Debug)]
@@ -136,6 +137,123 @@ pub fn create_new(path: &Path) -> io::Result<File> {
         .create_new(true)
         .open(path)
         .map(File::new)
+}
+
+/// Writes `bytes` to `path` atomically.
+///
+/// Data is written to `<file name>.tmp` in the same directory, flushed with
+/// `sync_all`, then renamed over the target. On Unix the parent directory is
+/// synced after the rename. On Windows the rename is retried briefly when the
+/// target is temporarily open by another process; that retry blocks the caller
+/// for at most a few hundred milliseconds.
+///
+/// A crash leaves either the old target or the new target, never a mixture. A
+/// leftover temp file is truncated by the next call and is never read as the
+/// target. The temp path is opened with normal create semantics, so it follows
+/// a symlink placed there; callers must pass a user-private directory.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp = temp_path(path)?;
+    let result = write_and_rename(&temp, path, bytes);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result?;
+    sync_parent(path)
+}
+
+/// Appends `.tmp` to the full file name, keeping the target stem intact.
+fn temp_path(path: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut temp = name.to_os_string();
+    temp.push(".tmp");
+    Ok(path.with_file_name(temp))
+}
+
+/// Writes the temp file, flushes it, then renames it over the target.
+fn write_and_rename(temp: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = StdFile::create(temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    rename_replacing(temp, target)
+}
+
+/// Returns the directory that contains `path`, falling back to the current
+/// directory for a bare file name.
+#[cfg(unix)]
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Flushes the directory entry after a rename on Unix.
+///
+/// Some filesystems do not support directory fsync and report `EINVAL` or
+/// `ENOTSUP`; that is treated as best effort rather than a failed write.
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let directory = StdFile::open(parent_dir(path))?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Windows has no portable directory handle in `std`; the rename is the
+/// durability boundary here.
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Renames a file over an existing target.
+#[cfg(not(windows))]
+fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// Renames a file over an existing target, retrying a sharing violation.
+#[cfg(windows)]
+fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    use std::time::Duration;
+
+    const ATTEMPTS: usize = 20;
+    const RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_sharing_violation(&error) && attempt + 1 < ATTEMPTS => {
+                last_error = Some(error);
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    match last_error {
+        Some(error) => Err(error),
+        None => Err(io::Error::other("rename retry exhausted")),
+    }
+}
+
+/// Returns `true` for Windows errors that mean the target is temporarily open.
+#[cfg(windows)]
+fn is_sharing_violation(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32) | Some(33))
 }
 
 #[cfg(test)]

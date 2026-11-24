@@ -235,10 +235,22 @@ impl Storage {
                 .ok_or_else(|| internal("read range is outside the buffer"))?;
 
             // Reads never require write access. A pending sync upgrades the
-            // cached handle to read-write when the flush actually runs.
-            let file = self
+            // cached handle to read-write when the flush actually runs. A file
+            // removed after the metadata check is treated like any other
+            // missing file: stop at this boundary so the caller sees a short
+            // read and the covered pieces are absent.
+            let file = match self
                 .handles
-                .get_or_open(index, &path, open_read, false, false, expected)?;
+                .get_or_open(index, &path, open_read, false, false, expected)
+            {
+                Ok(file) => file,
+                Err(StorageError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
 
             let read = read_up_to(
                 |chunk, position| file.read_at(chunk, position),

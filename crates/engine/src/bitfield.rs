@@ -10,8 +10,12 @@
 //!
 //! [`Bitfield::mark_stored`] is the only way to set a bit for a newly stored
 //! piece: it takes a [`StoredPiece`] produced by a complete write after a hash
-//! match. [`Bitfield::from_bytes`] is the resume exception, restoring bits that
-//! a previous session wrote. The generic setter is private, and
+//! match. [`Bitfield::mark_rechecked_present`] is the crate-private recheck
+//! exception: a streaming recheck hashed every byte of the piece against the
+//! metainfo, so it can set the bit without a write. External callers only
+//! receive rechecked bits through the engine's recheck result.
+//! [`Bitfield::from_bytes`] is the resume exception, restoring bits that a
+//! previous session wrote. The generic setter is private, and
 //! [`Bitfield::clear_piece`] / [`Bitfield::clear`] invalidate pieces; an
 //! invalidation can never create false trust.
 
@@ -156,6 +160,18 @@ impl Bitfield {
     /// it after [`store_verified`](crate::piece::store_verified) returns.
     pub fn mark_stored(&mut self, stored: &StoredPiece) -> Result<(), BitfieldError> {
         self.set(stored.piece(), true)
+    }
+
+    /// Marks a piece present after a streaming recheck matched its on-disk
+    /// bytes against the metainfo hash.
+    ///
+    /// This is crate-private because external callers only ever receive a
+    /// finished recheck result; they cannot obtain a rechecked bitfield any
+    /// other way. No [`StoredPiece`] is needed because recheck writes nothing:
+    /// the evidence is that every byte of the piece was read through the
+    /// storage handle and the incremental SHA-1 matched the expected hash.
+    pub(crate) fn mark_rechecked_present(&mut self, piece: u32) -> Result<(), BitfieldError> {
+        self.set(piece, true)
     }
 
     /// Clears one piece bit, for example when a recheck finds it damaged.

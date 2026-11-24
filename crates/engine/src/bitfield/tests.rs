@@ -246,6 +246,32 @@ fn clear_piece_clears_exactly_one_bit_and_rejects_out_of_range() {
     assert_eq!(bitfield.count_verified(), 2);
 }
 
+#[test]
+fn mark_rechecked_present_sets_exactly_one_bit_and_rejects_out_of_range() {
+    let mut bitfield = Bitfield::new(9).expect("bitfield");
+
+    bitfield
+        .mark_rechecked_present(4)
+        .expect("mark rechecked piece 4");
+    assert!(bitfield.get(4).expect("get piece 4"));
+    assert_eq!(bitfield.count_verified(), 1);
+
+    bitfield
+        .mark_rechecked_present(4)
+        .expect("marking the same piece twice is harmless");
+    assert_eq!(bitfield.count_verified(), 1);
+
+    assert_eq!(
+        bitfield.mark_rechecked_present(9),
+        Err(BitfieldError::OutOfRange {
+            piece: 9,
+            piece_count: 9,
+        })
+    );
+    assert_eq!(bitfield.count_verified(), 1);
+    assert_eq!(bitfield.as_bytes(), &[0b0001_0000, 0]);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

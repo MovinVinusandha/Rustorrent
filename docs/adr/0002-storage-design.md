@@ -564,7 +564,43 @@ where the code differs from the design above.
   / `clear` only invalidate. A test drives the pipeline and asserts the bit
   stays clear after a hash mismatch and after a failed chunk, then becomes set
   only after a successful retry.
-- **Test hooks are compiled out of release builds.** The hash gate and the
-  injected `DiskFull` write failure exist only under `#[cfg(test)]`; the
+- **Streaming recheck (3c-3) runs above the storage worker.** `Rechecker` owns
+  the `StorageHandle`, the shared `FileMap` and `MetaInfo`, and a shared
+  `HashPool`. `run(selection, base, cancel, progress)` reads through
+  `StorageHandle::read_range` in 256 KiB chunks, hashes 1 MiB batches with an
+  incremental SHA-1 state, and reads the next batch while the current batch
+  hashes. At most two batches (2 MiB) are in memory, and one pool permit is
+  held at a time, so the FIFO semaphore still makes live verification wait at
+  most one recheck batch. There is still no `Recheck` storage command.
+- **Recheck publishes only a complete result.** Selected bits are cleared in a
+  clone of the base bitfield before reading and set again only after a full
+  hash match; unselected bits are preserved and the caller's bitfield is never
+  mutated. `Bitfield::mark_rechecked_present` is crate-private, and
+  `Bitfield::set` stays private. A short read, missing file, or hash mismatch
+  leaves the bit clear and counts as absent; the piece is abandoned on the
+  first short read, including in the overlapped batch. A file removed between
+  the metadata check and the open is reported as a short read by the backend,
+  not as an I/O error. Other storage errors stop the run as typed
+  `RecheckError::Storage`; `UnsafePath` and permission errors can never be
+  reported as absent. Nothing is returned on error.
+- **Recheck cancellation and exclusivity.** `RecheckCancel` is a shared atomic
+  flag checked before each chunk read, before each hash job, and after the final
+  hash; a cancelled run returns `RecheckError::Cancelled` and publishes
+  nothing. Dropping the future releases the lease at its next await. An atomic
+  flag plus a drop guard allows one recheck per `Rechecker` and returns
+  `AlreadyRunning` otherwise; the session owns one `Rechecker` per torrent, so
+  the lease is not shared across torrents. Recheck stays exclusive with
+  same-torrent piece writes by caller contract; item 10 needs a `Checking`
+  state that excludes `Downloading` while a recheck or resume validation runs.
+- **Recheck progress is advisory.** One `RecheckProgress` snapshot is sent with
+  `try_send` after each selected piece. A full channel drops updates, including
+  the final one, so the returned `RecheckOutcome` is authoritative. The `Only`
+  selection must be strictly increasing and in range; an empty selection
+  returns the base bitfield without reading. `RecheckSelection` is validated
+  before any read, so an invalid list cannot clear a bit.
+- **Test hooks are compiled out of release builds.** The hash gate, the
+  injected `DiskFull` write failure, the injected `PermissionDenied` read
+  failure, and the read-request counter exist only under `#[cfg(test)]`; the
   release `bt-engine` library and `bt-tui` binary were checked for their
-  strings.
+  strings. The read counter is what proves the next recheck batch is read while
+  the current batch is held in the hash gate.

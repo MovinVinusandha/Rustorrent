@@ -8,6 +8,7 @@
 pub mod assembler;
 pub mod budget;
 pub mod buffer;
+pub mod recheck;
 pub mod spec;
 pub mod store;
 pub mod verify;
@@ -18,6 +19,10 @@ pub use budget::{
     TorrentBudget,
 };
 pub use buffer::{BlockError, InsertOutcome, PieceBuffer, PieceBufferError};
+pub use recheck::{
+    RECHECK_BATCH_LEN, RECHECK_CHUNK_LEN, RECHECK_CHUNKS_PER_JOB, RecheckCancel, RecheckError,
+    RecheckOutcome, RecheckProgress, RecheckSelection, Rechecker,
+};
 pub use spec::{PieceSpec, PieceSpecError};
 pub use store::{StoredPiece, WriteError, store_verified};
 pub use verify::{DEFAULT_MAX_HASH_JOBS, HashPool, HashPoolError, VerifiedPiece, VerifyError};

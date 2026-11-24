@@ -272,6 +272,22 @@ impl StorageHandle {
             .await
     }
 
+    /// Arms a one-shot injected read failure after `reads` successful reads.
+    ///
+    /// The worker answers with a real [`StorageError::PermissionDenied`], so
+    /// tests exercise the same mapping as a permission error. This hook is
+    /// compiled out of release builds.
+    pub(crate) async fn fail_read_after(&self, reads: usize) -> Result<(), StorageHandleError> {
+        self.send(|reply| Command::FailReadAfter { reads, reply })
+            .await
+    }
+
+    /// Number of read requests the worker has processed. Test-only.
+    #[cfg(test)]
+    pub(crate) async fn read_count(&self) -> Result<usize, StorageHandleError> {
+        self.send(|reply| Command::ReadCount { reply }).await
+    }
+
     /// Blocks the worker once this command reaches the front of the queue.
     ///
     /// Returns after the worker has entered the hold, with a sender that
@@ -323,6 +339,15 @@ enum Command {
         reply: Reply<()>,
     },
     #[cfg(test)]
+    FailReadAfter {
+        reads: usize,
+        reply: Reply<()>,
+    },
+    #[cfg(test)]
+    ReadCount {
+        reply: Reply<usize>,
+    },
+    #[cfg(test)]
     Hold {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -348,6 +373,14 @@ fn reject(command: Command) {
         }
         #[cfg(test)]
         Command::FailWriteAfter { reply, .. } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::FailReadAfter { reply, .. } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::ReadCount { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
@@ -380,9 +413,32 @@ fn run_worker(
     let mut shutdown = None;
     #[cfg(test)]
     let mut fail_write_after: Option<usize> = None;
+    #[cfg(test)]
+    let mut fail_read_after: Option<usize> = None;
+    #[cfg(test)]
+    let mut reads = 0usize;
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
+                #[cfg(test)]
+                {
+                    reads = reads.saturating_add(1);
+                }
+                #[cfg(test)]
+                if fail_read_after == Some(0) {
+                    fail_read_after = None;
+                    let _ = reply.send(Err(StorageHandleError::Storage(
+                        StorageError::PermissionDenied {
+                            path: PathBuf::from("<injected>"),
+                            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                        },
+                    )));
+                    continue;
+                }
+                #[cfg(test)]
+                if let Some(remaining) = fail_read_after.as_mut() {
+                    *remaining -= 1;
+                }
                 let len = len.min(MAX_RANGE_LEN);
                 let mut buf = vec![0u8; len];
                 let result = match storage.read_range(offset, &mut buf) {
@@ -433,6 +489,15 @@ fn run_worker(
             Command::FailWriteAfter { writes, reply } => {
                 fail_write_after = Some(writes);
                 let _ = reply.send(Ok(()));
+            }
+            #[cfg(test)]
+            Command::FailReadAfter { reads, reply } => {
+                fail_read_after = Some(reads);
+                let _ = reply.send(Ok(()));
+            }
+            #[cfg(test)]
+            Command::ReadCount { reply } => {
+                let _ = reply.send(Ok(reads));
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

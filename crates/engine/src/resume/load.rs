@@ -18,8 +18,14 @@ use crate::metainfo::InfoHash;
 #[derive(Debug, Error)]
 pub enum LoadError {
     /// The document could not be read.
-    #[error("could not read resume document: {0}")]
-    Io(#[source] std::io::Error),
+    #[error("could not read resume document {name}: {source}")]
+    Io {
+        /// Document file name, never a full path.
+        name: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// The document is oversized, malformed, or not a supported version.
     #[error(transparent)]
     Decode(#[from] DecodeError),
@@ -36,22 +42,27 @@ impl ResumeStore {
     /// does that before any bit is trusted.
     pub async fn load(&self, info_hash: &InfoHash) -> Result<Option<ResumeDocument>, LoadError> {
         let path = self.document_path(info_hash);
-        tokio::task::spawn_blocking(move || read_document(&path))
+        let name = self.document_name(info_hash);
+        tokio::task::spawn_blocking(move || read_document(&path, &name))
             .await
             .map_err(LoadError::Task)?
     }
 }
 
 /// Reads a document on a blocking thread and decodes it.
-fn read_document(path: &Path) -> Result<Option<ResumeDocument>, LoadError> {
+fn read_document(path: &Path, name: &str) -> Result<Option<ResumeDocument>, LoadError> {
+    let io_error = |source| LoadError::Io {
+        name: name.to_owned(),
+        source,
+    };
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(LoadError::Io(source)),
+        Err(source) => return Err(io_error(source)),
     };
 
     let max = u64::try_from(MAX_RESUME_BYTES).unwrap_or(u64::MAX);
-    let metadata = file.metadata().map_err(LoadError::Io)?;
+    let metadata = file.metadata().map_err(io_error)?;
     if metadata.len() > max {
         return Err(LoadError::Decode(DecodeError::TooLarge {
             len: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
@@ -62,7 +73,7 @@ fn read_document(path: &Path) -> Result<Option<ResumeDocument>, LoadError> {
     let mut bytes = Vec::new();
     file.take(max.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(LoadError::Io)?;
+        .map_err(io_error)?;
     if bytes.len() > MAX_RESUME_BYTES {
         return Err(LoadError::Decode(DecodeError::TooLarge {
             len: bytes.len(),

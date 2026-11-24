@@ -32,6 +32,132 @@ pub const DEFAULT_MAX_OPEN_HANDLES: usize = 64;
 /// other torrents can interleave.
 pub const OBSERVE_CHUNK_FILES: usize = 256;
 
+/// Maximum number of items processed by one removal worker command.
+pub const REMOVE_CHUNK_ITEMS: usize = 256;
+
+/// Maximum number of paths kept in one [`RemovalReport`] list.
+///
+/// The matching `*_count` field is always exact, even when this cap truncates
+/// the list and sets [`RemovalReport::truncated`].
+pub const MAX_REPORT_PATHS: usize = 1000;
+
+/// Outcome of removing one torrent from disk.
+///
+/// Every path is relative to the download root and sanitized before it is
+/// reported. Paths and file names are user data: callers must not log them
+/// without the user's consent.
+#[derive(Debug, Default)]
+pub struct RemovalReport {
+    /// Files and directories that were removed, capped at
+    /// [`MAX_REPORT_PATHS`].
+    pub removed: Vec<PathBuf>,
+    /// Paths that were already absent, capped at [`MAX_REPORT_PATHS`].
+    pub already_missing: Vec<PathBuf>,
+    /// Directories left in place because they still contain files. This is a
+    /// success, not a failure.
+    pub not_empty: Vec<PathBuf>,
+    /// Items that could not be removed, capped at [`MAX_REPORT_PATHS`].
+    pub failed: Vec<RemovalFailure>,
+    /// Exact number of removed items.
+    pub removed_count: usize,
+    /// Exact number of already-missing items.
+    pub already_missing_count: usize,
+    /// Exact number of non-empty directories that were kept.
+    pub not_empty_count: usize,
+    /// Exact number of failed items.
+    pub failed_count: usize,
+    /// `true` when at least one list was capped.
+    pub truncated: bool,
+}
+
+impl RemovalReport {
+    /// Returns `true` when at least one item failed.
+    pub fn has_failures(&self) -> bool {
+        self.failed_count != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record(&mut self, item: RemovalItemOutcome) {
+        match item {
+            RemovalItemOutcome::Removed(path) => {
+                self.removed_count = self.removed_count.saturating_add(1);
+                push_path(&mut self.removed, path, &mut self.truncated);
+            }
+            RemovalItemOutcome::AlreadyMissing(path) => {
+                self.already_missing_count = self.already_missing_count.saturating_add(1);
+                push_path(&mut self.already_missing, path, &mut self.truncated);
+            }
+            RemovalItemOutcome::NotEmpty(path) => {
+                self.not_empty_count = self.not_empty_count.saturating_add(1);
+                push_path(&mut self.not_empty, path, &mut self.truncated);
+            }
+            RemovalItemOutcome::Failed { path, error } => {
+                self.failed_count = self.failed_count.saturating_add(1);
+                if self.failed.len() < MAX_REPORT_PATHS {
+                    self.failed.push(RemovalFailure { path, error });
+                } else {
+                    self.truncated = true;
+                }
+            }
+        }
+    }
+}
+
+/// One failed removal, with a path relative to the download root.
+#[derive(Debug)]
+pub struct RemovalFailure {
+    /// Relative path that could not be removed.
+    pub path: PathBuf,
+    /// Why the removal failed.
+    pub error: RemovalError,
+}
+
+/// Typed reason a single removal item failed.
+#[derive(Debug, Error)]
+pub enum RemovalError {
+    /// A path failed a safety check.
+    #[error("unsafe path: {0}")]
+    Unsafe(UnsafeReason),
+    /// Permission was denied.
+    #[error("permission denied: {0}")]
+    PermissionDenied(#[source] io::Error),
+    /// The file is locked or in use by another process.
+    #[error("file is in use: {0}")]
+    FileInUse(#[source] io::Error),
+    /// Another I/O operation failed.
+    #[error("I/O error: {0}")]
+    Io(#[source] io::Error),
+    /// An internal invariant was violated.
+    #[error("internal removal invariant: {reason}")]
+    Internal {
+        /// Which invariant.
+        reason: &'static str,
+    },
+}
+
+#[cfg(test)]
+pub(crate) enum RemovalItemOutcome {
+    Removed(PathBuf),
+    AlreadyMissing(PathBuf),
+    NotEmpty(PathBuf),
+    Failed { path: PathBuf, error: RemovalError },
+}
+
+#[cfg(test)]
+pub(crate) struct RemovalChunk {
+    pub items: Vec<RemovalItemOutcome>,
+    pub done: bool,
+}
+
+#[cfg(test)]
+fn push_path(list: &mut Vec<PathBuf>, path: PathBuf, truncated: &mut bool) {
+    if list.len() < MAX_REPORT_PATHS {
+        list.push(path);
+    } else {
+        *truncated = true;
+    }
+}
+
 /// Metadata observed for one mapped file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservedFile {
@@ -410,6 +536,151 @@ impl Storage {
         Ok(observed)
     }
 
+    /// Removes one chunk of mapped files.
+    ///
+    /// `start` is clamped to the map length and `count` bounds the number of
+    /// files. Every item produces exactly one outcome; a failure never stops
+    /// the rest of the chunk. Missing files are reported as already missing.
+    #[cfg(test)]
+    pub(crate) fn remove_files(
+        &mut self,
+        start: usize,
+        count: usize,
+    ) -> Result<RemovalChunk, StorageError> {
+        let map = Arc::clone(&self.map);
+        let total = map.files().len();
+        let begin = start.min(total);
+        let end = begin.saturating_add(count).min(total);
+        let mut items = Vec::with_capacity(end.saturating_sub(begin));
+
+        for index in begin..end {
+            items.push(self.remove_file_item(&map, index));
+        }
+
+        Ok(RemovalChunk {
+            items,
+            done: end == total,
+        })
+    }
+
+    /// Removes one mapped file after re-validating its ancestors and target.
+    #[cfg(test)]
+    fn remove_file_item(&mut self, map: &FileMap, index: usize) -> RemovalItemOutcome {
+        let file = match map.files().get(index) {
+            Some(file) => file,
+            None => {
+                return RemovalItemOutcome::Failed {
+                    path: PathBuf::new(),
+                    error: RemovalError::Internal {
+                        reason: "file index is outside the file map",
+                    },
+                };
+            }
+        };
+        let report_path = relative_path(&file.disk_components);
+        let path = match resolve_file_path(&self.root, file) {
+            Ok(path) => path,
+            Err(error) => {
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(error),
+                };
+            }
+        };
+
+        let before = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.handles.remove_index(index);
+                return RemovalItemOutcome::AlreadyMissing(report_path);
+            }
+            Err(source) => {
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(classify(&path, source)),
+                };
+            }
+        };
+        if let Err(error) = check_file(&path, &before) {
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: removal_error(error),
+            };
+        }
+
+        let before_id = file_id(&before);
+        let pending = self.handles.remove_index(index);
+
+        match check_ancestors(&self.root, &file.disk_components) {
+            Ok(true) => {}
+            Ok(false) => return RemovalItemOutcome::AlreadyMissing(report_path),
+            Err(error) => {
+                self.restore_pending(index, &path, pending);
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(error),
+                };
+            }
+        }
+
+        let after = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return RemovalItemOutcome::AlreadyMissing(report_path);
+            }
+            Err(source) => {
+                self.restore_pending(index, &path, pending);
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(classify(&path, source)),
+                };
+            }
+        };
+        if let Err(error) = check_file(&path, &after) {
+            self.restore_pending(index, &path, pending);
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: removal_error(error),
+            };
+        }
+        if !same_target(&before, &after, before_id, file_id(&after)) {
+            self.restore_pending(index, &path, pending);
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: RemovalError::Unsafe(UnsafeReason::Changed),
+            };
+        }
+
+        match fs::remove_file(&path) {
+            Ok(()) => RemovalItemOutcome::Removed(report_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                RemovalItemOutcome::AlreadyMissing(report_path)
+            }
+            Err(source) => {
+                self.restore_pending(index, &path, pending);
+                RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(classify(&path, source)),
+                }
+            }
+        }
+    }
+
+    /// Restores a pending sync when a failed removal leaves the file in place.
+    #[cfg(test)]
+    fn restore_pending(&mut self, index: usize, path: &Path, pending: bool) {
+        if !pending {
+            return;
+        }
+
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.is_file() && link_reason(&metadata).is_none() {
+            self.handles.needs_sync.insert(index);
+        }
+    }
+
     /// Flushes dirty data and drops every open handle.
     ///
     /// The cache is cleared only when the flush succeeds. On failure the cache
@@ -660,9 +931,74 @@ impl HandleCache {
         }
     }
 
+    /// Drops the cached handle for `index` before its path is removed.
+    ///
+    /// Returns `true` when the entry was dirty or already waiting for a sync,
+    /// so a failed removal can put the pending flag back.
+    #[cfg(test)]
+    fn remove_index(&mut self, index: usize) -> bool {
+        let pending = self.needs_sync.remove(&index);
+        let mut dirty = false;
+        self.entries.retain(|entry| {
+            if entry.index == index {
+                dirty = entry.dirty;
+                false
+            } else {
+                true
+            }
+        });
+        dirty || pending
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
         self.needs_sync.clear();
+    }
+}
+
+/// Builds a relative display path from mapped components.
+///
+/// Components are sanitized before joining, so even a hostile hand-built map
+/// cannot put an absolute path or `..` into a report.
+#[cfg(test)]
+fn relative_path(components: &[String]) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in components {
+        path.push(sanitize_component(component));
+    }
+    path
+}
+
+/// Returns `true` when two metadata checks describe the same target.
+#[cfg(test)]
+fn same_target(
+    before: &fs::Metadata,
+    after: &fs::Metadata,
+    before_id: Option<FileId>,
+    after_id: Option<FileId>,
+) -> bool {
+    before.file_type().is_file() == after.file_type().is_file()
+        && before.file_type().is_dir() == after.file_type().is_dir()
+        && before_id == after_id
+}
+
+/// Converts a storage error into a reportable removal error.
+#[cfg(test)]
+fn removal_error(error: StorageError) -> RemovalError {
+    match error {
+        StorageError::UnsafePath {
+            reason: UnsafeReason::NotFile | UnsafeReason::NotDirectory,
+            ..
+        } => RemovalError::Unsafe(UnsafeReason::WrongKind),
+        StorageError::UnsafePath { reason, .. } => RemovalError::Unsafe(reason),
+        StorageError::PermissionDenied { source, .. } => RemovalError::PermissionDenied(source),
+        StorageError::FileInUse { source, .. } => RemovalError::FileInUse(source),
+        StorageError::Io { source, .. } | StorageError::DiskFull { source, .. } => {
+            RemovalError::Io(source)
+        }
+        _ => RemovalError::Internal {
+            reason: "unexpected storage error during removal",
+        },
     }
 }
 
@@ -1241,6 +1577,8 @@ pub enum UnsafeReason {
     NotDirectory,
     /// A regular file was expected.
     NotFile,
+    /// A mapped file or directory was replaced by the opposite kind.
+    WrongKind,
     /// Two paths resolve to the same file.
     DuplicateFile,
     /// A component changed between the check and the open.
@@ -1256,6 +1594,7 @@ impl fmt::Display for UnsafeReason {
             Self::ReparsePoint => "component is a reparse point",
             Self::NotDirectory => "component is not a directory",
             Self::NotFile => "component is not a regular file",
+            Self::WrongKind => "path has the wrong kind",
             Self::DuplicateFile => "path aliases another file",
             Self::Changed => "component changed while opening",
             Self::InvalidComponent => "component is not sanitized",

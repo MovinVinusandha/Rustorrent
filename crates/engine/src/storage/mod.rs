@@ -9,7 +9,8 @@ pub mod layout;
 pub mod thread;
 
 pub use backend::{
-    OBSERVE_CHUNK_FILES, ObservedFile, Preallocation, Storage, StorageConfig, StorageError,
+    MAX_REPORT_PATHS, OBSERVE_CHUNK_FILES, ObservedFile, Preallocation, REMOVE_CHUNK_ITEMS,
+    RemovalError, RemovalFailure, RemovalReport, Storage, StorageConfig, StorageError,
     UnsafeReason,
 };
 pub use thread::{MAX_RANGE_LEN, QUEUE_CAPACITY, StorageHandle, StorageHandleError};

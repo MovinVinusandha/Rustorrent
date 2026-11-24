@@ -251,6 +251,10 @@ async fn restore_falls_back_when_the_document_does_not_match() {
         }
         other => panic!("unexpected restore source: {other:?}"),
     }
+    assert!(
+        store.document_path(&fixture.hash()).exists(),
+        "a mismatched document must be left in place"
+    );
     assert_eq!(outcome.checked(), 3);
     assert_eq!(outcome.bits().count_verified(), 3);
 
@@ -271,6 +275,10 @@ async fn restore_falls_back_when_the_document_is_corrupt() {
         outcome.source(),
         RestoreSource::LoadFailed(LoadError::Decode(_))
     ));
+    assert!(
+        store.document_path(&fixture.hash()).exists(),
+        "a corrupt document must be left in place"
+    );
     assert_eq!(outcome.checked(), 2);
     assert_eq!(outcome.bits().count_verified(), 2);
 
@@ -291,6 +299,10 @@ async fn restore_falls_back_to_a_full_recheck_when_a_spot_check_fails() {
     let outcome = restore(&fixture, &store, &storage).await;
 
     assert!(matches!(outcome.source(), RestoreSource::SpotCheckFailed));
+    assert!(
+        store.document_path(&fixture.hash()).exists(),
+        "a failed spot check must leave the document in place"
+    );
     assert_eq!(outcome.checked(), 11, "five samples, then all six pieces");
     assert_eq!(outcome.bits().count_verified(), 0);
     for piece in 0..6 {

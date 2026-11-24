@@ -1,12 +1,18 @@
 # Fuzzing
 
-The fuzz crate is excluded from the main workspace. It requires nightly Rust
-and `cargo-fuzz`; it is not part of the stable CI job.
+The fuzz crate is excluded from the main workspace and requires nightly Rust
+and `cargo-fuzz`.
+
+Every push and pull request checks that the targets compile with
+`cargo check --manifest-path fuzz/Cargo.toml --bins` on nightly. A scheduled
+workflow fuzzes each target for five minutes every Monday, and on demand, and
+uploads crash inputs as `fuzz-artifacts-<target>-<run_attempt>`.
 
 ```text
 cargo install cargo-fuzz
 cargo fuzz run bencode
 cargo fuzz run metainfo
+cargo fuzz run piece_buffer
 cargo fuzz run resume
 ```
 

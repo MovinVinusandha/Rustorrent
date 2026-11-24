@@ -174,8 +174,9 @@ impl Rechecker {
     ///
     /// The base bitfield must have the torrent's piece count. Its selected bits
     /// are cleared before checking and set again only after a hash match;
-    /// unselected bits are preserved. Nothing is published if this returns an
-    /// error.
+    /// unselected bits are preserved. A selected piece whose data is missing,
+    /// truncated, or does not match the metainfo hash stays clear and counts as
+    /// absent. Nothing is published if this returns an error.
     pub async fn run(
         &self,
         selection: RecheckSelection<'_>,
@@ -216,8 +217,9 @@ impl Rechecker {
             let mut hasher = Sha1::new();
             let mut position = spec.offset();
             let mut remaining = spec.length();
+            let mut complete = true;
 
-            while remaining > 0 {
+            'piece: while remaining > 0 {
                 let batch_len = remaining.min(RECHECK_BATCH_LEN);
                 let mut batch = Vec::with_capacity(batch_len);
 
@@ -242,12 +244,12 @@ impl Rechecker {
                         });
                     }
                     if read.len() < want {
-                        return Err(RecheckError::ShortRead {
-                            piece,
-                            offset: position,
-                            expected: want,
-                            got: read.len(),
-                        });
+                        // A missing or truncated file means the piece is
+                        // absent. Abandon it on the first short read: later
+                        // chunks cannot make it match, and its cleared bit
+                        // must stay clear.
+                        complete = false;
+                        break 'piece;
                     }
 
                     batch.extend_from_slice(&read);
@@ -276,6 +278,12 @@ impl Rechecker {
                     .map_err(RecheckError::HashTask)?;
             }
 
+            checked += 1;
+
+            if !complete {
+                continue;
+            }
+
             let digest = hasher.finalize();
             let mut found = [0u8; PIECE_HASH_LENGTH];
             found.copy_from_slice(&digest);
@@ -284,8 +292,6 @@ impl Rechecker {
                 bits.mark_rechecked_present(piece)?;
                 present += 1;
             }
-
-            checked += 1;
         }
 
         Ok(RecheckOutcome {
@@ -428,18 +434,6 @@ pub enum RecheckError {
         /// Storage error.
         #[source]
         source: StorageHandleError,
-    },
-    /// Storage returned fewer bytes than the piece still needs.
-    #[error("piece {piece} read at offset {offset} returned {got} of {expected} bytes")]
-    ShortRead {
-        /// Piece being checked.
-        piece: u32,
-        /// Absolute torrent offset of the short read.
-        offset: u64,
-        /// Bytes requested.
-        expected: usize,
-        /// Bytes returned.
-        got: usize,
     },
     /// Storage returned more bytes than requested.
     #[error(

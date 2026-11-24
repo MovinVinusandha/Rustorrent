@@ -9,9 +9,9 @@ use super::*;
 use crate::bitfield::Bitfield;
 use crate::metainfo::{FileInfo, InfoHash, MetaInfo, Mode, PIECE_HASH_LENGTH};
 use crate::piece::{HashPool, PieceSpecError};
-use crate::storage::backend::StorageConfig;
+use crate::storage::backend::{StorageConfig, StorageError, UnsafeReason};
 use crate::storage::layout::FileMap;
-use crate::storage::thread::{MAX_RANGE_LEN, StorageHandle};
+use crate::storage::thread::{MAX_RANGE_LEN, StorageHandle, StorageHandleError};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
@@ -111,6 +111,33 @@ impl Fixture {
         Bitfield::new(self.map.piece_count()).expect("base bitfield")
     }
 
+    fn file_path(&self, index: usize) -> PathBuf {
+        let file = self.map.files().get(index).expect("file index");
+        self.root.join(file.to_path())
+    }
+
+    fn temp_path(&self, name: &str) -> PathBuf {
+        self._dir.path().join(name)
+    }
+
+    fn flip_byte(&self, file: usize, offset: u64) {
+        let path = self.file_path(file);
+        let mut data = fs::read(&path).expect("read file");
+        let index = usize::try_from(offset).expect("in-file offset");
+        data[index] ^= 0xFF;
+        fs::write(&path, &data).expect("write file");
+    }
+
+    fn truncate_file(&self, file: usize, len: u64) {
+        let path = self.file_path(file);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open file")
+            .set_len(len)
+            .expect("truncate file");
+    }
+
     fn rechecker(&self, storage: StorageHandle, pool: Arc<HashPool>) -> Rechecker {
         Rechecker::new(storage, Arc::clone(&self.map), Arc::clone(&self.meta), pool)
             .expect("rechecker")
@@ -166,6 +193,181 @@ async fn subset_recheck_preserves_unselected_bits() {
     assert!(outcome.bits().get(2).expect("piece 2"));
     assert_eq!(outcome.bits().count_verified(), 3);
     assert_eq!(base.count_verified(), 2, "the base bitfield is not mutated");
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn damaged_piece_is_absent_and_loses_its_base_bit() {
+    let fixture = Fixture::new(&[(&["a.bin"], 3 * MIB)], MIB);
+    fixture.flip_byte(0, MIB + 123);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    let mut base = fixture.base();
+    for piece in 0..3 {
+        base.mark_rechecked_present(piece).expect("base bit");
+    }
+
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base)
+        .await
+        .expect("recheck");
+
+    assert_eq!(outcome.checked(), 3);
+    assert_eq!(outcome.present(), 2);
+    assert_eq!(outcome.absent(), 1);
+    assert!(outcome.bits().get(0).expect("piece 0"));
+    assert!(!outcome.bits().get(1).expect("piece 1"));
+    assert!(outcome.bits().get(2).expect("piece 2"));
+    assert_eq!(outcome.bits().count_verified(), 2);
+    assert_eq!(base.count_verified(), 3, "the base bitfield is not mutated");
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unselected_damaged_piece_keeps_its_base_bit() {
+    let fixture = Fixture::new(&[(&["a.bin"], 3 * MIB)], MIB);
+    fixture.flip_byte(0, 123);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    let mut base = fixture.base();
+    base.mark_rechecked_present(0).expect("base piece 0");
+    base.mark_rechecked_present(1).expect("base piece 1");
+
+    let selection = [1u32];
+    let outcome = rechecker
+        .run(RecheckSelection::Only(&selection), &base)
+        .await
+        .expect("recheck");
+
+    assert_eq!(outcome.checked(), 1);
+    assert_eq!(outcome.present(), 1);
+    assert_eq!(outcome.absent(), 0);
+    assert!(
+        outcome.bits().get(0).expect("piece 0"),
+        "an unselected damaged piece keeps its base bit"
+    );
+    assert!(outcome.bits().get(1).expect("piece 1"));
+    assert_eq!(outcome.bits().count_verified(), 2);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn missing_file_makes_its_pieces_absent() {
+    let fixture = Fixture::new(&[(&["a.bin"], MIB), (&["b.bin"], MIB)], MIB);
+    fs::remove_file(fixture.file_path(1)).expect("remove second file");
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    let mut base = fixture.base();
+    base.mark_rechecked_present(0).expect("base piece 0");
+    base.mark_rechecked_present(1).expect("base piece 1");
+
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base)
+        .await
+        .expect("recheck");
+
+    assert_eq!(outcome.checked(), 2);
+    assert_eq!(outcome.present(), 1);
+    assert_eq!(outcome.absent(), 1);
+    assert!(outcome.bits().get(0).expect("piece 0"));
+    assert!(!outcome.bits().get(1).expect("piece 1"));
+    assert_eq!(outcome.bits().count_verified(), 1);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn short_read_abandons_the_piece_without_reading_remaining_chunks() {
+    let fixture = Fixture::new(&[(&["a.bin"], 2 * MIB)], 2 * MIB);
+    fixture.truncate_file(0, 300 * KIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    // The first read succeeds and the second returns 44 KiB of the 256 KiB it
+    // asked for. A third read would hit the injected failure, so this passes
+    // only if the piece is abandoned instead of reading the rest of the batch.
+    storage.fail_read_after(2).await.expect("arm read failure");
+
+    let selection = [0u32];
+    let outcome = rechecker
+        .run(RecheckSelection::Only(&selection), &fixture.base())
+        .await
+        .expect("recheck");
+
+    assert_eq!(outcome.checked(), 1);
+    assert_eq!(outcome.present(), 0);
+    assert_eq!(outcome.absent(), 1);
+    assert_eq!(outcome.bits().count_verified(), 0);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn storage_error_stops_the_run_and_is_typed() {
+    let fixture = Fixture::new(&[(&["a.bin"], 2 * MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    let mut base = fixture.base();
+    base.mark_rechecked_present(0).expect("base piece 0");
+    base.mark_rechecked_present(1).expect("base piece 1");
+
+    storage.fail_read_after(1).await.expect("arm read failure");
+
+    match rechecker.run(RecheckSelection::All, &base).await {
+        Err(RecheckError::Storage {
+            piece: 0,
+            offset: 262_144,
+            source: StorageHandleError::Storage(StorageError::PermissionDenied { .. }),
+        }) => {}
+        other => panic!("expected a typed permission error, got {other:?}"),
+    }
+    assert_eq!(
+        base.count_verified(),
+        2,
+        "a failed run must not publish a bitfield"
+    );
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_swap_is_a_security_error_not_an_absent_piece() {
+    let fixture = Fixture::new(&[(&["a.bin"], MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    let path = fixture.file_path(0);
+    let outside = fixture.temp_path("outside.bin");
+    fs::write(&outside, vec![0u8; usize::try_from(MIB).expect("length")]).expect("write outside");
+    fs::remove_file(&path).expect("remove file");
+    std::os::unix::fs::symlink(&outside, &path).expect("create symlink");
+
+    match rechecker.run(RecheckSelection::All, &fixture.base()).await {
+        Err(RecheckError::Storage {
+            piece: 0,
+            offset: 0,
+            source:
+                StorageHandleError::Storage(StorageError::UnsafePath {
+                    reason: UnsafeReason::Symlink,
+                    ..
+                }),
+        }) => {}
+        other => panic!("expected an unsafe path error, got {other:?}"),
+    }
 
     drop(rechecker);
     storage.shutdown().await.expect("shutdown");

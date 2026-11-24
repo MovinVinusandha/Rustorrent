@@ -49,9 +49,9 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       on the first short read; other storage errors stop the run as typed
       errors. Cancellation is a shared `RecheckCancel` checked before each chunk
       and hash job; dropping the future releases the run lease. Progress is an
-      advisory `try_send` snapshot per piece. One recheck runs per torrent,
-      exclusive with same-torrent writes. See ADR 0002 for the implementation
-      notes.
+      advisory `try_send` snapshot per piece. One recheck runs per `Rechecker`
+      (the session owns one per torrent), exclusive with same-torrent writes.
+      See ADR 0002 for the implementation notes.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
     against files, fallback to recheck. Persist verified bits only after
     `Storage::sync()` succeeds or a recheck confirms the data. When a file

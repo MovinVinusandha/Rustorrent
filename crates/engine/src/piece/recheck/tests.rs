@@ -805,6 +805,118 @@ async fn a_short_read_in_the_overlapped_batch_still_abandons_the_piece() {
     storage.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test]
+async fn cancelling_during_the_final_hash_returns_cancelled() {
+    let fixture = Fixture::new(&[(&["a.bin"], MIB)], MIB);
+    let storage = fixture.open().await;
+    let pool = Arc::new(HashPool::new());
+    let (gate, mut entered) = HashGate::new();
+    pool.set_test_gate(Arc::clone(&gate));
+    let rechecker = Arc::new(fixture.rechecker(storage.clone(), Arc::clone(&pool)));
+    let base = Arc::new(fixture.base());
+    let cancel = RecheckCancel::new();
+
+    let task = {
+        let rechecker = Arc::clone(&rechecker);
+        let base = Arc::clone(&base);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            rechecker
+                .run(RecheckSelection::All, &base, &cancel, None)
+                .await
+        })
+    };
+
+    entered.recv().await.expect("final hash entered the gate");
+    cancel.cancel();
+    gate.open();
+
+    match task.await.expect("task") {
+        Err(RecheckError::Cancelled) => {}
+        other => panic!("expected cancellation, got {other:?}"),
+    }
+    assert_eq!(base.count_verified(), 0);
+
+    // The lease is released even though the final hash completed.
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+        .expect("run after cancellation");
+    assert_eq!(outcome.present(), 1);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_panicking_hash_job_is_a_typed_error() {
+    let fixture = Fixture::new(&[(&["a.bin"], MIB)], MIB);
+    let storage = fixture.open().await;
+    let pool = Arc::new(HashPool::new());
+    let (gate, _entered) = HashGate::new();
+    pool.set_test_gate(Arc::clone(&gate));
+    gate.panic_on_enter();
+    let rechecker = fixture.rechecker(storage.clone(), Arc::clone(&pool));
+    let base = fixture.base();
+
+    match rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+    {
+        Err(RecheckError::HashTask { piece: 0, .. }) => {}
+        other => panic!("expected a hash task error, got {other:?}"),
+    }
+    assert_eq!(base.count_verified(), 0);
+
+    // A fresh pool can retry, and the storage worker survived the panic.
+    let retry = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+    let outcome = retry
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+        .expect("retry after a hash panic");
+    assert_eq!(outcome.present(), 1);
+
+    drop(rechecker);
+    drop(retry);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_storage_error_in_the_overlapped_batch_stops_the_run() {
+    let fixture = Fixture::new(&[(&["a.bin"], 2 * MIB)], 2 * MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+    let base = fixture.base();
+
+    // Four reads fill the first batch; the fifth is the first read of the
+    // overlapped batch and fails.
+    storage.fail_read_after(4).await.expect("arm read failure");
+
+    match rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+    {
+        Err(RecheckError::Storage {
+            piece: 0,
+            offset,
+            source: StorageHandleError::Storage(StorageError::PermissionDenied { .. }),
+        }) => assert_eq!(offset, MIB),
+        other => panic!("expected a typed permission error, got {other:?}"),
+    }
+    assert_eq!(base.count_verified(), 0);
+
+    // The first batch's hash finished and released its permit, and the
+    // one-shot injection is gone, so a retry succeeds.
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+        .expect("run after the error");
+    assert_eq!(outcome.present(), 1);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
 #[test]
 fn chunk_constants_fit_the_storage_limit() {
     assert_eq!(RECHECK_CHUNK_LEN, 256 * 1024);
@@ -820,6 +932,10 @@ async fn selection_validation_is_typed() {
     let storage = fixture.open().await;
     let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
     let base = fixture.base();
+
+    // Validation must reject a selection before any read: this one-shot
+    // failure would abort the run if a read happened.
+    storage.fail_read_after(0).await.expect("arm read failure");
 
     let unordered = [2u32, 1];
     match rechecker
@@ -887,6 +1003,11 @@ async fn selection_validation_is_typed() {
             found: 2,
         }) => {}
         other => panic!("expected a piece count mismatch, got {other:?}"),
+    }
+
+    match storage.read_range(0, 1).await {
+        Err(StorageHandleError::Storage(StorageError::PermissionDenied { .. })) => {}
+        other => panic!("selection validation must not read, got {other:?}"),
     }
 
     drop(rechecker);

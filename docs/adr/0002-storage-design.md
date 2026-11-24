@@ -578,17 +578,20 @@ where the code differs from the design above.
   mutated. `Bitfield::mark_rechecked_present` is crate-private, and
   `Bitfield::set` stays private. A short read, missing file, or hash mismatch
   leaves the bit clear and counts as absent; the piece is abandoned on the
-  first short read, including in the overlapped batch. Other storage errors
-  stop the run as typed `RecheckError::Storage`; `UnsafePath` and permission
-  errors can never be reported as absent. Nothing is returned on error.
+  first short read, including in the overlapped batch. A file removed between
+  the metadata check and the open is reported as a short read by the backend,
+  not as an I/O error. Other storage errors stop the run as typed
+  `RecheckError::Storage`; `UnsafePath` and permission errors can never be
+  reported as absent. Nothing is returned on error.
 - **Recheck cancellation and exclusivity.** `RecheckCancel` is a shared atomic
-  flag checked before each chunk read and each hash job; a cancelled run returns
-  `RecheckError::Cancelled` and publishes nothing. Dropping the future releases
-  the lease at its next await. An atomic flag plus a drop guard allows one
-  recheck per torrent and returns `AlreadyRunning` otherwise; the lease is not
-  shared across torrents. Recheck stays exclusive with same-torrent piece
-  writes by caller contract; item 10 needs a `Checking` state that excludes
-  `Downloading` while a recheck or resume validation runs.
+  flag checked before each chunk read, before each hash job, and after the final
+  hash; a cancelled run returns `RecheckError::Cancelled` and publishes
+  nothing. Dropping the future releases the lease at its next await. An atomic
+  flag plus a drop guard allows one recheck per `Rechecker` and returns
+  `AlreadyRunning` otherwise; the session owns one `Rechecker` per torrent, so
+  the lease is not shared across torrents. Recheck stays exclusive with
+  same-torrent piece writes by caller contract; item 10 needs a `Checking`
+  state that excludes `Downloading` while a recheck or resume validation runs.
 - **Recheck progress is advisory.** One `RecheckProgress` snapshot is sent with
   `try_send` after each selected piece. A full channel drops updates, including
   the final one, so the returned `RecheckOutcome` is authoritative. The `Only`

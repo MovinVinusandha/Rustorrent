@@ -359,13 +359,15 @@ impl Rechecker {
                 });
 
                 if remaining == 0 {
-                    hasher = hash.await.map_err(RecheckError::HashTask)?;
+                    hasher = hash
+                        .await
+                        .map_err(|source| RecheckError::HashTask { piece, source })?;
                     break;
                 }
 
                 let (hashed, next) =
                     tokio::join!(hash, self.read_batch(piece, position, remaining, cancel));
-                hasher = hashed.map_err(RecheckError::HashTask)?;
+                hasher = hashed.map_err(|source| RecheckError::HashTask { piece, source })?;
 
                 let Some(next) = next? else {
                     // A short read in the overlapped batch means the piece is
@@ -387,6 +389,12 @@ impl Rechecker {
                     })?;
                 remaining -= next.len();
                 batch = next;
+            }
+
+            // A cancel that arrived during the last hash must still be
+            // observed: the piece is complete but nothing may be published.
+            if cancel.is_cancelled() {
+                return Err(RecheckError::Cancelled);
             }
 
             checked += 1;
@@ -426,6 +434,9 @@ impl Rechecker {
         cancel: &RecheckCancel,
     ) -> Result<Option<Vec<u8>>, RecheckError> {
         let batch_len = remaining.min(RECHECK_BATCH_LEN);
+        if cancel.is_cancelled() {
+            return Err(RecheckError::Cancelled);
+        }
         let mut batch = Vec::with_capacity(batch_len);
 
         while batch.len() < batch_len {
@@ -634,8 +645,14 @@ pub enum RecheckError {
         offset: u64,
     },
     /// The blocking hash task failed.
-    #[error("piece hashing task failed")]
-    HashTask(#[source] JoinError),
+    #[error("piece {piece} hashing task failed")]
+    HashTask {
+        /// Piece being checked.
+        piece: u32,
+        /// Task error.
+        #[source]
+        source: JoinError,
+    },
     /// A bitfield operation failed.
     #[error(transparent)]
     Bitfield(#[from] BitfieldError),

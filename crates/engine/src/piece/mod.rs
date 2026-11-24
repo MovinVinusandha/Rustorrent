@@ -8,6 +8,7 @@ pub mod assembler;
 pub mod budget;
 pub mod buffer;
 pub mod spec;
+pub mod verify;
 
 pub use assembler::{DEFAULT_STALL_TIMEOUT, InsertResult, PieceAssembler, PieceError};
 pub use budget::{
@@ -16,6 +17,7 @@ pub use budget::{
 };
 pub use buffer::{BlockError, InsertOutcome, PieceBuffer, PieceBufferError};
 pub use spec::{PieceSpec, PieceSpecError};
+pub use verify::{DEFAULT_MAX_HASH_JOBS, HashPool, HashPoolError, VerifiedPiece, VerifyError};
 
 /// Protocol block size: 16 KiB.
 ///

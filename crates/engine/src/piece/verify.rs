@@ -17,6 +17,8 @@ use std::fmt;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
 use thiserror::Error;
@@ -35,6 +37,8 @@ pub struct HashPool {
     max_jobs: usize,
     #[cfg(test)]
     gate: Mutex<Option<Arc<HashGate>>>,
+    #[cfg(test)]
+    counters: Arc<TestCounters>,
 }
 
 impl HashPool {
@@ -45,6 +49,8 @@ impl HashPool {
             max_jobs: DEFAULT_MAX_HASH_JOBS,
             #[cfg(test)]
             gate: Mutex::new(None),
+            #[cfg(test)]
+            counters: Arc::new(TestCounters::default()),
         }
     }
 
@@ -67,6 +73,8 @@ impl HashPool {
             max_jobs,
             #[cfg(test)]
             gate: Mutex::new(None),
+            #[cfg(test)]
+            counters: Arc::new(TestCounters::default()),
         })
     }
 
@@ -95,6 +103,25 @@ impl HashPool {
             });
         }
 
+        self.run_job(move || verify_buffer(buffer))
+            .await
+            .map_err(VerifyError::TaskFailed)?
+    }
+
+    /// Runs one blocking job under the pool's job cap.
+    ///
+    /// The semaphore permit moves into the blocking closure, so it covers the
+    /// actual work and is released when the job ends. Recheck acquires one
+    /// permit per batch and releases it immediately after hashing; Tokio's
+    /// semaphore is FIFO, so live piece verification waits for at most one
+    /// recheck batch. A caller that drops this future while the job runs
+    /// detaches that job; it still owns its data and permit and releases both
+    /// when it finishes.
+    pub(crate) async fn run_job<T, F>(&self, job: F) -> Result<T, JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         // The pool owns the semaphore and never closes it, so this cannot
         // fail. Keeping the whole result alive still holds the permit when one
         // was acquired, without an error path or a panic.
@@ -102,29 +129,44 @@ impl HashPool {
 
         #[cfg(test)]
         let gate = self.gate.lock().expect("hash gate lock").clone();
+        #[cfg(test)]
+        let counters = Arc::clone(&self.counters);
 
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             #[cfg(test)]
+            let _active = ActiveJob::start(counters);
+            #[cfg(test)]
             if let Some(gate) = gate {
                 gate.enter();
             }
-            verify_buffer(buffer)
+            job()
         })
         .await
-        .map_err(VerifyError::TaskFailed)?
     }
 
     /// Hash jobs that can start immediately.
     ///
     /// This is an admission hint only; a job still has to win the permit.
     #[cfg(test)]
-    fn available_jobs(&self) -> usize {
+    pub(crate) fn available_jobs(&self) -> usize {
         self.permits.available_permits()
     }
 
+    /// Jobs that have entered the blocking pool, including finished ones.
     #[cfg(test)]
-    fn set_test_gate(&self, gate: Arc<HashGate>) {
+    pub(crate) fn started_jobs(&self) -> usize {
+        self.counters.started.load(Ordering::SeqCst)
+    }
+
+    /// Jobs currently running or waiting inside the test gate.
+    #[cfg(test)]
+    pub(crate) fn active_jobs(&self) -> usize {
+        self.counters.active.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_gate(&self, gate: Arc<HashGate>) {
         *self.gate.lock().expect("hash gate lock") = Some(gate);
     }
 }
@@ -132,6 +174,34 @@ impl HashPool {
 impl Default for HashPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test-only counters that make job batching and leaks observable.
+#[cfg(test)]
+#[derive(Default)]
+struct TestCounters {
+    started: AtomicUsize,
+    active: AtomicUsize,
+}
+
+/// Decrements the active-job count when a blocking job ends or panics.
+#[cfg(test)]
+struct ActiveJob(Arc<TestCounters>);
+
+#[cfg(test)]
+impl ActiveJob {
+    fn start(counters: Arc<TestCounters>) -> Self {
+        counters.started.fetch_add(1, Ordering::SeqCst);
+        counters.active.fetch_add(1, Ordering::SeqCst);
+        Self(counters)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveJob {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

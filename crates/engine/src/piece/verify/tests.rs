@@ -191,6 +191,54 @@ async fn short_last_piece_hashes_exactly_the_actual_length() {
 }
 
 #[tokio::test]
+async fn blocking_jobs_share_the_cap_and_release_their_permit() {
+    let (gate, mut entered) = HashGate::new();
+    let pool = Arc::new(HashPool::with_max_jobs(1).expect("hash pool"));
+    pool.set_test_gate(Arc::clone(&gate));
+
+    let first = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        async move { pool.run_job(|| 1u8).await }
+    });
+    timeout(WAIT, entered.recv())
+        .await
+        .expect("first job entered the gate")
+        .expect("gate entry");
+    assert_eq!(pool.available_jobs(), 0, "the job holds the only permit");
+    assert_eq!(pool.active_jobs(), 1);
+    assert_eq!(pool.started_jobs(), 1);
+
+    let mut second = pin!(pool.run_job(|| 2u8));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        second.as_mut().poll(&mut context).is_pending(),
+        "the second job waits for the only permit"
+    );
+    assert_eq!(
+        pool.started_jobs(),
+        1,
+        "a waiting job has not entered the blocking pool"
+    );
+
+    gate.open();
+    let first_value = timeout(WAIT, first)
+        .await
+        .expect("first job finished")
+        .expect("first task")
+        .expect("first job");
+    assert_eq!(first_value, 1);
+    let second_value = timeout(WAIT, second)
+        .await
+        .expect("second job finished")
+        .expect("second job");
+    assert_eq!(second_value, 2);
+
+    assert_eq!(pool.available_jobs(), 1, "the permit was released");
+    assert_eq!(pool.active_jobs(), 0, "no blocking job is still running");
+    assert_eq!(pool.started_jobs(), 2);
+}
+
+#[tokio::test]
 async fn hash_cap_is_never_exceeded() {
     let (gate, mut entered) = HashGate::new();
     let pool = Arc::new(HashPool::with_max_jobs(2).expect("hash pool"));

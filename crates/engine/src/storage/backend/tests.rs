@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 
@@ -1223,4 +1224,27 @@ fn classify_maps_windows_file_in_use() {
             "code {code}"
         );
     }
+}
+
+#[test]
+fn system_time_ns_handles_epoch_and_overflow() {
+    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH), Some(0));
+
+    let max = Duration::from_nanos(i64::MAX as u64);
+    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH + max), Some(i64::MAX));
+    assert_eq!(
+        system_time_ns(SystemTime::UNIX_EPOCH - max),
+        Some(-i64::MAX)
+    );
+
+    let too_far = Duration::from_nanos(i64::MAX as u64 + 1);
+    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH + too_far), None);
+    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH - too_far), None);
+}
+
+#[test]
+fn system_time_ns_handles_pre_epoch_times() {
+    let before = SystemTime::UNIX_EPOCH - Duration::from_secs(3_600);
+
+    assert_eq!(system_time_ns(before), Some(-3_600_000_000_000));
 }

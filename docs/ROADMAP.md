@@ -14,7 +14,7 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     post-sanitization path collisions.
   - [x] 3b. Storage backend: safe file creation, positioned reads/writes via
     `crates/platform`, open-handle cap, preallocation policy.
-  - [ ] 3c. Piece verification, split into separately merged steps.
+  - [x] 3c. Piece verification, split into separately merged steps.
     - [x] 3c-1. Storage thread: one owned `Storage` on a dedicated OS thread,
       bounded request queue and a cloneable async handle (`Open`, `ReadRange`,
       `WriteRange`, `Sync`, `Shutdown`); typed errors when the worker is gone,
@@ -86,9 +86,9 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
   - Must model a `Checking` state that excludes `Downloading`. A recheck reads
     the torrent's files, so the session must keep the torrent out of the
     download scheduler while `Rechecker::run` is active and drop any queued
-    piece stores for it. `Rechecker` already rejects a second concurrent run
-    for the same torrent, and resume-data validation (3d) uses the same
-    exclusion.
+    piece stores for it. The session owns exactly one `Rechecker` per torrent;
+    each one rejects a second concurrent run with `AlreadyRunning`, and
+    resume-data validation (3d) uses the same exclusion.
 - [ ] 11. TUI: list, add, details, limits
 - [ ] 12. Cross-platform CI green, tag v0.1.0
 

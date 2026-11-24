@@ -223,6 +223,29 @@ fn a_full_final_byte_roundtrips_when_piece_count_is_a_multiple_of_eight() {
     );
 }
 
+#[test]
+fn clear_piece_clears_exactly_one_bit_and_rejects_out_of_range() {
+    let mut bitfield =
+        Bitfield::from_bytes(&[0b0000_0101, 0b0000_0001], 9).expect("bitfield from bytes");
+    assert_eq!(bitfield.count_verified(), 3);
+
+    bitfield.clear_piece(2).expect("clear piece 2");
+    assert!(!bitfield.get(2).expect("get piece 2"));
+    assert!(bitfield.get(0).expect("get piece 0"));
+    assert!(bitfield.get(8).expect("get piece 8"));
+    assert_eq!(bitfield.count_verified(), 2);
+    assert_eq!(bitfield.as_bytes(), &[0b0000_0001, 0b0000_0001]);
+
+    assert_eq!(
+        bitfield.clear_piece(9),
+        Err(BitfieldError::OutOfRange {
+            piece: 9,
+            piece_count: 9,
+        })
+    );
+    assert_eq!(bitfield.count_verified(), 2);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

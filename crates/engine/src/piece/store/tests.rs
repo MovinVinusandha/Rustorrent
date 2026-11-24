@@ -9,6 +9,7 @@ use sha1::{Digest, Sha1};
 use tempfile::TempDir;
 
 use super::*;
+use crate::bitfield::{Bitfield, BitfieldError};
 use crate::metainfo::PIECE_HASH_LENGTH;
 use crate::piece::{
     BLOCK_LEN, HashPool, MemoryBudget, PeerKey, PieceBuffer, PieceSpec, TorrentBudget,
@@ -98,11 +99,23 @@ async fn verified_piece(
     data: &[u8],
     declared_piece_length: u64,
 ) -> Verified {
+    verify_piece(index, offset, data, declared_piece_length, hash_of(data))
+        .await
+        .expect("verified piece")
+}
+
+async fn verify_piece(
+    index: u32,
+    offset: u64,
+    data: &[u8],
+    declared_piece_length: u64,
+    hash: [u8; PIECE_HASH_LENGTH],
+) -> Result<Verified, crate::piece::VerifyError> {
     let budget = MemoryBudget::new(128 * MIB).expect("memory budget");
     let torrent = budget
         .torrent_budget(declared_piece_length)
         .expect("torrent budget");
-    let spec = PieceSpec::new(index, offset, data.len(), hash_of(data)).expect("piece spec");
+    let spec = PieceSpec::new(index, offset, data.len(), hash).expect("piece spec");
     let reservation = torrent.try_reserve(data.len()).expect("reservation");
     let mut buffer = PieceBuffer::new(spec, reservation).expect("piece buffer");
     for (block_index, block) in data.chunks(BLOCK_LEN).enumerate() {
@@ -113,12 +126,12 @@ async fn verified_piece(
     }
 
     let pool = HashPool::new();
-    let piece = pool.verify(buffer).await.expect("verified piece");
-    Verified {
+    let piece = pool.verify(buffer).await?;
+    Ok(Verified {
         piece,
         budget,
         torrent,
-    }
+    })
 }
 
 async fn read_all(storage: &StorageHandle, offset: u64, len: usize) -> Vec<u8> {
@@ -379,6 +392,86 @@ async fn last_short_piece_round_trips() {
     assert_eq!(stored.length(), last_len);
 
     assert_eq!(read_all(&storage, 2 * MIB, last_len).await, data);
+
+    drop(verified.piece);
+    assert_budget_idle(&verified.budget, &verified.torrent);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn bits_are_set_only_after_a_hash_match_and_a_complete_write() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let len = usize::try_from(5 * MIB / 2).expect("piece length");
+    let map = map_pieces(&[(&["a.bin"], 5 * MIB / 2)], 5 * MIB / 2, 1);
+    let storage = open_storage(&root, map).await;
+    let data = test_bytes(len);
+    let mut bitfield = Bitfield::new(1).expect("bitfield");
+
+    // A hash mismatch never produces a VerifiedPiece, so there is nothing to
+    // store and the bit stays clear.
+    let mismatch = verify_piece(0, 0, &data, 5 * MIB / 2, hash_of(b"wrong piece")).await;
+    assert!(mismatch.is_err());
+    assert!(!bitfield.get(0).expect("get piece 0"));
+
+    // A complete hash match with a failed second chunk still leaves the bit
+    // clear: StoredPiece is only built after every chunk succeeds.
+    let verified = verified_piece(0, 0, &data, 5 * MIB / 2).await;
+    storage
+        .fail_write_after(1)
+        .await
+        .expect("arm write failure");
+    let error = store_verified(&storage, &verified.piece)
+        .await
+        .expect_err("the second chunk must fail");
+    assert!(error.is_disk_full());
+    assert!(
+        !bitfield.get(0).expect("get piece 0"),
+        "a failed chunk must not set the bit"
+    );
+
+    let stored = store_verified(&storage, &verified.piece)
+        .await
+        .expect("retry with the same piece");
+    bitfield.mark_stored(&stored).expect("mark stored");
+    assert!(bitfield.get(0).expect("get piece 0"));
+    assert_eq!(bitfield.count_verified(), 1);
+    assert_eq!(read_all(&storage, 0, len).await, data);
+
+    drop(verified.piece);
+    assert_budget_idle(&verified.budget, &verified.torrent);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn mark_stored_sets_only_its_piece_and_checks_the_range() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let piece_len = usize::try_from(MIB).expect("piece length");
+    let map = map_pieces(&[(&["a.bin"], 2 * MIB)], MIB, 2);
+    let storage = open_storage(&root, map).await;
+
+    let data = test_bytes(piece_len);
+    let verified = verified_piece(1, MIB, &data, MIB).await;
+    let stored = store_verified(&storage, &verified.piece)
+        .await
+        .expect("store piece 1");
+
+    let mut bitfield = Bitfield::new(2).expect("bitfield");
+    bitfield.mark_stored(&stored).expect("mark stored");
+    assert!(!bitfield.get(0).expect("get piece 0"));
+    assert!(bitfield.get(1).expect("get piece 1"));
+    assert_eq!(bitfield.count_verified(), 1);
+
+    let mut too_small = Bitfield::new(1).expect("bitfield");
+    assert_eq!(
+        too_small.mark_stored(&stored),
+        Err(BitfieldError::OutOfRange {
+            piece: 1,
+            piece_count: 1,
+        })
+    );
+    assert_eq!(too_small.count_verified(), 0);
 
     drop(verified.piece);
     assert_budget_idle(&verified.budget, &verified.torrent);

@@ -28,7 +28,7 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -49,7 +49,7 @@ use crate::storage::thread::{StorageHandle, StorageHandleError};
 #[derive(Debug)]
 pub struct ResumeStore {
     dir: PathBuf,
-    saving: Mutex<BTreeSet<InfoHash>>,
+    saving: Arc<Mutex<BTreeSet<InfoHash>>>,
 }
 
 impl ResumeStore {
@@ -59,7 +59,7 @@ impl ResumeStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
-            saving: Mutex::new(BTreeSet::new()),
+            saving: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -83,8 +83,9 @@ impl ResumeStore {
     /// cannot observe later changes to the same bitfield.
     ///
     /// Only one save per info-hash can run on this store at a time. A second
-    /// caller gets [`SaveError::AlreadySaving`] without touching storage, and
-    /// the lease is released when the first save returns or fails.
+    /// caller gets [`SaveError::AlreadySaving`] without touching storage. The
+    /// lease is owned by the blocking write task, so dropping the save future
+    /// cannot admit a concurrent writer while that write is still running.
     ///
     /// A failure before the rename leaves the previous document in place. A
     /// failure during the rename leaves either the old or the new document,
@@ -120,20 +121,23 @@ impl ResumeStore {
 
         let dir = self.dir.clone();
         let path = self.document_path(&info_hash);
-        let blocking = tokio::task::spawn_blocking(move || write_document(&dir, &path, &bytes))
-            .await
-            .map_err(SaveError::Task)?;
+        let blocking = tokio::task::spawn_blocking(move || {
+            let result = write_document(&dir, &path, &bytes);
+            drop(lease);
+            result
+        })
+        .await
+        .map_err(SaveError::Task)?;
         blocking.map_err(|error| match error {
             BlockingError::CreateDir(source) => SaveError::CreateDir(source),
             BlockingError::Write(source) => SaveError::Write(source),
         })?;
 
-        drop(lease);
         Ok(())
     }
 
     /// Reserves the save slot for one torrent.
-    fn acquire(&self, info_hash: InfoHash) -> Result<SaveLease<'_>, SaveError> {
+    fn acquire(&self, info_hash: InfoHash) -> Result<SaveLease, SaveError> {
         let mut saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
         if !saving.insert(info_hash) {
             return Err(SaveError::AlreadySaving);
@@ -141,19 +145,19 @@ impl ResumeStore {
         drop(saving);
 
         Ok(SaveLease {
-            saving: &self.saving,
+            saving: Arc::clone(&self.saving),
             info_hash,
         })
     }
 }
 
-/// Holds the save slot until the save returns, fails, or is cancelled.
-struct SaveLease<'a> {
-    saving: &'a Mutex<BTreeSet<InfoHash>>,
+/// Holds the save slot until the blocking write finishes or is dropped.
+struct SaveLease {
+    saving: Arc<Mutex<BTreeSet<InfoHash>>>,
     info_hash: InfoHash,
 }
 
-impl Drop for SaveLease<'_> {
+impl Drop for SaveLease {
     fn drop(&mut self) {
         let mut saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
         saving.remove(&self.info_hash);

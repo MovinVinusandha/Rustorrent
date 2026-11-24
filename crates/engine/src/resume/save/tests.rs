@@ -251,6 +251,43 @@ async fn a_second_save_for_the_same_torrent_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_blocking_writer_keeps_the_lease_until_it_finishes() {
+    let (dir, root) = fixture();
+    let map = map_with(&[(&["a.bin"], 4)], 4);
+    write_file(&root, &["a.bin"], &[0x66; 4]);
+    let storage = open(&root, &map).await;
+    let store = Arc::new(ResumeStore::new(dir.path().join("resume")));
+    let bits = Bitfield::new(1).expect("bitfield");
+    let lease = store.acquire(info_hash()).expect("lease");
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        ready_tx.send(()).ok();
+        release_rx.recv().ok();
+    });
+    ready_rx.await.expect("writer ready");
+
+    let error = store
+        .save(info_hash(), &map, bits.clone(), &storage)
+        .await
+        .expect_err("save while a blocking writer holds the lease");
+    assert!(matches!(error, SaveError::AlreadySaving));
+
+    release_tx.send(()).expect("release writer");
+    writer.await.expect("join writer");
+
+    store
+        .save(info_hash(), &map, bits, &storage)
+        .await
+        .expect("save after the blocking writer finishes");
+    assert!(store.document_path(&info_hash()).exists());
+
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn a_failed_flush_writes_nothing_and_releases_the_lease() {
     let (dir, root) = fixture();
     let resume_dir = dir.path().join("resume");

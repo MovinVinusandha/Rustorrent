@@ -5,7 +5,7 @@ rbit appears to provide it (verify by reading its code and tests before relying 
 
 | BEP | Name | Target | Status | rbit | Module | Tests | Notes |
 |---|---|---|---|---|---|---|---|
-| 3 | Core protocol | v0.1 | in-progress | verify | bencode, metainfo | unit + fuzz | bencode and v1 metainfo done; tracker and peer wire pending. Gaps: `.utf-8` keys and legacy text encodings (v0.2) |
+| 3 | Core protocol | v0.1 | in-progress | verify | bencode, metainfo, piece, storage | unit + fuzz | bencode, v1 metainfo, and the piece verification/write path done; tracker and peer wire pending. Gaps: `.utf-8` keys and legacy text encodings (v0.2) |
 | 23 | Compact peers | v0.1 | planned | verify | | | |
 | 15 | UDP tracker | v0.1 | planned | verify | | | |
 | 12 | Multi-tracker | v0.1 | planned | verify | | | |

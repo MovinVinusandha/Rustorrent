@@ -23,16 +23,19 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       reservations, piece specs and peer keys, block assembly with peer
       attribution, stall expiry, and block-insertion fuzzing. Pure in-memory:
       it does not use `StorageHandle` and can merge before 3c-1.
-    - [ ] 3c-2b. Piece verification and write path: SHA-1 on the blocking pool
-      with a job cap, and writing verified pieces through
-      `StorageHandle::write_range` in chunks of at most 1 MiB. Planned API:
-      `store_verified(storage, VerifiedPiece) -> Result<StoredPiece, WriteError>`
-      returns a `StoredPiece` with no public constructor, and
-      `Bitfield::mark_stored(&StoredPiece)` sets the verified bit synchronously,
-      so no `&mut Bitfield` is held across an await. The bit stays false after a
-      failed chunk and becomes true only after `mark_stored`. The 1 MiB chunk
-      copy is outside the piece budget (bounded, not peer-sized). The ADR,
-      roadmap status, and BEP notes land in that branch.
+    - [x] 3c-2b. Piece verification and write path: SHA-1 on the blocking pool
+      with a configurable job cap (default 2), and writing verified pieces
+      through `StorageHandle::write_range` in chunks of at most 1 MiB.
+      `store_verified(storage, &VerifiedPiece) -> Result<StoredPiece, WriteError>`
+      borrows the piece, so a failed chunk is retried without re-downloading.
+      `StoredPiece` has no public constructor, and
+      `Bitfield::mark_stored(&StoredPiece)` is the only way to set a verified
+      bit; it is synchronous, so no `&mut Bitfield` is held across an await.
+      The bit stays false after a failed chunk and becomes true only after a
+      complete write. The 1 MiB chunk copy is outside the piece budget
+      (bounded, not peer-sized). The bitfield's generic setter is private;
+      invalidation uses `clear_piece`. See ADR 0002 for the implementation
+      notes.
     - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
       the verified bitmap, treat missing or short data as absent.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation

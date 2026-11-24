@@ -61,6 +61,10 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     sweep.
   - Must own one `PieceAssembler` and one `TorrentBudget` handle per torrent,
     dropping both when the torrent is removed.
+  - Must introduce a per-torrent state object that owns the `Bitfield`, the
+    `TorrentBudget` handle, and the spec factory, and carries the info-hash.
+    `mark_stored` checks that hash, so a `StoredPiece` from one torrent cannot
+    set a bit in another torrent's bitfield.
 - [ ] 11. TUI: list, add, details, limits
 - [ ] 12. Cross-platform CI green, tag v0.1.0
 

@@ -12,8 +12,8 @@ use super::*;
 use crate::bitfield::{Bitfield, BitfieldError};
 use crate::metainfo::PIECE_HASH_LENGTH;
 use crate::piece::{
-    BLOCK_LEN, HashPool, MemoryBudget, PeerKey, PieceBuffer, PieceSpec, TorrentBudget,
-    VerifiedPiece, assert_budget_idle,
+    BLOCK_LEN, HashPool, MemoryBudget, PeerKey, PieceBuffer, TorrentBudget, VerifiedPiece,
+    assert_budget_idle, test_spec,
 };
 use crate::storage::backend::{StorageConfig, StorageError};
 use crate::storage::layout::{FileMap, MappedFile};
@@ -115,7 +115,7 @@ async fn verify_piece(
     let torrent = budget
         .torrent_budget(declared_piece_length)
         .expect("torrent budget");
-    let spec = PieceSpec::new(index, offset, data.len(), hash).expect("piece spec");
+    let spec = test_spec(index, offset, data.len(), hash).expect("piece spec");
     let reservation = torrent.try_reserve(data.len()).expect("reservation");
     let mut buffer = PieceBuffer::new(spec, reservation).expect("piece buffer");
     for (block_index, block) in data.chunks(BLOCK_LEN).enumerate() {

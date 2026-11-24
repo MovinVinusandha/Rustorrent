@@ -8,6 +8,7 @@ use super::*;
 use crate::metainfo::PIECE_HASH_LENGTH;
 use crate::piece::{
     BLOCK_LEN, MemoryBudget, PeerKey, PieceBuffer, PieceSpec, TorrentBudget, assert_budget_idle,
+    test_spec,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -43,7 +44,7 @@ fn hash_of(bytes: &[u8]) -> [u8; PIECE_HASH_LENGTH] {
 }
 
 fn spec(index: u32, offset: u64, hash: [u8; PIECE_HASH_LENGTH], len: usize) -> PieceSpec {
-    PieceSpec::new(index, offset, len, hash).expect("piece spec")
+    test_spec(index, offset, len, hash).expect("piece spec")
 }
 
 fn fill(torrent: &TorrentBudget, spec: PieceSpec, data: &[u8], peers: &[u64]) -> PieceBuffer {

@@ -23,11 +23,15 @@ pub struct PieceSpec {
 impl PieceSpec {
     /// Creates a piece spec after validating its range and length.
     ///
+    /// Crate-private: outside this crate a spec must come from
+    /// [`PieceSpec::from_metainfo`], which also checks the torrent's file map
+    /// and hash list.
+    ///
     /// `length` is the actual piece length, not the torrent's declared piece
     /// length. A zero length is rejected because no piece can be empty, and a
     /// length above [`MAX_PIECE_LENGTH`] is rejected even when the metainfo
     /// fields were forged.
-    pub fn new(
+    pub(crate) fn new(
         index: u32,
         offset: u64,
         length: usize,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::metainfo::PIECE_HASH_LENGTH;
 use crate::piece::{
-    BLOCK_LEN, MemoryBudget, PeerKey, PieceSpec, TorrentBudget, assert_budget_idle,
+    BLOCK_LEN, MemoryBudget, PeerKey, PieceSpec, TorrentBudget, assert_budget_idle, test_spec,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -23,7 +23,7 @@ fn start_piece(
 ) {
     let length_u64 = u64::try_from(length).expect("length fits u64");
     let offset = u64::from(index) * length_u64;
-    let spec = PieceSpec::new(index, offset, length, HASH).expect("piece spec");
+    let spec = test_spec(index, offset, length, HASH).expect("piece spec");
     let reservation = torrent.try_reserve(length).expect("reservation");
     assembler.start_at(spec, reservation, now).expect("start");
 }
@@ -33,7 +33,7 @@ fn setup_at(
     now: Instant,
 ) -> (PieceAssembler, MemoryBudget, TorrentBudget, PieceSpec) {
     let (budget, torrent) = budgets(length);
-    let spec = PieceSpec::new(0, 0, length, HASH).expect("piece spec");
+    let spec = test_spec(0, 0, length, HASH).expect("piece spec");
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
     start_piece(&mut assembler, &torrent, 0, length, now);
     (assembler, budget, torrent, spec)
@@ -409,7 +409,7 @@ fn starting_with_a_mismatched_reservation_is_a_buffer_error() {
     let t0 = Instant::now();
     let len = 4096;
     let (budget, torrent) = budgets(len);
-    let spec = PieceSpec::new(0, 0, len, HASH).expect("spec");
+    let spec = test_spec(0, 0, len, HASH).expect("spec");
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
 
     let reservation = torrent.try_reserve(len - 1).expect("reservation");
@@ -469,7 +469,7 @@ fn only_wrapped_block_violations_are_protocol_violations() {
 fn public_start_and_insert_use_the_current_time() {
     let len = BLOCK_LEN;
     let (budget, torrent) = budgets(len);
-    let spec = PieceSpec::new(0, 0, len, HASH).expect("spec");
+    let spec = test_spec(0, 0, len, HASH).expect("spec");
     let mut assembler = PieceAssembler::new(DEFAULT_STALL_TIMEOUT).expect("assembler");
 
     let reservation = torrent.try_reserve(len).expect("reservation");

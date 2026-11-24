@@ -22,6 +22,20 @@ pub use spec::{PieceSpec, PieceSpecError};
 pub use store::{StoredPiece, WriteError, store_verified};
 pub use verify::{DEFAULT_MAX_HASH_JOBS, HashPool, HashPoolError, VerifiedPiece, VerifyError};
 
+/// Builds a piece spec in unit tests without constructing metainfo.
+///
+/// Production code must use [`PieceSpec::from_metainfo`], which also checks
+/// the spec against the torrent's file map and hash list.
+#[cfg(test)]
+pub(crate) fn test_spec(
+    index: u32,
+    offset: u64,
+    length: usize,
+    hash: [u8; crate::metainfo::PIECE_HASH_LENGTH],
+) -> Result<PieceSpec, PieceSpecError> {
+    PieceSpec::new(index, offset, length, hash)
+}
+
 /// Protocol block size: 16 KiB.
 ///
 /// Every piece is split into blocks of this size. The final block of a piece

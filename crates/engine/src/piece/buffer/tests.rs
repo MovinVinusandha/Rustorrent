@@ -2,13 +2,13 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::metainfo::{MAX_PIECE_LENGTH, PIECE_HASH_LENGTH};
-use crate::piece::{MemoryBudget, TorrentBudget};
+use crate::piece::{MemoryBudget, TorrentBudget, test_spec};
 
 const MIB: u64 = 1024 * 1024;
 const HASH: [u8; PIECE_HASH_LENGTH] = [0x5A; PIECE_HASH_LENGTH];
 
 fn spec(length: usize) -> PieceSpec {
-    PieceSpec::new(0, 0, length, HASH).expect("piece spec")
+    test_spec(0, 0, length, HASH).expect("piece spec")
 }
 
 fn torrent_budget(length: usize) -> TorrentBudget {
@@ -480,7 +480,7 @@ fn spec_and_reserved_bytes_are_exposed() {
     let len = 4096;
     let torrent = torrent_budget(len);
     let reservation = torrent.try_reserve(len).expect("reservation");
-    let spec = PieceSpec::new(7, 1234, len, HASH).expect("spec");
+    let spec = test_spec(7, 1234, len, HASH).expect("spec");
     let buffer = PieceBuffer::new(spec, reservation).expect("buffer");
 
     assert_eq!(buffer.piece(), 7);

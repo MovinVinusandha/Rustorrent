@@ -182,6 +182,7 @@ fn write_and_rename(temp: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> 
 
 /// Returns the directory that contains `path`, falling back to the current
 /// directory for a bare file name.
+#[cfg(unix)]
 fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,

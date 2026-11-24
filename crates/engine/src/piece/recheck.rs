@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha1::{Digest, Sha1};
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio::task::JoinError;
 
 use super::{HashPool, PieceSpec, PieceSpecError};
@@ -49,6 +50,33 @@ pub const RECHECK_BATCH_LEN: usize = RECHECK_CHUNK_LEN * RECHECK_CHUNKS_PER_JOB;
 
 const _: () = assert!(RECHECK_CHUNK_LEN <= MAX_RANGE_LEN);
 const _: () = assert!(RECHECK_BATCH_LEN <= MAX_RANGE_LEN);
+
+/// Cooperative cancellation flag for a recheck.
+///
+/// Clones share one flag. Cancellation is checked before each chunk read and
+/// before each hash job, so a run that observes it stops within one batch and
+/// returns [`RecheckError::Cancelled`] without publishing a bitfield.
+#[derive(Debug, Clone, Default)]
+pub struct RecheckCancel {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RecheckCancel {
+    /// Creates a flag that is not cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cancellation. Calling this more than once is harmless.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` once cancellation was requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// Pieces selected for one recheck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +164,47 @@ impl RecheckOutcome {
     }
 }
 
+/// Advisory snapshot sent after each selected piece finishes.
+///
+/// Updates are sent with `try_send`, so a full channel drops an update,
+/// including the final one. The returned [`RecheckOutcome`] is the
+/// authoritative result; progress is only a hint for a front-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecheckProgress {
+    piece: u32,
+    checked: u32,
+    present: u32,
+    absent: u32,
+    total: u32,
+}
+
+impl RecheckProgress {
+    /// Index of the piece that just finished.
+    pub fn piece(&self) -> u32 {
+        self.piece
+    }
+
+    /// Number of selected pieces finished so far.
+    pub fn checked(&self) -> u32 {
+        self.checked
+    }
+
+    /// Number of finished pieces that matched the metainfo hash.
+    pub fn present(&self) -> u32 {
+        self.present
+    }
+
+    /// Number of finished pieces that were absent or damaged.
+    pub fn absent(&self) -> u32 {
+        self.absent
+    }
+
+    /// Number of selected pieces in this run.
+    pub fn total(&self) -> u32 {
+        self.total
+    }
+}
+
 /// Per-torrent streaming recheck.
 ///
 /// A `Rechecker` owns the torrent's storage handle, file map, metainfo, and a
@@ -177,10 +246,21 @@ impl Rechecker {
     /// unselected bits are preserved. A selected piece whose data is missing,
     /// truncated, or does not match the metainfo hash stays clear and counts as
     /// absent. Nothing is published if this returns an error.
+    ///
+    /// Cancellation is checked before each chunk read and before each hash job.
+    /// A cancelled run stops within one batch and returns
+    /// [`RecheckError::Cancelled`]; dropping the future releases the run's
+    /// lease at its next await. Neither publishes a bitfield.
+    ///
+    /// When `progress` is set, one update is sent with `try_send` after each
+    /// selected piece. Updates are advisory: a full channel drops them,
+    /// including the final one, so the returned outcome is the result.
     pub async fn run(
         &self,
         selection: RecheckSelection<'_>,
         base: &Bitfield,
+        cancel: &RecheckCancel,
+        progress: Option<&mpsc::Sender<RecheckProgress>>,
     ) -> Result<RecheckOutcome, RecheckError> {
         let _lease = self.acquire()?;
 
@@ -202,11 +282,18 @@ impl Rechecker {
                 absent: 0,
             });
         }
+        if cancel.is_cancelled() {
+            return Err(RecheckError::Cancelled);
+        }
 
         let mut checked = 0u32;
         let mut present = 0u32;
 
         for piece in selection.iter(self.map.piece_count()) {
+            if cancel.is_cancelled() {
+                return Err(RecheckError::Cancelled);
+            }
+
             let spec = PieceSpec::from_metainfo(self.map.as_ref(), self.meta.as_ref(), piece)?;
 
             // A selected piece is unknown until the whole piece matches. Clear
@@ -224,6 +311,10 @@ impl Rechecker {
                 let mut batch = Vec::with_capacity(batch_len);
 
                 while batch.len() < batch_len {
+                    if cancel.is_cancelled() {
+                        return Err(RecheckError::Cancelled);
+                    }
+
                     let want = (batch_len - batch.len()).min(RECHECK_CHUNK_LEN);
                     let read = self
                         .storage
@@ -268,6 +359,10 @@ impl Rechecker {
                     remaining -= want;
                 }
 
+                if cancel.is_cancelled() {
+                    return Err(RecheckError::Cancelled);
+                }
+
                 hasher = self
                     .pool
                     .run_job(move || {
@@ -280,17 +375,25 @@ impl Rechecker {
 
             checked += 1;
 
-            if !complete {
-                continue;
+            if complete {
+                let digest = hasher.finalize();
+                let mut found = [0u8; PIECE_HASH_LENGTH];
+                found.copy_from_slice(&digest);
+
+                if found == spec.hash() {
+                    bits.mark_rechecked_present(piece)?;
+                    present += 1;
+                }
             }
 
-            let digest = hasher.finalize();
-            let mut found = [0u8; PIECE_HASH_LENGTH];
-            found.copy_from_slice(&digest);
-
-            if found == spec.hash() {
-                bits.mark_rechecked_present(piece)?;
-                present += 1;
+            if let Some(progress) = progress {
+                let _ = progress.try_send(RecheckProgress {
+                    piece,
+                    checked,
+                    present,
+                    absent: checked - present,
+                    total,
+                });
             }
         }
 
@@ -391,6 +494,9 @@ pub enum RecheckError {
     /// Another recheck is already running on this `Rechecker`.
     #[error("a recheck is already running for this torrent")]
     AlreadyRunning,
+    /// The run observed a cancelled [`RecheckCancel`] and stopped.
+    #[error("recheck was cancelled")]
+    Cancelled,
     /// The base bitfield does not match the torrent's piece count.
     #[error("bitfield has {found} pieces, torrent has {expected}")]
     PieceCountMismatch {

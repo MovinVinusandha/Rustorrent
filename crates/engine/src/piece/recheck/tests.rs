@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 
 use super::*;
 use crate::bitfield::Bitfield;
@@ -152,7 +153,7 @@ async fn all_valid_pieces_are_present() {
     let base = fixture.base();
 
     let outcome = rechecker
-        .run(RecheckSelection::All, &base)
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
         .await
         .expect("recheck");
 
@@ -181,7 +182,12 @@ async fn subset_recheck_preserves_unselected_bits() {
     let selection = [1u32];
 
     let outcome = rechecker
-        .run(RecheckSelection::Only(&selection), &base)
+        .run(
+            RecheckSelection::Only(&selection),
+            &base,
+            &RecheckCancel::new(),
+            None,
+        )
         .await
         .expect("recheck");
 
@@ -211,7 +217,7 @@ async fn damaged_piece_is_absent_and_loses_its_base_bit() {
     }
 
     let outcome = rechecker
-        .run(RecheckSelection::All, &base)
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
         .await
         .expect("recheck");
 
@@ -241,7 +247,12 @@ async fn unselected_damaged_piece_keeps_its_base_bit() {
 
     let selection = [1u32];
     let outcome = rechecker
-        .run(RecheckSelection::Only(&selection), &base)
+        .run(
+            RecheckSelection::Only(&selection),
+            &base,
+            &RecheckCancel::new(),
+            None,
+        )
         .await
         .expect("recheck");
 
@@ -271,7 +282,7 @@ async fn missing_file_makes_its_pieces_absent() {
     base.mark_rechecked_present(1).expect("base piece 1");
 
     let outcome = rechecker
-        .run(RecheckSelection::All, &base)
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
         .await
         .expect("recheck");
 
@@ -300,7 +311,12 @@ async fn short_read_abandons_the_piece_without_reading_remaining_chunks() {
 
     let selection = [0u32];
     let outcome = rechecker
-        .run(RecheckSelection::Only(&selection), &fixture.base())
+        .run(
+            RecheckSelection::Only(&selection),
+            &fixture.base(),
+            &RecheckCancel::new(),
+            None,
+        )
         .await
         .expect("recheck");
 
@@ -325,7 +341,10 @@ async fn storage_error_stops_the_run_and_is_typed() {
 
     storage.fail_read_after(1).await.expect("arm read failure");
 
-    match rechecker.run(RecheckSelection::All, &base).await {
+    match rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+    {
         Err(RecheckError::Storage {
             piece: 0,
             offset: 262_144,
@@ -356,7 +375,15 @@ async fn symlink_swap_is_a_security_error_not_an_absent_piece() {
     fs::remove_file(&path).expect("remove file");
     std::os::unix::fs::symlink(&outside, &path).expect("create symlink");
 
-    match rechecker.run(RecheckSelection::All, &fixture.base()).await {
+    match rechecker
+        .run(
+            RecheckSelection::All,
+            &fixture.base(),
+            &RecheckCancel::new(),
+            None,
+        )
+        .await
+    {
         Err(RecheckError::Storage {
             piece: 0,
             offset: 0,
@@ -374,13 +401,235 @@ async fn symlink_swap_is_a_security_error_not_an_absent_piece() {
 }
 
 #[tokio::test]
+async fn cancelled_before_start_reads_nothing_and_releases_the_lease() {
+    let fixture = Fixture::new(&[(&["a.bin"], MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+    let base = fixture.base();
+    let cancel = RecheckCancel::new();
+    cancel.cancel();
+
+    // A read now would fail. The cancelled run must not read, and the dummy
+    // read below proves the one-shot hook is still armed.
+    storage.fail_read_after(0).await.expect("arm read failure");
+
+    match rechecker
+        .run(RecheckSelection::All, &base, &cancel, None)
+        .await
+    {
+        Err(RecheckError::Cancelled) => {}
+        other => panic!("expected cancellation, got {other:?}"),
+    }
+    match storage.read_range(0, 1).await {
+        Err(StorageHandleError::Storage(StorageError::PermissionDenied { .. })) => {}
+        other => panic!("the cancelled run must not read, got {other:?}"),
+    }
+
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+        .expect("run after cancellation");
+    assert_eq!(outcome.present(), 1);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn active_run_holds_the_lease_until_cancelled() {
+    let fixture = Fixture::new(&[(&["a.bin"], 16 * MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = Arc::new(fixture.rechecker(storage.clone(), Arc::new(HashPool::new())));
+    let base = Arc::new(fixture.base());
+    let cancel = RecheckCancel::new();
+    let (tx, mut rx) = mpsc::channel(4);
+
+    let task = {
+        let rechecker = Arc::clone(&rechecker);
+        let base = Arc::clone(&base);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            rechecker
+                .run(RecheckSelection::All, &base, &cancel, Some(&tx))
+                .await
+        })
+    };
+
+    let first = rx.recv().await.expect("first progress update");
+    assert_eq!(first.checked(), 1);
+
+    match rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+    {
+        Err(RecheckError::AlreadyRunning) => {}
+        other => panic!("expected AlreadyRunning, got {other:?}"),
+    }
+
+    cancel.cancel();
+    match task.await.expect("task") {
+        Err(RecheckError::Cancelled) => {}
+        other => panic!("expected cancellation, got {other:?}"),
+    }
+
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+        .expect("run after cancellation");
+    assert_eq!(outcome.present(), 16);
+    assert_eq!(outcome.bits().count_verified(), 16);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dropping_the_run_releases_the_lease() {
+    let fixture = Fixture::new(&[(&["a.bin"], MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+    let base = fixture.base();
+
+    let dropped = tokio::time::timeout(
+        std::time::Duration::ZERO,
+        rechecker.run(RecheckSelection::All, &base, &RecheckCancel::new(), None),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the run should be dropped at its first await"
+    );
+
+    let outcome = rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+        .expect("run after a dropped future");
+    assert_eq!(outcome.present(), 1);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn progress_updates_are_bounded_and_advisory() {
+    let fixture = Fixture::new(&[(&["a.bin"], 4 * MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+    let (tx, mut rx) = mpsc::channel(1);
+
+    let outcome = rechecker
+        .run(
+            RecheckSelection::All,
+            &fixture.base(),
+            &RecheckCancel::new(),
+            Some(&tx),
+        )
+        .await
+        .expect("recheck");
+    assert_eq!(outcome.checked(), 4);
+    assert_eq!(outcome.present(), 4);
+
+    let only = rx.try_recv().expect("one buffered update");
+    assert_eq!(only.piece(), 0);
+    assert_eq!(only.checked(), 1);
+    assert_eq!(only.total(), 4);
+    assert_eq!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "a full channel drops later updates, including the final one"
+    );
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn progress_reports_every_selected_piece() {
+    let fixture = Fixture::new(&[(&["a.bin"], 4 * MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+    let (tx, mut rx) = mpsc::channel(4);
+    let selection = [0u32, 2];
+
+    let outcome = rechecker
+        .run(
+            RecheckSelection::Only(&selection),
+            &fixture.base(),
+            &RecheckCancel::new(),
+            Some(&tx),
+        )
+        .await
+        .expect("recheck");
+    assert_eq!(outcome.checked(), 2);
+    assert_eq!(outcome.present(), 2);
+
+    let first = rx.try_recv().expect("first update");
+    assert_eq!((first.piece(), first.checked(), first.total()), (0, 1, 2));
+    let last = rx.try_recv().expect("final update");
+    assert_eq!((last.piece(), last.checked(), last.present()), (2, 2, 2));
+    assert_eq!(last.absent(), 0);
+    assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn storage_shutdown_mid_run_is_a_typed_error() {
+    let fixture = Fixture::new(&[(&["a.bin"], 8 * MIB)], MIB);
+    let storage = fixture.open().await;
+    let rechecker = Arc::new(fixture.rechecker(storage.clone(), Arc::new(HashPool::new())));
+    let base = Arc::new(fixture.base());
+    let cancel = RecheckCancel::new();
+    let (tx, mut rx) = mpsc::channel(4);
+
+    let task = {
+        let rechecker = Arc::clone(&rechecker);
+        let base = Arc::clone(&base);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            rechecker
+                .run(RecheckSelection::All, &base, &cancel, Some(&tx))
+                .await
+        })
+    };
+
+    rx.recv().await.expect("first progress update");
+    storage.shutdown().await.expect("shutdown");
+
+    match task.await.expect("task") {
+        Err(RecheckError::Storage {
+            source: StorageHandleError::ShuttingDown,
+            ..
+        }) => {}
+        other => panic!("expected a shutdown error, got {other:?}"),
+    }
+
+    match rechecker
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+        .await
+    {
+        Err(RecheckError::Storage {
+            source: StorageHandleError::ShuttingDown,
+            ..
+        }) => {}
+        other => panic!("expected a shutdown error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn last_short_piece_hashes_its_actual_length() {
     let fixture = Fixture::new(&[(&["a.bin"], 2 * MIB + 200 * KIB)], MIB);
     let storage = fixture.open().await;
     let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
 
     let outcome = rechecker
-        .run(RecheckSelection::All, &fixture.base())
+        .run(
+            RecheckSelection::All,
+            &fixture.base(),
+            &RecheckCancel::new(),
+            None,
+        )
         .await
         .expect("recheck");
 
@@ -407,7 +656,12 @@ async fn empty_selection_returns_the_base_without_reading() {
         .expect("arm a read failure that must not be used");
 
     let outcome = rechecker
-        .run(RecheckSelection::Only(&[]), &base)
+        .run(
+            RecheckSelection::Only(&[]),
+            &base,
+            &RecheckCancel::new(),
+            None,
+        )
         .await
         .expect("empty recheck");
 
@@ -428,7 +682,7 @@ async fn zero_pieces_all_returns_the_base() {
     let base = fixture.base();
 
     let outcome = rechecker
-        .run(RecheckSelection::All, &base)
+        .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
         .await
         .expect("zero-piece recheck");
 
@@ -450,7 +704,12 @@ async fn batching_uses_one_hash_job_per_batch() {
     let rechecker = fixture.rechecker(storage.clone(), Arc::clone(&pool));
 
     let outcome = rechecker
-        .run(RecheckSelection::All, &fixture.base())
+        .run(
+            RecheckSelection::All,
+            &fixture.base(),
+            &RecheckCancel::new(),
+            None,
+        )
         .await
         .expect("recheck");
 
@@ -484,7 +743,12 @@ async fn selection_validation_is_typed() {
 
     let unordered = [2u32, 1];
     match rechecker
-        .run(RecheckSelection::Only(&unordered), &base)
+        .run(
+            RecheckSelection::Only(&unordered),
+            &base,
+            &RecheckCancel::new(),
+            None,
+        )
         .await
     {
         Err(RecheckError::SelectionNotSorted {
@@ -496,7 +760,12 @@ async fn selection_validation_is_typed() {
 
     let duplicate = [1u32, 1];
     match rechecker
-        .run(RecheckSelection::Only(&duplicate), &base)
+        .run(
+            RecheckSelection::Only(&duplicate),
+            &base,
+            &RecheckCancel::new(),
+            None,
+        )
         .await
     {
         Err(RecheckError::SelectionNotSorted {
@@ -508,7 +777,12 @@ async fn selection_validation_is_typed() {
 
     let out_of_range = [3u32];
     match rechecker
-        .run(RecheckSelection::Only(&out_of_range), &base)
+        .run(
+            RecheckSelection::Only(&out_of_range),
+            &base,
+            &RecheckCancel::new(),
+            None,
+        )
         .await
     {
         Err(RecheckError::SelectionOutOfRange {
@@ -519,7 +793,15 @@ async fn selection_validation_is_typed() {
     }
 
     let short_base = Bitfield::new(2).expect("short bitfield");
-    match rechecker.run(RecheckSelection::All, &short_base).await {
+    match rechecker
+        .run(
+            RecheckSelection::All,
+            &short_base,
+            &RecheckCancel::new(),
+            None,
+        )
+        .await
+    {
         Err(RecheckError::PieceCountMismatch {
             expected: 3,
             found: 2,

@@ -20,8 +20,8 @@ pub use budget::{
 };
 pub use buffer::{BlockError, InsertOutcome, PieceBuffer, PieceBufferError};
 pub use recheck::{
-    RECHECK_BATCH_LEN, RECHECK_CHUNK_LEN, RECHECK_CHUNKS_PER_JOB, RecheckError, RecheckOutcome,
-    RecheckSelection, Rechecker,
+    RECHECK_BATCH_LEN, RECHECK_CHUNK_LEN, RECHECK_CHUNKS_PER_JOB, RecheckCancel, RecheckError,
+    RecheckOutcome, RecheckProgress, RecheckSelection, Rechecker,
 };
 pub use spec::{PieceSpec, PieceSpecError};
 pub use store::{StoredPiece, WriteError, store_verified};

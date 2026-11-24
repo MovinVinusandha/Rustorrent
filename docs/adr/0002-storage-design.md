@@ -785,15 +785,16 @@ where the code differs from the design above.
   returns both results. The engine has no logging, and report paths stay
   relative to the download root.
 
-## Status and exceptions (2026-11-24)
+## Status and exceptions (2026-11-24, updated 2026-11-25)
 
 - **Worker scope.** The storage worker is one `std::thread` per
   `StorageHandle`, which is one per torrent today, not one per session as the
   thread model above describes. The 64-handle cap is therefore per torrent, so
   N torrents can hold N × 64 descriptors. Item 10 replaces this with a session
   pool and a global handle budget; the `StorageHandle` methods stay the same.
-- **Blocking jobs are not cancellable.** `HashPool`, `store_verified`, and
-  resume load/save run on `tokio::task::spawn_blocking`. Dropping the future
+- **Blocking jobs are not cancellable.** `HashPool`, `store_verified`, and all
+  resume load, restore planning, and save work run on
+  `tokio::task::spawn_blocking`. Dropping the future
   detaches the job. The semaphore permit and the piece buffer move into the
   closure, writes are idempotent, and resume documents are capped at 16 MiB, so
   cancellation cannot leak budget or corrupt a document. This is a deliberate

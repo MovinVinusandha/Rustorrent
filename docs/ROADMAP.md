@@ -126,12 +126,12 @@ Before item 4:
   `unsafe_code` are enforced by CI's `-D warnings`.
 - [x] Reconcile `AGENTS.md`, `ARCHITECTURE.md`, ADR 0001, ADR 0002, and
   `BEP_STATUS.md` with the code.
-- [ ] Harden resume saves: a unique temp file per save (pid + process-wide
+- [x] Harden resume saves: a unique temp file per save (pid + process-wide
   counter + nanosecond timestamp) created with `create_new`, atomic rename,
   and a sweep of stale `*.resume.tmp.*` older than 24 hours. No cross-process
   lock file; keep the in-process lease as an efficiency measure and document
   one daemon per resume directory.
-- [ ] CI: build the fuzz crate and add weekly fuzz and `cargo deny` schedules.
+- [x] CI: build the fuzz crate and add weekly fuzz and `cargo deny` schedules.
 
 Blocking prerequisites of item 10:
 - [ ] Non-blocking TUI command dispatch: send commands from a task, feed

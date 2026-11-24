@@ -654,7 +654,31 @@ where the code differs from the design above.
   before any read, so an invalid list cannot clear a bit.
 - **Test hooks are compiled out of release builds.** The hash gate, the
   injected `DiskFull` write failure, the injected `PermissionDenied` read
-  failure, and the read-request counter exist only under `#[cfg(test)]`; the
+  failure, and the read notification exist only under `#[cfg(test)]`; the
   release `bt-engine` library and `bt-tui` binary were checked for their
-  strings. The read counter is what proves the next recheck batch is read while
-  the current batch is held in the hash gate.
+  strings. The read notification is what proves the next recheck batch is read
+  while the current batch is held in the hash gate.
+
+## Status and exceptions (2026-11-24)
+
+- **Worker scope.** The storage worker is one `std::thread` per
+  `StorageHandle`, which is one per torrent today, not one per session as the
+  thread model above describes. The 64-handle cap is therefore per torrent, so
+  N torrents can hold N × 64 descriptors. Item 10 replaces this with a session
+  pool and a global handle budget; the `StorageHandle` methods stay the same.
+- **Blocking jobs are not cancellable.** `HashPool`, `store_verified`, and
+  resume load/save run on `tokio::task::spawn_blocking`. Dropping the future
+  detaches the job. The semaphore permit and the piece buffer move into the
+  closure, writes are idempotent, and resume documents are capped at 16 MiB, so
+  cancellation cannot leak budget or corrupt a document. This is a deliberate
+  exception to the "every spawned task is cancellable" rule.
+
+### Durability and portability by platform
+
+| Property | Linux | macOS | Windows |
+|---|---|---|---|
+| Flush the temp file before rename (`sync_all`) | yes | yes | yes |
+| Sync the parent directory after rename | yes, best effort on `EINVAL`/`ENOTSUP` | yes, same | no: `std` has no portable directory handle, so the rename is the boundary |
+| Duplicate-inode and hardlink detection | yes | yes | not available: layout and `create_new` collisions only |
+| Post-open file identity check | yes | yes | skipped (`file_id` is `None`) |
+| Path cap | 1024 bytes for the relative path | same | same; the root prefix is not counted |

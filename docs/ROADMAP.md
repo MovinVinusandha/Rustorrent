@@ -72,7 +72,7 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     recorded in the `FileMap`, never follow links, and never remove directories
     outside the root. Route deletion through the storage worker as a command so
     it runs on the storage thread and cannot race open handles. The API stub
-    currently ignores `delete_files`.
+    currently rejects `delete_files: true` with `NOT_IMPLEMENTED`.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame
@@ -112,9 +112,9 @@ Recorded 2026-11-24 from the read-only whole-workspace review of `main`
 (`ae62a18`, same tree as `206f2ed`).
 
 Before item 4:
-- [ ] Inherit the workspace `[lints]` in every crate so `missing_docs` and
+- [x] Inherit the workspace `[lints]` in every crate so `missing_docs` and
   `unsafe_code` are enforced by CI's `-D warnings`.
-- [ ] Reconcile `AGENTS.md`, `ARCHITECTURE.md`, ADR 0001, ADR 0002, and
+- [x] Reconcile `AGENTS.md`, `ARCHITECTURE.md`, ADR 0001, ADR 0002, and
   `BEP_STATUS.md` with the code.
 - [ ] Harden resume saves: a unique temp file per save (pid + process-wide
   counter + nanosecond timestamp) created with `create_new`, atomic rename,

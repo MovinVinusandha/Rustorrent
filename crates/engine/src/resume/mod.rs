@@ -6,8 +6,12 @@
 //! to the daemon.
 
 mod format;
+mod restore;
 
 pub use format::{
     DecodeError, EncodeError, MAX_RESUME_BYTES, RESUME_VERSION, ResumeDocument, ResumeFile,
     decode_document, encode_document, layout_fingerprint,
+};
+pub use restore::{
+    RestoreError, RestorePlan, SPOT_CHECK_PIECES, ValidationError, plan_restore, validate_document,
 };

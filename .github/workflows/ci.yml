@@ -45,3 +45,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  fuzz-check:
+    name: fuzz targets
+    runs-on: ubuntu-latest
+    env:
+      # The repo pins stable in rust-toolchain.toml; the environment variable
+      # outranks it so the fuzz crate is checked with nightly.
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: Check fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins

@@ -106,6 +106,9 @@ fn open_unchecked(root: &Path, map: Arc<FileMap>) -> Storage {
         seen_inodes: BTreeSet::new(),
         handles: HandleCache::new(1).expect("handle cache"),
         created_dirs: CreatedDirs::default(),
+        removed: false,
+        removal_failed: false,
+        removal_plan: None,
     }
 }
 
@@ -1880,4 +1883,70 @@ fn remove_directories_falls_back_to_the_structural_layout_after_a_restart() {
     assert!(report.removed.contains(&PathBuf::from("top/sub")));
     assert!(report.removed.contains(&PathBuf::from("top")));
     assert!(!root.join("top").exists());
+}
+
+#[test]
+fn a_completed_removal_rejects_data_operations() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"data").expect("write");
+    storage.begin_removal();
+
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 0);
+    let dirs = remove_all_dirs(&mut storage);
+    assert_eq!(dirs.failed_count, 0);
+    assert!(storage.finish_removal());
+
+    let mut buf = [0u8; 4];
+    assert!(matches!(
+        storage.read_range(0, &mut buf),
+        Err(StorageError::Removed)
+    ));
+    assert!(matches!(
+        storage.write_range(0, b"data"),
+        Err(StorageError::Removed)
+    ));
+    assert!(matches!(
+        storage.observe_files(0, 1),
+        Err(StorageError::Removed)
+    ));
+    assert!(!root.join("top").exists());
+    storage.close().expect("close after removal");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_removal_pass_does_not_mark_the_storage_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["blocked", "a"], 4), (&["open", "b"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"aaaabbbb").expect("write");
+    let blocked = root.join("blocked");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).expect("make read-only");
+
+    storage.begin_removal();
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 1);
+    let dirs = remove_all_dirs(&mut storage);
+    assert_eq!(dirs.failed_count, 0);
+    assert!(!storage.finish_removal());
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore mode");
+    storage
+        .write_range(0, b"data")
+        .expect("a failed pass must leave the storage usable");
+
+    storage.begin_removal();
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 0);
+    let dirs = remove_all_dirs(&mut storage);
+    assert_eq!(dirs.failed_count, 0);
+    assert!(storage.finish_removal());
+    assert!(!root.join("blocked").exists());
 }

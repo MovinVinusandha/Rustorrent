@@ -728,3 +728,123 @@ async fn requests_after_shutdown_are_rejected() {
         Err(StorageHandleError::ShuttingDown)
     ));
 }
+
+#[tokio::test]
+async fn remove_data_deletes_files_and_directories() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 4), (&["top", "sub", "b"], 4)]);
+    let handle = open(&root, map).await;
+    handle
+        .write_range(0, b"aaaabbbb".to_vec())
+        .await
+        .expect("write");
+
+    let report = handle.remove_data().await.expect("remove data");
+
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.removed_count, 4, "two files and two directories");
+    assert!(!root.join("top").exists());
+    assert!(root.is_dir(), "the download root must survive");
+
+    match handle.write_range(0, b"data".to_vec()).await {
+        Err(StorageHandleError::Storage(StorageError::Removed)) => {}
+        other => panic!("expected a removed storage, got {other:?}"),
+    }
+    match handle.read_range(0, 4).await {
+        Err(StorageHandleError::Storage(StorageError::Removed)) => {}
+        other => panic!("expected a removed storage, got {other:?}"),
+    }
+    close(handle).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remove_data_marks_removed_only_after_a_clean_pass() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["blocked", "a"], 4), (&["open", "b"], 4)]);
+    let handle = open(&root, map).await;
+    handle
+        .write_range(0, b"aaaabbbb".to_vec())
+        .await
+        .expect("write");
+    let blocked = root.join("blocked");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).expect("make read-only");
+
+    let first = handle.remove_data().await.expect("first pass");
+
+    assert_eq!(first.failed_count, 1);
+    assert_eq!(first.removed_count, 2, "the open file and its directory");
+    assert!(root.join("blocked").join("a").is_file());
+    assert!(!root.join("open").exists());
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore mode");
+    handle
+        .write_range(0, b"data".to_vec())
+        .await
+        .expect("a partial failure must leave the storage usable");
+
+    let second = handle.remove_data().await.expect("second pass");
+
+    assert_eq!(second.failed_count, 0);
+    assert!(!root.join("blocked").exists());
+    match handle.write_range(0, b"data".to_vec()).await {
+        Err(StorageHandleError::Storage(StorageError::Removed)) => {}
+        other => panic!("expected a removed storage, got {other:?}"),
+    }
+    close(handle).await;
+}
+
+#[tokio::test]
+async fn remove_data_chunks_large_maps() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let names: Vec<String> = (0..REMOVE_CHUNK_ITEMS + 1)
+        .map(|index| format!("f{index}.bin"))
+        .collect();
+    let components: Vec<Vec<&str>> = names.iter().map(|name| vec![name.as_str()]).collect();
+    let entries: Vec<(&[&str], u64)> = components
+        .iter()
+        .map(|components| (components.as_slice(), 0))
+        .collect();
+    let handle = open(&root, map_with(&entries)).await;
+
+    let report = handle.remove_data().await.expect("remove data");
+
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.removed_count, REMOVE_CHUNK_ITEMS + 1);
+    assert_eq!(
+        handle.remove_file_chunks().await.expect("chunk count"),
+        2,
+        "a 257-file map must be removed in two worker commands"
+    );
+    close(handle).await;
+}
+
+#[tokio::test]
+async fn remove_data_keeps_unowned_files_and_still_marks_removed() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 1)]);
+    let handle = open(&root, map).await;
+    handle.write_range(0, b"x".to_vec()).await.expect("write");
+    fs::write(root.join("top").join("user.txt"), b"keep").expect("write user file");
+
+    let report = handle.remove_data().await.expect("remove data");
+
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.not_empty_count, 1);
+    assert_eq!(report.not_empty, vec![PathBuf::from("top")]);
+    assert_eq!(
+        fs::read(root.join("top").join("user.txt")).expect("read user file"),
+        b"keep"
+    );
+    match handle.write_range(0, b"x".to_vec()).await {
+        Err(StorageHandleError::Storage(StorageError::Removed)) => {}
+        other => panic!("expected a removed storage, got {other:?}"),
+    }
+    close(handle).await;
+}

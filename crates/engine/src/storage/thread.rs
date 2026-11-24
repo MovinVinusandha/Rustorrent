@@ -24,7 +24,10 @@ use std::thread;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use super::backend::{OBSERVE_CHUNK_FILES, ObservedFile, Storage, StorageConfig, StorageError};
+use super::backend::{
+    OBSERVE_CHUNK_FILES, ObservedFile, REMOVE_CHUNK_ITEMS, RemovalChunk, RemovalReport, Storage,
+    StorageConfig, StorageError,
+};
 use super::layout::FileMap;
 
 /// Maximum number of requests waiting in the worker queue.
@@ -207,6 +210,66 @@ impl StorageHandle {
         }
     }
 
+    /// Removes every mapped file and every directory this worker owns.
+    ///
+    /// Files and directories are walked in [`REMOVE_CHUNK_ITEMS`]-sized
+    /// worker commands, so a large torrent does not hold the queue for the
+    /// whole pass. A failure never stops the pass. The storage is marked
+    /// removed only when no item failed; after a partial failure the same
+    /// handle stays usable and can retry.
+    ///
+    /// The caller must stop downloads, rechecks, and resume saves for this
+    /// torrent first; requests from other clones are interleaved with the
+    /// removal commands.
+    ///
+    /// The report contains paths relative to the download root. Callers must
+    /// treat file names as user data and not log them without consent.
+    pub async fn remove_data(&self) -> Result<RemovalReport, StorageHandleError> {
+        self.send(|reply| Command::BeginRemoval { reply }).await?;
+        let mut report = RemovalReport::default();
+
+        let mut start = 0usize;
+        loop {
+            let chunk = self
+                .send(|reply| Command::RemoveFiles {
+                    start,
+                    count: REMOVE_CHUNK_ITEMS,
+                    reply,
+                })
+                .await?;
+            let count = chunk.items.len();
+            for item in chunk.items {
+                report.record(item);
+            }
+            if chunk.done {
+                break;
+            }
+            start = start.saturating_add(count);
+        }
+
+        let mut start = 0usize;
+        loop {
+            let chunk = self
+                .send(|reply| Command::RemoveDirectories {
+                    start,
+                    count: REMOVE_CHUNK_ITEMS,
+                    reply,
+                })
+                .await?;
+            let count = chunk.items.len();
+            for item in chunk.items {
+                report.record(item);
+            }
+            if chunk.done {
+                break;
+            }
+            start = start.saturating_add(count);
+        }
+
+        self.send(|reply| Command::FinishRemoval { reply }).await?;
+        Ok(report)
+    }
+
     /// Returns `true` once shutdown has begun or the worker has exited.
     pub fn is_closed(&self) -> bool {
         self.state.shutting_down.load(Ordering::Acquire) || self.tx.is_closed()
@@ -335,6 +398,12 @@ impl StorageHandle {
         self.send(|reply| Command::ObserveCount { reply }).await
     }
 
+    /// Number of remove-files commands the worker has processed. Test-only.
+    #[cfg(test)]
+    pub(crate) async fn remove_file_chunks(&self) -> Result<usize, StorageHandleError> {
+        self.send(|reply| Command::RemoveFileCount { reply }).await
+    }
+
     /// Blocks the worker once this command reaches the front of the queue.
     ///
     /// Returns after the worker has entered the hold, with a sender that
@@ -378,6 +447,22 @@ enum Command {
         count: usize,
         reply: Reply<Vec<ObservedFile>>,
     },
+    BeginRemoval {
+        reply: Reply<()>,
+    },
+    RemoveFiles {
+        start: usize,
+        count: usize,
+        reply: Reply<RemovalChunk>,
+    },
+    RemoveDirectories {
+        start: usize,
+        count: usize,
+        reply: Reply<RemovalChunk>,
+    },
+    FinishRemoval {
+        reply: Reply<()>,
+    },
     Shutdown {
         reply: Reply<()>,
     },
@@ -397,6 +482,10 @@ enum Command {
     },
     #[cfg(test)]
     ObserveCount {
+        reply: Reply<usize>,
+    },
+    #[cfg(test)]
+    RemoveFileCount {
         reply: Reply<usize>,
     },
     #[cfg(test)]
@@ -427,6 +516,12 @@ fn reject(command: Command) {
         Command::ObserveFiles { reply, .. } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
+        Command::BeginRemoval { reply } | Command::FinishRemoval { reply } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        Command::RemoveFiles { reply, .. } | Command::RemoveDirectories { reply, .. } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
         #[cfg(test)]
         Command::OpenHandles { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
@@ -441,6 +536,10 @@ fn reject(command: Command) {
         }
         #[cfg(test)]
         Command::ObserveCount { reply } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::RemoveFileCount { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
@@ -483,6 +582,8 @@ fn run_worker(
     let mut notify_read_at: Option<(usize, oneshot::Sender<()>)> = None;
     #[cfg(test)]
     let mut observe_requests = 0usize;
+    #[cfg(test)]
+    let mut remove_file_requests = 0usize;
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
@@ -564,6 +665,40 @@ fn run_worker(
                         .map_err(StorageHandleError::Storage),
                 );
             }
+            Command::BeginRemoval { reply } => {
+                storage.begin_removal();
+                let _ = reply.send(Ok(()));
+            }
+            Command::RemoveFiles {
+                start,
+                count,
+                reply,
+            } => {
+                #[cfg(test)]
+                {
+                    remove_file_requests = remove_file_requests.saturating_add(1);
+                }
+                let _ = reply.send(
+                    storage
+                        .remove_files(start, count)
+                        .map_err(StorageHandleError::Storage),
+                );
+            }
+            Command::RemoveDirectories {
+                start,
+                count,
+                reply,
+            } => {
+                let _ = reply.send(
+                    storage
+                        .remove_directories(start, count)
+                        .map_err(StorageHandleError::Storage),
+                );
+            }
+            Command::FinishRemoval { reply } => {
+                storage.finish_removal();
+                let _ = reply.send(Ok(()));
+            }
             Command::Shutdown { reply } => {
                 shutdown = Some(reply);
                 break;
@@ -585,6 +720,10 @@ fn run_worker(
             #[cfg(test)]
             Command::ObserveCount { reply } => {
                 let _ = reply.send(Ok(observe_requests));
+            }
+            #[cfg(test)]
+            Command::RemoveFileCount { reply } => {
+                let _ = reply.send(Ok(remove_file_requests));
             }
             #[cfg(test)]
             Command::NotifyReadAt { count, reached } => {

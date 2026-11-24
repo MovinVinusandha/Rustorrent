@@ -76,7 +76,6 @@ impl RemovalReport {
         self.failed_count != 0
     }
 
-    #[cfg(test)]
     pub(crate) fn record(&mut self, item: RemovalItemOutcome) {
         match item {
             RemovalItemOutcome::Removed(path) => {
@@ -135,7 +134,6 @@ pub enum RemovalError {
     },
 }
 
-#[cfg(test)]
 pub(crate) enum RemovalItemOutcome {
     Removed(PathBuf),
     AlreadyMissing(PathBuf),
@@ -143,13 +141,17 @@ pub(crate) enum RemovalItemOutcome {
     Failed { path: PathBuf, error: RemovalError },
 }
 
-#[cfg(test)]
+impl RemovalItemOutcome {
+    fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
 pub(crate) struct RemovalChunk {
     pub items: Vec<RemovalItemOutcome>,
     pub done: bool,
 }
 
-#[cfg(test)]
 fn push_path(list: &mut Vec<PathBuf>, path: PathBuf, truncated: &mut bool) {
     if list.len() < MAX_REPORT_PATHS {
         list.push(path);
@@ -217,6 +219,9 @@ pub struct Storage {
     seen_inodes: BTreeSet<FileId>,
     handles: HandleCache,
     created_dirs: CreatedDirs,
+    removed: bool,
+    removal_failed: bool,
+    removal_plan: Option<Vec<Vec<String>>>,
 }
 
 /// Directories this storage instance created below the download root.
@@ -226,24 +231,18 @@ pub struct Storage {
 /// structural layout instead.
 #[derive(Debug, Default)]
 struct CreatedDirs {
-    #[cfg(test)]
     dirs: BTreeSet<Vec<String>>,
 }
 
 impl CreatedDirs {
     fn record(&mut self, components: &[String]) {
-        #[cfg(test)]
         self.dirs.insert(components.to_vec());
-        #[cfg(not(test))]
-        let _ = components;
     }
 
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.dirs.is_empty()
     }
 
-    #[cfg(test)]
     fn names(&self) -> &BTreeSet<Vec<String>> {
         &self.dirs
     }
@@ -315,6 +314,9 @@ impl Storage {
             seen_inodes,
             handles,
             created_dirs,
+            removed: false,
+            removal_failed: false,
+            removal_plan: None,
         })
     }
 
@@ -349,7 +351,13 @@ impl Storage {
     /// at the first missing or short file, so a gap is never skipped. A file
     /// longer than its mapped length contributes only the mapped length.
     /// Returns zero when `offset` is at or past the end of the torrent.
+    ///
+    /// A storage marked removed rejects every data operation, so a stale
+    /// handle cannot read through paths that no longer exist.
     pub fn read_range(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, StorageError> {
+        if self.removed {
+            return Err(StorageError::Removed);
+        }
         if buf.is_empty() {
             return Ok(0);
         }
@@ -469,7 +477,13 @@ impl Storage {
     ///
     /// If this returns an error, part of the range may already be on disk.
     /// Callers must set verified state only after a complete successful call.
+    ///
+    /// A storage marked removed rejects writes, so a stale handle cannot
+    /// recreate files or directories that were just deleted.
     pub fn write_range(&mut self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        if self.removed {
+            return Err(StorageError::Removed);
+        }
         if buf.is_empty() {
             return Ok(());
         }
@@ -547,7 +561,13 @@ impl Storage {
     /// Evicted dirty files are reopened read-write after their ancestors are
     /// re-checked and synced. A file that was removed after eviction is a typed
     /// error.
+    ///
+    /// A removed storage has no files left to flush, so this returns `Ok(())`
+    /// and lets shutdown complete.
     pub fn sync(&mut self) -> Result<(), StorageError> {
+        if self.removed {
+            return Ok(());
+        }
         self.handles
             .sync(&self.root, self.map.as_ref(), &self.files)
     }
@@ -559,11 +579,17 @@ impl Storage {
     /// reported as [`ObservedFile::Missing`], not as errors. Ancestors and the
     /// final path are checked with the same symlink rules as every other
     /// storage operation; a symlinked file is a typed error.
+    ///
+    /// A storage marked removed rejects observes instead of reporting every
+    /// file as missing.
     pub fn observe_files(
         &self,
         start: usize,
         count: usize,
     ) -> Result<Vec<ObservedFile>, StorageError> {
+        if self.removed {
+            return Err(StorageError::Removed);
+        }
         let files = self.map.files();
         let begin = start.min(files.len());
         let end = begin.saturating_add(count).min(files.len());
@@ -576,12 +602,31 @@ impl Storage {
         Ok(observed)
     }
 
+    /// Starts a removal pass.
+    ///
+    /// Clears the previous pass's failure mark and the cached directory plan,
+    /// so a retry after a partial failure looks at the current filesystem.
+    pub(crate) fn begin_removal(&mut self) {
+        self.removal_failed = false;
+        self.removal_plan = None;
+    }
+
+    /// Ends a removal pass and marks the storage removed when it was clean.
+    ///
+    /// Returns `true` when the storage is now marked removed. A pass with any
+    /// failed item leaves it usable so the caller can retry.
+    pub(crate) fn finish_removal(&mut self) -> bool {
+        if !self.removal_failed {
+            self.removed = true;
+        }
+        self.removed
+    }
+
     /// Removes one chunk of mapped files.
     ///
     /// `start` is clamped to the map length and `count` bounds the number of
     /// files. Every item produces exactly one outcome; a failure never stops
     /// the rest of the chunk. Missing files are reported as already missing.
-    #[cfg(test)]
     pub(crate) fn remove_files(
         &mut self,
         start: usize,
@@ -594,7 +639,11 @@ impl Storage {
         let mut items = Vec::with_capacity(end.saturating_sub(begin));
 
         for index in begin..end {
-            items.push(self.remove_file_item(&map, index));
+            let item = self.remove_file_item(&map, index);
+            if item.is_failure() {
+                self.removal_failed = true;
+            }
+            items.push(item);
         }
 
         Ok(RemovalChunk {
@@ -610,20 +659,30 @@ impl Storage {
     /// top-level folder and its subfolders are offered instead. A non-empty
     /// directory is kept and reported as a success, so files this client did
     /// not create are never touched.
-    #[cfg(test)]
     pub(crate) fn remove_directories(
         &mut self,
         start: usize,
         count: usize,
     ) -> Result<RemovalChunk, StorageError> {
-        let plan = self.removal_directory_plan();
-        let total = plan.len();
+        if self.removal_plan.is_none() {
+            let plan = self.build_removal_directory_plan();
+            self.removal_plan = Some(plan);
+        }
+        let total = self.removal_plan.as_ref().map_or(0, Vec::len);
         let begin = start.min(total);
         let end = begin.saturating_add(count).min(total);
         let mut items = Vec::with_capacity(end.saturating_sub(begin));
+        let mut failed = false;
 
-        for components in &plan[begin..end] {
-            items.push(self.remove_directory_item(components));
+        if let Some(plan) = self.removal_plan.as_ref() {
+            for components in &plan[begin..end] {
+                let item = self.remove_directory_item(components);
+                failed |= item.is_failure();
+                items.push(item);
+            }
+        }
+        if failed {
+            self.removal_failed = true;
         }
 
         Ok(RemovalChunk {
@@ -633,8 +692,7 @@ impl Storage {
     }
 
     /// Lists the directories removal may try, deepest first.
-    #[cfg(test)]
-    fn removal_directory_plan(&self) -> Vec<Vec<String>> {
+    fn build_removal_directory_plan(&self) -> Vec<Vec<String>> {
         let mut dirs = BTreeSet::new();
 
         if self.created_dirs.is_empty() {
@@ -653,7 +711,6 @@ impl Storage {
     }
 
     /// Removes one directory after re-validating its ancestors and target.
-    #[cfg(test)]
     fn remove_directory_item(&self, components: &[String]) -> RemovalItemOutcome {
         let report_path = relative_path(components);
 
@@ -751,7 +808,6 @@ impl Storage {
     }
 
     /// Removes one mapped file after re-validating its ancestors and target.
-    #[cfg(test)]
     fn remove_file_item(&mut self, map: &FileMap, index: usize) -> RemovalItemOutcome {
         let file = match map.files().get(index) {
             Some(file) => file,
@@ -854,7 +910,6 @@ impl Storage {
     }
 
     /// Restores a pending sync when a failed removal leaves the file in place.
-    #[cfg(test)]
     fn restore_pending(&mut self, index: usize, path: &Path, pending: bool) {
         if !pending {
             return;
@@ -1130,7 +1185,6 @@ impl HandleCache {
     ///
     /// Returns `true` when the entry was dirty or already waiting for a sync,
     /// so a failed removal can put the pending flag back.
-    #[cfg(test)]
     fn remove_index(&mut self, index: usize) -> bool {
         let pending = self.needs_sync.remove(&index);
         let mut dirty = false;
@@ -1155,7 +1209,6 @@ impl HandleCache {
 ///
 /// Components are sanitized before joining, so even a hostile hand-built map
 /// cannot put an absolute path or `..` into a report.
-#[cfg(test)]
 fn relative_path(components: &[String]) -> PathBuf {
     let mut path = PathBuf::new();
     for component in components {
@@ -1165,7 +1218,6 @@ fn relative_path(components: &[String]) -> PathBuf {
 }
 
 /// Returns `true` when two metadata checks describe the same target.
-#[cfg(test)]
 fn same_target(
     before: &fs::Metadata,
     after: &fs::Metadata,
@@ -1178,7 +1230,6 @@ fn same_target(
 }
 
 /// Converts a storage error into a reportable removal error.
-#[cfg(test)]
 fn removal_error(error: StorageError) -> RemovalError {
     match error {
         StorageError::UnsafePath {
@@ -1869,6 +1920,10 @@ pub enum StorageError {
         /// What is wrong.
         reason: &'static str,
     },
+    /// The storage completed a removal pass and no longer accepts data
+    /// operations.
+    #[error("storage was removed")]
+    Removed,
     /// An internal invariant was violated.
     #[error("internal storage invariant: {reason}")]
     Internal {

@@ -16,13 +16,16 @@ Modules:
 - `bitfield`: fixed-size piece bits with exact trailing-bit checks.
 - `storage`: pure path sanitization and `FileMap` (`layout`), the safe file
   backend (`backend`), and the dedicated storage worker and its async handle
-  (`thread`).
+  (`thread`). Removal of mapped files and owned directories runs through the
+  backend and worker.
 - `piece`: piece specs and blocks, memory budget, assembly with peer
   attribution, verification and `HashPool`, piece storage, and streaming
   recheck.
 - `resume`: version 1 codec and layout fingerprint (`format`), bounded load
-  (`load`), pure restore planning (`restore`), save against a `StorageHandle`
-  (`save`), and restore against a `Rechecker` (`restore_run`).
+  (`load`), pure restore planning (`restore`), save and removal against a
+  `StorageHandle` (`save`), and restore against a `Rechecker` (`restore_run`).
+- `removal`: orchestrates one torrent removal, deleting resume data first and
+  torrent data through the storage worker when requested.
 - Planned: `tracker`, `peer`, `picker`, `choker`, `ratelimit`, `magnet`,
   `dht`, `session`, `settings`.
 
@@ -32,11 +35,13 @@ bounded request queue. That is one worker per torrent today; roadmap item 10
 replaces it with one session worker and a global handle budget. Piece hashing
 runs on the blocking pool through a shared `HashPool`, never on a runtime
 worker. A recheck reads 256 KiB chunks and hashes 1 MiB batches with an
-incremental SHA-1 state, overlapping one read with one hash. Resume load and
-save use `spawn_blocking` (bounded, non-cancellable jobs; see ADR 0002). The
-per-torrent session tasks, tracker, and peer tasks arrive with items 4-10;
-the session will own one `Rechecker`, one `PieceAssembler`, and one budget
-handle per torrent, plus one shared `HashPool`.
+incremental SHA-1 state, overlapping one read with one hash. Resume load,
+save, and removal use `spawn_blocking` (bounded, non-cancellable jobs; see ADR
+0002). Data removal is a worker pass of 256-item unlink and `remove_dir`
+chunks, never a runtime-worker operation. The per-torrent session tasks,
+tracker, and peer tasks arrive with items 4-10; the session will own one
+`Rechecker`, one `PieceAssembler`, and one budget handle per torrent, plus one
+shared `HashPool`.
 
 ## API (proto + client)
 Command in / Event out. `InProcessClient` (channels) exists today; a Remote
@@ -56,9 +61,14 @@ whose `API_VERSION` differs is rejected. See skill engine-api-design.
   than 24 hours. Run one daemon per resume directory: the temp names are unique
   but not a cross-process lock. It stores the verified bitfield and exact
   observed size/mtime per file; the format and restore rules are in ADR 0002
-  section 7.
+  section 7. Removal deletes that torrent's document and leftover temps; a
+  missing document is success.
 - Piece data lives only in the download directory. Missing or short files
   mean absent pieces, never a reason to delete or truncate user files.
+  Removal deletes only mapped file paths and the torrent's own empty
+  directories, deepest first; the download root and non-empty directories are
+  always kept. A clean pass marks the storage removed, and a fresh instance is
+  needed to download the torrent again.
 
 ## Security model
 Untrusted: every byte from peers, trackers, DHT, .torrent files.

@@ -381,7 +381,71 @@ e
 - Save triggers are not wired yet. Item 10 owns them: every 30 seconds while
   active, and on pause, stop, and graceful shutdown. Saves are not per piece.
 
-### 8. Dependencies
+### 8. Removal
+
+- **Ordering.** Removal deletes the resume document and its temps first, then,
+  when `delete_files` is set, the torrent data. The caller must stop downloads,
+  rechecks, and resume saves for that torrent first; the worker only serializes
+  removal with requests from other clones. A real resume I/O error still
+  attempts data removal and reports both outcomes, because the data files are
+  the user-visible payload and a stale document is validated against the
+  layout and ignored. `AlreadySaving` is different: a save is still writing the
+  document, so the data phase is skipped and the caller can retry.
+- **What may be deleted.** Only files recorded in the `FileMap` and
+  directories derived from it are candidates. The engine never lists the
+  download directory, never uses `remove_dir_all`, never removes the download
+  root, and never follows a link. A final path that is a symlink or reparse
+  point is reported as `Unsafe(Symlink)` or `Unsafe(ReparsePoint)`; a path of
+  the wrong kind is `Unsafe(WrongKind)`; nothing at that path is removed.
+- **Re-validation.** Every removal re-checks each existing ancestor with
+  `symlink_metadata` immediately before the operation. Immediately before each
+  final `unlink` or `remove_dir`, the target is checked again and compared with
+  the first check: the file kind must match, and on Unix the `(dev, ino)` pair
+  must match too. A mismatch is `Unsafe(Changed)` and nothing is removed. This
+  leaves the same check-then-use window as reads and writes; the threat model
+  excludes an attacker who can write to the download tree while the client
+  runs.
+- **Hard links.** Unlinking a mapped path removes only that directory entry. A
+  file with another hard link keeps its data under the other name; removal
+  never truncates or writes the content.
+- **Handles and pending syncs.** The cached handle for a file is dropped before
+  its path is unlinked, and a pending `needs_sync` entry for it is discarded.
+  If the removal then fails and the file is still present, the pending flag is
+  restored so a later `sync` still flushes it.
+- **Directories bottom-up.** Directory removal is planned deepest first, one
+  `remove_dir` at a time. A non-empty directory is kept and reported as
+  `not_empty`, which counts as success: files the client did not create are
+  never deleted. The plan uses directories this `Storage` instance created.
+  After a restart the creation record is gone, so removal falls back to the
+  torrent's own top-level folder and its subfolders. A pre-existing top-level
+  folder is therefore offered only while it is empty; anything inside it is
+  kept.
+- **Idempotence.** A missing file or directory is `already_missing`, and a
+  second removal succeeds without touching anything. Every item gets its own
+  result, a failure never stops the rest of the pass, and the pass runs in
+  256-item worker commands.
+- **Partial failure.** A storage is marked removed only when every item ended
+  as removed, already missing, or not empty. One failed item leaves the
+  storage usable, so reads, writes, and observes still work and the caller can
+  retry. After a clean pass, reads, writes, and observes return
+  `StorageError::Removed` and `sync` becomes a no-op, so a stale handle cannot
+  recreate a deleted path. A fresh `Storage` for the same torrent accepts
+  writes again.
+- **Report.** `RemovalReport` carries `removed`, `already_missing`,
+  `not_empty`, and `failed` with exact counts and up to `MAX_REPORT_PATHS`
+  (1,000) paths per list; `truncated` is set when a list is capped. Paths are
+  relative to the download root and sanitized. The engine never logs them:
+  file names are user data, and callers must not log them without consent.
+- **Resume cleanup.** `ResumeStore::remove` deletes the document, then regular
+  temp files named for exactly this torrent
+  (`<info-hash>.resume.tmp.*`). A missing document or resume directory is
+  success. A temp that is a symlink, directory, or other non-regular file is
+  skipped. Errors name the document file, never a full path.
+- **Windows read-only files.** A read-only file makes deletion fail with a
+  permission error; the report returns `RemovalError::PermissionDenied` and the
+  attribute is never cleared automatically. The user can change it and retry.
+
+### 9. Dependencies
 
 - `unicode-normalization` is not added. Measured on a stripped
   `opt-level = "z"`, LTO, `panic = "abort"` binary: +124,352 bytes (121.4 KiB),
@@ -404,16 +468,16 @@ In scope for v0.1:
 - corrupt or truncated resume data: falls back to a recheck and never blocks the
   torrent;
 - an existing on-disk tree: a symlink or reparse point anywhere below the
-  download root is rejected before any read or write through it, including a
-  component swapped after `open`.
+  download root is rejected before any read, write, or removal through it,
+  including a component swapped after `open`.
 
 Out of scope for v0.1:
 
 - an attacker who can already write to the download directory. Such an attacker
-  can replace a component between the final check and the open (TOCTOU), or
-  plant a hard link in advance. Closing that window needs handle-relative
-  traversal (`openat`/`openat2` with `RESOLVE_BENEATH` on Linux, reparse-point
-  handles on Windows), which v0.1 does not use.
+  can replace a component between the final check and the open or unlink
+  (TOCTOU), or plant a hard link in advance. Closing that window needs
+  handle-relative traversal (`openat`/`openat2` with `RESOLVE_BENEATH` on
+  Linux, reparse-point handles on Windows), which v0.1 does not use.
 - a compromised local account or a hostile kernel.
 
 ## Known limitations
@@ -425,7 +489,8 @@ Out of scope for v0.1:
   written in place. On Linux `fs.protected_hardlinks=1` (the default on most
   distributions) stops an unprivileged process from linking to a file it does
   not own. Windows has no stable file-index accessor in `std`, so duplicate
-  hard links there are caught only by the case-folded layout keys.
+  hard links there are caught only by the case-folded layout keys. Removal
+  unlinks one directory entry; data reachable through another hard link stays.
 - **Peak handle usage is `capacity + 1`.** The cache itself never exceeds
   `max_open_handles`, but a sync reopen and a lazy create each hold one
   transient handle outside it.
@@ -447,7 +512,9 @@ Positive:
 - path traversal and symlink escapes fail closed with typed errors;
 - memory and handle use are bounded;
 - resume corruption degrades to a recheck, never to a stuck torrent;
-- only hash-verified bytes reach the user's files.
+- only hash-verified bytes reach the user's files;
+- removal deletes only mapped files and empty torrent directories, and a
+  non-empty directory is always kept.
 
 Negative:
 
@@ -672,6 +739,28 @@ where the code differs from the design above.
   release `bt-engine` library and `bt-tui` binary were checked for their
   strings. The read notification is what proves the next recheck batch is read
   while the current batch is held in the hash gate.
+- **Removal is a chunked worker pass.** `BeginRemoval`, `RemoveFiles`,
+  `RemoveDirectories`, and `FinishRemoval` are worker commands; one pass sends
+  at most 256 items per command. Only `FinishRemoval` marks the storage
+  removed, and only when no item failed. The directory plan is cached for one
+  pass and rebuilt on retry.
+- **Directory ownership is recorded during creation.** `ensure_parent_dirs`
+  records a directory only when its own `create_dir` succeeds; a concurrent
+  creator that wins the race is not owned. After a restart the set is empty and
+  removal falls back to the structural plan, which still requires every
+  directory to be empty.
+- **Removal state lives in `Storage`.** `removed`, `removal_failed`, and the
+  cached plan are storage fields, so a fresh `Storage` starts clean. Reads,
+  writes, and observes check `removed`; `sync` becomes a no-op so shutdown can
+  finish.
+- **Resume removal reuses the save lease and temp matcher.**
+  `ResumeStore::remove` acquires the same per-torrent lease as a save and runs
+  the deletion on `spawn_blocking`. The temp matcher is shared with the
+  stale-temp sweep, so both agree on the name pattern.
+- **`remove_torrent` is orchestration only.** It calls resume removal, then
+  `StorageHandle::remove_data` unless the resume error is `AlreadySaving`, and
+  returns both results. The engine has no logging, and report paths stay
+  relative to the download root.
 
 ## Status and exceptions (2026-11-24)
 

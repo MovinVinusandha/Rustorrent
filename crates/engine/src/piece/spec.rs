@@ -1,9 +1,9 @@
 //! Piece identity and hash metadata.
 //!
 //! A [`PieceSpec`] ties one piece index to the exact byte range it covers and
-//! the SHA-1 hash it must match. The last piece may be shorter than the
-//! torrent's declared piece length, so the length is always taken from the
-//! actual range and converted with checked arithmetic.
+//! the SHA-1 hash it must match (normally taken from metainfo). The last piece
+//! may be shorter than the torrent's declared piece length, so the length is
+//! always taken from the actual range and converted with checked arithmetic.
 
 use thiserror::Error;
 
@@ -23,11 +23,15 @@ pub struct PieceSpec {
 impl PieceSpec {
     /// Creates a piece spec after validating its range and length.
     ///
+    /// Crate-private: outside this crate a spec must come from
+    /// [`PieceSpec::from_metainfo`], which also checks the torrent's file map
+    /// and hash list.
+    ///
     /// `length` is the actual piece length, not the torrent's declared piece
     /// length. A zero length is rejected because no piece can be empty, and a
     /// length above [`MAX_PIECE_LENGTH`] is rejected even when the metainfo
     /// fields were forged.
-    pub fn new(
+    pub(crate) fn new(
         index: u32,
         offset: u64,
         length: usize,
@@ -152,7 +156,7 @@ impl PieceSpec {
         self.length
     }
 
-    /// Expected SHA-1 hash.
+    /// Expected SHA-1 hash, normally taken from metainfo.
     pub fn hash(&self) -> [u8; PIECE_HASH_LENGTH] {
         self.hash
     }

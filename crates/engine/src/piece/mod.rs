@@ -1,13 +1,16 @@
-//! In-memory piece assembly and verification primitives.
+//! In-memory piece assembly, verification, and writing.
 //!
-//! The first stage (3c-2a) is pure in-memory: the memory budget, piece specs,
-//! piece buffers, and the assembler that expires stalled pieces. Hashing and
-//! writing verified pieces arrive in 3c-2b and depend on the storage worker.
+//! The memory budget, piece specs, piece buffers, and the assembler that
+//! expires stalled pieces are pure in-memory. Verified pieces are hashed on a
+//! capped blocking pool and written through the storage worker in 1 MiB
+//! chunks.
 
 pub mod assembler;
 pub mod budget;
 pub mod buffer;
 pub mod spec;
+pub mod store;
+pub mod verify;
 
 pub use assembler::{DEFAULT_STALL_TIMEOUT, InsertResult, PieceAssembler, PieceError};
 pub use budget::{
@@ -16,6 +19,22 @@ pub use budget::{
 };
 pub use buffer::{BlockError, InsertOutcome, PieceBuffer, PieceBufferError};
 pub use spec::{PieceSpec, PieceSpecError};
+pub use store::{StoredPiece, WriteError, store_verified};
+pub use verify::{DEFAULT_MAX_HASH_JOBS, HashPool, HashPoolError, VerifiedPiece, VerifyError};
+
+/// Builds a piece spec in unit tests without constructing metainfo.
+///
+/// Production code must use [`PieceSpec::from_metainfo`], which also checks
+/// the spec against the torrent's file map and hash list.
+#[cfg(test)]
+pub(crate) fn test_spec(
+    index: u32,
+    offset: u64,
+    length: usize,
+    hash: [u8; crate::metainfo::PIECE_HASH_LENGTH],
+) -> Result<PieceSpec, PieceSpecError> {
+    PieceSpec::new(index, offset, length, hash)
+}
 
 /// Protocol block size: 16 KiB.
 ///

@@ -123,6 +123,14 @@ impl PieceBuffer {
         self.is_complete().then_some(self.data.as_ref())
     }
 
+    /// Decomposes a verified buffer into its spec, bytes, and reservation.
+    ///
+    /// The reservation must stay alive for as long as the bytes are queued for
+    /// a write, so the caller moves all three into a `VerifiedPiece`.
+    pub(crate) fn into_parts(self) -> (PieceSpec, Box<[u8]>, PieceReservation) {
+        (self.spec, self.data, self.reservation)
+    }
+
     /// Peer that supplied `block`, or `None` if it is missing or out of range.
     pub fn block_contributor(&self, block: u32) -> Option<PeerKey> {
         let index = usize::try_from(block).ok()?;

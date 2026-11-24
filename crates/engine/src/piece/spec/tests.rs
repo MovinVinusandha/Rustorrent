@@ -1,6 +1,6 @@
 use super::*;
 use crate::metainfo::{FileInfo, InfoHash, Mode};
-use crate::piece::PeerKey;
+use crate::piece::{PeerKey, test_spec};
 use crate::storage::layout::FileMap;
 
 const HASH_A: [u8; PIECE_HASH_LENGTH] = [0x11; PIECE_HASH_LENGTH];
@@ -85,28 +85,25 @@ fn from_metainfo_handles_a_64_mib_piece() {
 
 #[test]
 fn new_checks_length_limits_and_offset_overflow() {
-    assert_eq!(
-        PieceSpec::new(0, 0, 0, HASH_A),
-        Err(PieceSpecError::ZeroLength)
-    );
+    assert_eq!(test_spec(0, 0, 0, HASH_A), Err(PieceSpecError::ZeroLength));
 
     let max = usize::try_from(MAX_PIECE_LENGTH).expect("max fits usize");
     let over = usize::try_from(MAX_PIECE_LENGTH + 1).expect("limit+1 fits usize");
     assert!(matches!(
-        PieceSpec::new(0, 0, over, HASH_A),
+        test_spec(0, 0, over, HASH_A),
         Err(PieceSpecError::PieceTooLarge { length, max: limit })
             if length == over && limit == MAX_PIECE_LENGTH
     ));
-    assert!(PieceSpec::new(0, 0, max, HASH_A).is_ok());
+    assert!(test_spec(0, 0, max, HASH_A).is_ok());
 
     assert_eq!(
-        PieceSpec::new(0, u64::MAX, 1, HASH_A),
+        test_spec(0, u64::MAX, 1, HASH_A),
         Err(PieceSpecError::LengthOverflow {
             offset: u64::MAX,
             length: 1,
         })
     );
-    let boundary = PieceSpec::new(0, u64::MAX - 1, 1, HASH_A).expect("boundary");
+    let boundary = test_spec(0, u64::MAX - 1, 1, HASH_A).expect("boundary");
     assert_eq!(boundary.end_offset(), u64::MAX);
 }
 
@@ -179,7 +176,7 @@ fn from_metainfo_rejects_map_meta_mismatches() {
 
 #[test]
 fn piece_spec_is_copy_and_keeps_its_hash() {
-    let spec = PieceSpec::new(3, 100, 4096, HASH_A).expect("spec");
+    let spec = test_spec(3, 100, 4096, HASH_A).expect("spec");
     let copy = spec;
     assert_eq!(copy, spec);
     assert_eq!(copy.hash(), HASH_A);

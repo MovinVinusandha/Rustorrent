@@ -7,6 +7,13 @@
 //!
 //! Every index access is checked and returns a typed error; malformed byte
 //! slices are rejected rather than normalized.
+//!
+//! [`Bitfield::mark_stored`] is the only way to set a bit for a newly stored
+//! piece: it takes a [`StoredPiece`] produced by a complete write after a hash
+//! match. [`Bitfield::from_bytes`] is the resume exception, restoring bits that
+//! a previous session wrote. The generic setter is private, and
+//! [`Bitfield::clear_piece`] / [`Bitfield::clear`] invalidate pieces; an
+//! invalidation can never create false trust.
 
 use std::fmt;
 
@@ -14,6 +21,7 @@ use thiserror::Error;
 
 use crate::bencode::MAX_STRING_BYTES;
 use crate::metainfo::PIECE_HASH_LENGTH;
+use crate::piece::StoredPiece;
 
 /// Highest piece count accepted by [`Bitfield`].
 ///
@@ -139,8 +147,27 @@ impl Bitfield {
         Ok(byte & mask != 0)
     }
 
-    /// Sets or clears `piece`.
-    pub fn set(&mut self, piece: u32, value: bool) -> Result<(), BitfieldError> {
+    /// Sets the bit for a piece that was completely written after its SHA-1
+    /// matched.
+    ///
+    /// This is the only way to set a bit for a newly stored piece;
+    /// [`Bitfield::from_bytes`] is the resume exception. It is synchronous by
+    /// design, so a caller never holds a `&mut Bitfield` across an await: call
+    /// it after [`store_verified`](crate::piece::store_verified) returns.
+    pub fn mark_stored(&mut self, stored: &StoredPiece) -> Result<(), BitfieldError> {
+        self.set(stored.piece(), true)
+    }
+
+    /// Clears one piece bit, for example when a recheck finds it damaged.
+    ///
+    /// Invalidating a piece can never create false trust, so this is safe to
+    /// expose.
+    pub fn clear_piece(&mut self, piece: u32) -> Result<(), BitfieldError> {
+        self.set(piece, false)
+    }
+
+    /// Sets or clears `piece`; private so `true` stays behind `mark_stored`.
+    fn set(&mut self, piece: u32, value: bool) -> Result<(), BitfieldError> {
         let (index, mask) = self.bit(piece)?;
         let byte = self.bytes.get_mut(index).ok_or(BitfieldError::OutOfRange {
             piece,

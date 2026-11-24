@@ -216,6 +216,37 @@ pub struct Storage {
     files: Vec<PreparedFile>,
     seen_inodes: BTreeSet<FileId>,
     handles: HandleCache,
+    created_dirs: CreatedDirs,
+}
+
+/// Directories this storage instance created below the download root.
+///
+/// Removal only offers these for deletion. The set is empty after a process
+/// restart, where ownership is unknown and removal falls back to the
+/// structural layout instead.
+#[derive(Debug, Default)]
+struct CreatedDirs {
+    #[cfg(test)]
+    dirs: BTreeSet<Vec<String>>,
+}
+
+impl CreatedDirs {
+    fn record(&mut self, components: &[String]) {
+        #[cfg(test)]
+        self.dirs.insert(components.to_vec());
+        #[cfg(not(test))]
+        let _ = components;
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty()
+    }
+
+    #[cfg(test)]
+    fn names(&self) -> &BTreeSet<Vec<String>> {
+        &self.dirs
+    }
 }
 
 impl Storage {
@@ -249,6 +280,7 @@ impl Storage {
 
         let mut files = Vec::with_capacity(map.files().len());
         let mut seen_inodes = BTreeSet::new();
+        let mut created_dirs = CreatedDirs::default();
 
         for file in map.files() {
             let path = resolve_file_path(root, file)?;
@@ -265,7 +297,14 @@ impl Storage {
             files.push(PreparedFile { path, existed });
         }
 
-        prepare_files(root, map.as_ref(), &config, &files, &mut seen_inodes)?;
+        prepare_files(
+            root,
+            map.as_ref(),
+            &config,
+            &files,
+            &mut seen_inodes,
+            &mut created_dirs,
+        )?;
         let handles = HandleCache::new(config.max_open_handles)?;
 
         Ok(Self {
@@ -275,6 +314,7 @@ impl Storage {
             files,
             seen_inodes,
             handles,
+            created_dirs,
         })
     }
 
@@ -563,6 +603,153 @@ impl Storage {
         })
     }
 
+    /// Removes one chunk of directories left by a torrent.
+    ///
+    /// Only directories this storage instance created are offered, deepest
+    /// first. After a restart, when ownership is unknown, the torrent's own
+    /// top-level folder and its subfolders are offered instead. A non-empty
+    /// directory is kept and reported as a success, so files this client did
+    /// not create are never touched.
+    #[cfg(test)]
+    pub(crate) fn remove_directories(
+        &mut self,
+        start: usize,
+        count: usize,
+    ) -> Result<RemovalChunk, StorageError> {
+        let plan = self.removal_directory_plan();
+        let total = plan.len();
+        let begin = start.min(total);
+        let end = begin.saturating_add(count).min(total);
+        let mut items = Vec::with_capacity(end.saturating_sub(begin));
+
+        for components in &plan[begin..end] {
+            items.push(self.remove_directory_item(components));
+        }
+
+        Ok(RemovalChunk {
+            items,
+            done: end == total,
+        })
+    }
+
+    /// Lists the directories removal may try, deepest first.
+    #[cfg(test)]
+    fn removal_directory_plan(&self) -> Vec<Vec<String>> {
+        let mut dirs = BTreeSet::new();
+
+        if self.created_dirs.is_empty() {
+            for file in self.map.files() {
+                for len in 1..file.disk_components.len() {
+                    dirs.insert(file.disk_components[..len].to_vec());
+                }
+            }
+        } else {
+            dirs.extend(self.created_dirs.names().iter().cloned());
+        }
+
+        let mut plan: Vec<Vec<String>> = dirs.into_iter().collect();
+        plan.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        plan
+    }
+
+    /// Removes one directory after re-validating its ancestors and target.
+    #[cfg(test)]
+    fn remove_directory_item(&self, components: &[String]) -> RemovalItemOutcome {
+        let report_path = relative_path(components);
+
+        if components.is_empty() {
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: RemovalError::Internal {
+                    reason: "removal plan contains the download root",
+                },
+            };
+        }
+        for component in components {
+            if sanitize_component(component) != *component {
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: RemovalError::Unsafe(UnsafeReason::InvalidComponent),
+                };
+            }
+        }
+
+        let mut path = self.root.to_path_buf();
+        for component in components {
+            path.push(component);
+        }
+
+        let before = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return RemovalItemOutcome::AlreadyMissing(report_path);
+            }
+            Err(source) => {
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(classify(&path, source)),
+                };
+            }
+        };
+        if let Err(error) = check_directory(&path, &before) {
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: removal_error(error),
+            };
+        }
+        let before_id = file_id(&before);
+
+        match check_ancestors(&self.root, components) {
+            Ok(true) => {}
+            Ok(false) => return RemovalItemOutcome::AlreadyMissing(report_path),
+            Err(error) => {
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(error),
+                };
+            }
+        }
+
+        let after = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return RemovalItemOutcome::AlreadyMissing(report_path);
+            }
+            Err(source) => {
+                return RemovalItemOutcome::Failed {
+                    path: report_path,
+                    error: removal_error(classify(&path, source)),
+                };
+            }
+        };
+        if let Err(error) = check_directory(&path, &after) {
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: removal_error(error),
+            };
+        }
+        if !same_target(&before, &after, before_id, file_id(&after)) {
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: RemovalError::Unsafe(UnsafeReason::Changed),
+            };
+        }
+
+        match fs::remove_dir(&path) {
+            Ok(()) => RemovalItemOutcome::Removed(report_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                RemovalItemOutcome::AlreadyMissing(report_path)
+            }
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                RemovalItemOutcome::NotEmpty(report_path)
+            }
+            Err(source) => RemovalItemOutcome::Failed {
+                path: report_path,
+                error: removal_error(classify(&path, source)),
+            },
+        }
+    }
+
     /// Removes one mapped file after re-validating its ancestors and target.
     #[cfg(test)]
     fn remove_file_item(&mut self, map: &FileMap, index: usize) -> RemovalItemOutcome {
@@ -716,7 +903,11 @@ impl Storage {
         let parent_count = mapped.disk_components.len().saturating_sub(1);
 
         if !check_ancestors(&self.root, &mapped.disk_components)? {
-            ensure_parent_dirs(&self.root, &mapped.disk_components[..parent_count])?;
+            ensure_parent_dirs(
+                &self.root,
+                &mapped.disk_components[..parent_count],
+                &mut self.created_dirs,
+            )?;
             return ensure_file(
                 &path,
                 mapped.length,
@@ -732,7 +923,11 @@ impl Storage {
                 Ok(file_id(&metadata))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                ensure_parent_dirs(&self.root, &mapped.disk_components[..parent_count])?;
+                ensure_parent_dirs(
+                    &self.root,
+                    &mapped.disk_components[..parent_count],
+                    &mut self.created_dirs,
+                )?;
                 ensure_file(
                     &path,
                     mapped.length,
@@ -1121,6 +1316,7 @@ fn prepare_files(
     config: &StorageConfig,
     files: &[PreparedFile],
     seen_inodes: &mut BTreeSet<FileId>,
+    created_dirs: &mut CreatedDirs,
 ) -> Result<(), StorageError> {
     for (file, prepared) in map.files().iter().zip(files) {
         let needed = file.length == 0 || config.preallocation == Preallocation::SetLen;
@@ -1129,7 +1325,7 @@ fn prepare_files(
         }
 
         let parent_count = file.disk_components.len().saturating_sub(1);
-        ensure_parent_dirs(root, &file.disk_components[..parent_count])?;
+        ensure_parent_dirs(root, &file.disk_components[..parent_count], created_dirs)?;
         let _ = ensure_file(
             &prepared.path,
             file.length,
@@ -1143,10 +1339,17 @@ fn prepare_files(
 }
 
 /// Creates missing parent directories, re-checking every existing component.
-fn ensure_parent_dirs(root: &Path, components: &[String]) -> Result<(), StorageError> {
+///
+/// A directory is recorded as created by this storage only when the `mkdir`
+/// succeeds here. A concurrent creator that wins the race is not recorded.
+fn ensure_parent_dirs(
+    root: &Path,
+    components: &[String],
+    created: &mut CreatedDirs,
+) -> Result<(), StorageError> {
     let mut path = root.to_path_buf();
 
-    for component in components {
+    for (index, component) in components.iter().enumerate() {
         if sanitize_component(component) != *component {
             return Err(StorageError::UnsafePath {
                 path: path.clone(),
@@ -1159,7 +1362,7 @@ fn ensure_parent_dirs(root: &Path, components: &[String]) -> Result<(), StorageE
         match fs::symlink_metadata(&path) {
             Ok(metadata) => check_directory(&path, &metadata)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(&path) {
-                Ok(()) => {}
+                Ok(()) => created.record(&components[..=index]),
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                     let metadata =
                         fs::symlink_metadata(&path).map_err(|source| classify(&path, source))?;

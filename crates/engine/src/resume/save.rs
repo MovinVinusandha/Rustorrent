@@ -7,7 +7,8 @@
 //! 3. flush dirty file data through storage;
 //! 4. observe size and modification time of every mapped file;
 //! 5. encode a document that carries the caller's snapshot;
-//! 6. write the document through [`bt_platform::file::write_atomic`].
+//! 6. create the resume directory, sweep stale temp files, and write the
+//!    document through [`bt_platform::file::write_atomic`].
 //!
 //! The caller passes the bitfield snapshot by value. Pieces completed after
 //! the snapshot was taken are simply absent from this document. Because the
@@ -26,10 +27,11 @@
 //! torrent is rechecked.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -71,9 +73,17 @@ impl ResumeStore {
     /// Returns the path of the resume document for `info_hash`.
     ///
     /// The file name is the lowercase hex info-hash plus `.resume`. The
-    /// temporary file used by an atomic write adds `.tmp`.
+    /// temporary file used by an atomic write adds
+    /// `.tmp.<pid>.<counter>.<nanos>`; saves sweep stale temps.
     pub fn document_path(&self, info_hash: &InfoHash) -> PathBuf {
-        self.dir.join(format!("{info_hash}.resume"))
+        self.dir.join(self.document_name(info_hash))
+    }
+
+    /// Returns the document file name for `info_hash`.
+    ///
+    /// Every error that mentions a document uses this name, never a path.
+    pub(super) fn document_name(&self, info_hash: &InfoHash) -> String {
+        format!("{info_hash}.resume")
     }
 
     /// Flushes storage, observes every file, and atomically writes a document.
@@ -121,8 +131,9 @@ impl ResumeStore {
 
         let dir = self.dir.clone();
         let path = self.document_path(&info_hash);
+        let name = self.document_name(&info_hash);
         let blocking = tokio::task::spawn_blocking(move || {
-            let result = write_document(&dir, &path, &bytes);
+            let result = write_document(&dir, &path, &name, &bytes);
             drop(lease);
             result
         })
@@ -130,7 +141,7 @@ impl ResumeStore {
         .map_err(SaveError::Task)?;
         blocking.map_err(|error| match error {
             BlockingError::CreateDir(source) => SaveError::CreateDir(source),
-            BlockingError::Write(source) => SaveError::Write(source),
+            BlockingError::Write { name, source } => SaveError::Write { name, source },
         })?;
 
         Ok(())
@@ -196,8 +207,14 @@ pub enum SaveError {
     #[error("could not create resume directory: {0}")]
     CreateDir(#[source] io::Error),
     /// The document could not be written or renamed into place.
-    #[error("could not write resume document: {0}")]
-    Write(#[source] io::Error),
+    #[error("could not write resume document {name}: {source}")]
+    Write {
+        /// Document file name, never a full path.
+        name: String,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
     /// The blocking write task was cancelled or panicked.
     #[error("resume save task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
@@ -239,13 +256,83 @@ enum BlockingError {
     /// The resume directory could not be created.
     CreateDir(io::Error),
     /// The document could not be written atomically.
-    Write(io::Error),
+    Write {
+        /// Document file name, never a full path.
+        name: String,
+        /// Underlying I/O error.
+        source: io::Error,
+    },
 }
 
-/// Creates the resume directory and writes the document atomically.
-fn write_document(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), BlockingError> {
+/// Age after which a temp file from an interrupted save is swept.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Creates the resume directory, sweeps stale temps, and writes the document.
+fn write_document(dir: &Path, path: &Path, name: &str, bytes: &[u8]) -> Result<(), BlockingError> {
     std::fs::create_dir_all(dir).map_err(BlockingError::CreateDir)?;
-    bt_platform::file::write_atomic(path, bytes).map_err(BlockingError::Write)
+    sweep_stale_temps(dir);
+    bt_platform::file::write_atomic(path, bytes).map_err(|source| BlockingError::Write {
+        name: name.to_owned(),
+        source,
+    })
+}
+
+/// Removes temp files left behind by an interrupted atomic write.
+///
+/// Only regular files named `<document>.resume.tmp.<pid>.<counter>.<nanos>`
+/// and last modified more than 24 hours ago are removed. Removal errors and
+/// unreadable entries are ignored: a leftover temp never blocks a save, and
+/// the directory may hold the documents and files of other torrents.
+fn sweep_stale_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        if !is_resume_temp(&entry.file_name()) {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow a symlink at the entry.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= STALE_TEMP_AGE {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Returns `true` for `<document>.resume.tmp.<pid>.<counter>.<nanos>`.
+fn is_resume_temp(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some((document, suffix)) = name.rsplit_once(".resume.tmp.") else {
+        return false;
+    };
+    if document.is_empty() {
+        return false;
+    }
+    let mut parts = suffix.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(counter), Some(nanos), None)
+            if is_digits(pid) && is_digits(counter) && is_digits(nanos)
+    )
+}
+
+/// Returns `true` for a non-empty run of ASCII digits.
+fn is_digits(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]

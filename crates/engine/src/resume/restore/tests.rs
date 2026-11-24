@@ -1,3 +1,5 @@
+use proptest::prelude::*;
+
 use super::*;
 use crate::bitfield::Bitfield;
 use crate::metainfo::InfoHash;
@@ -414,4 +416,84 @@ fn plan_rejects_mismatched_inputs() {
             found: 1,
         }))
     );
+}
+
+/// The sampler as it was written before it became allocation-free: collect
+/// every verified index, then pick ordinals from that list. The new sampler
+/// must return exactly these pieces.
+fn reference_spot_check(bits: &Bitfield, limit: usize) -> Vec<u32> {
+    let verified: Vec<u32> = (0..bits.piece_count())
+        .filter(|&piece| matches!(bits.get(piece), Ok(true)))
+        .collect();
+
+    if limit == 0 {
+        return Vec::new();
+    }
+    if verified.len() <= limit {
+        return verified;
+    }
+    if limit == 1 {
+        return vec![verified[verified.len() / 2]];
+    }
+
+    let last = verified.len() as u64 - 1;
+    let steps = limit as u64 - 1;
+    (0..limit)
+        .map(|index| verified[(index as u64 * last / steps) as usize])
+        .collect()
+}
+
+fn bitfield_from_flags(flags: &[bool]) -> Bitfield {
+    let mut bytes = vec![0u8; flags.len().div_ceil(8)];
+    for (piece, verified) in flags.iter().enumerate() {
+        if *verified {
+            bytes[piece / 8] |= 1 << (piece % 8);
+        }
+    }
+    let pieces = u32::try_from(flags.len()).expect("piece count");
+    Bitfield::from_bytes(&bytes, pieces).expect("bitfield")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn spot_check_matches_the_reference_sampler(
+        flags in prop::collection::vec(any::<bool>(), 1..2000),
+        limit in 0usize..=8,
+    ) {
+        let bits = bitfield_from_flags(&flags);
+        prop_assert_eq!(
+            spot_check_pieces(&bits, limit),
+            reference_spot_check(&bits, limit)
+        );
+    }
+}
+
+#[test]
+fn spot_check_scales_to_the_largest_bitfield() {
+    let pieces = crate::bitfield::MAX_PIECE_COUNT;
+    let last = u64::from(pieces - 1);
+    let full = bitfield_from_flags(&vec![true; pieces as usize]);
+    assert_eq!(pieces, full.piece_count());
+
+    let sampled = spot_check_pieces(&full, 5);
+    let expected: Vec<u32> = (0..5)
+        .map(|index| (index as u64 * last / 4) as u32)
+        .collect();
+    assert_eq!(sampled, expected);
+
+    let sparse = Bitfield::from_bytes(
+        &{
+            let mut bytes = vec![0u8; pieces.div_ceil(8) as usize];
+            for piece in [0, pieces / 2, pieces - 1] {
+                bytes[piece as usize / 8] |= 1 << (piece % 8);
+            }
+            bytes
+        },
+        pieces,
+    )
+    .expect("bitfield");
+    assert_eq!(spot_check_pieces(&sparse, 1), vec![pieces / 2]);
+    assert_eq!(spot_check_pieces(&sparse, 2), vec![0, pieces - 1]);
 }

@@ -356,29 +356,50 @@ fn file_is_stale(saved: &ResumeFile, observed: &ObservedFile) -> bool {
 }
 
 /// Samples up to `limit` verified pieces, spread across the bitfield.
+///
+/// This selects exactly the same pieces as collecting every verified index and
+/// taking `limit` evenly spaced ordinals: all of them when there are no more
+/// than `limit`, the middle one when `limit == 1`, and otherwise ordinals that
+/// include the first and the last. The allocation is proportional to `limit`,
+/// not to the piece count, so a large torrent costs no extra memory here.
 fn spot_check_pieces(bits: &Bitfield, limit: usize) -> Vec<u32> {
-    let verified: Vec<u32> = (0..bits.piece_count())
-        .filter(|&piece| matches!(bits.get(piece), Ok(true)))
-        .collect();
-
     if limit == 0 {
         return Vec::new();
     }
-    if verified.len() <= limit {
-        return verified;
-    }
-    if limit == 1 {
-        return vec![verified[verified.len() / 2]];
+    let verified = bits.count_verified() as usize;
+    if verified == 0 {
+        return Vec::new();
     }
 
-    let last = verified.len() as u64 - 1;
-    let steps = limit as u64 - 1;
-    (0..limit)
-        .map(|index| {
-            let position = index as u64 * last / steps;
-            verified[position as usize]
-        })
-        .collect()
+    let ordinals: Vec<u32> = if verified <= limit {
+        (0..verified as u32).collect()
+    } else if limit == 1 {
+        vec![(verified / 2) as u32]
+    } else {
+        let last = verified as u64 - 1;
+        let steps = limit as u64 - 1;
+        (0..limit)
+            .map(|index| (index as u64 * last / steps) as u32)
+            .collect()
+    };
+
+    let mut sampled = Vec::with_capacity(ordinals.len());
+    let mut seen = 0u32;
+    let mut next = 0usize;
+    for piece in 0..bits.piece_count() {
+        if !matches!(bits.get(piece), Ok(true)) {
+            continue;
+        }
+        if next < ordinals.len() && ordinals[next] == seen {
+            sampled.push(piece);
+            next += 1;
+            if next == ordinals.len() {
+                break;
+            }
+        }
+        seen += 1;
+    }
+    sampled
 }
 
 #[cfg(test)]

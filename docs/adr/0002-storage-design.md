@@ -272,9 +272,13 @@ Piece assembly belongs to 3c; storage never allocates piece-sized buffers.
   pass `directories::BaseDirs::data_local_dir()/resume` when item 10 wires the
   session; the engine never chooses an OS path and never stores an absolute
   path in the file. A resume file is never inside the download directory.
-- File names: `<info-hash-hex>.resume` for the document and
-  `<info-hash-hex>.resume.tmp` for the one temporary file, both in the resume
-  directory.
+- File names: `<info-hash-hex>.resume` for the document. A save writes a
+  unique temp `<info-hash-hex>.resume.tmp.<pid>.<counter>.<nanos>` in the same
+  directory and renames it over the document, so two writers never share a
+  temp path. The pid, counter, and timestamp make names unique; they do not
+  arbitrate between processes. **Run at most one daemon per resume
+  directory**: the in-process save lease only avoids redundant work and is not
+  a cross-process lock.
 - Version 1 fields:
 
 ```text
@@ -327,7 +331,9 @@ e
 - Spot check: after per-file validation, up to `SPOT_CHECK_PIECES` (5)
   verified pieces are sampled evenly across the verified range, always
   including the first and last. A torrent with five or fewer verified pieces
-  checks all of them. The sampled pieces are cleared and added to the `Only`
+  checks all of them. Sampling counts the verified bits and keeps only the
+  `limit` sampled ordinals, so its memory is proportional to the sample, not
+  to the piece count. The sampled pieces are cleared and added to the `Only`
   list, so an unchanged torrent reads only the sample. If any sample fails,
   every readable piece is rechecked with `RecheckSelection::All`; a failure
   proves metadata no longer describes the bytes, so the remaining saved bits
@@ -353,17 +359,25 @@ e
   concurrent save with `AlreadySaving`. The blocking write task owns the
   lease, so dropping the save future cannot admit a second writer; the lease
   is released when the write finishes or fails.
-- Atomic write: create the resume directory in the blocking task, write the
-  temporary file in the same directory, `sync_all`, rename over the target,
-  then sync the parent directory on Unix. On Windows, the rename replaces an
-  existing target and retries sharing or lock violations. A failed save
-  leaves the previous document untouched.
-- Blocking I/O: the load, directory creation, and write all run on
-  `spawn_blocking`; no file operation runs on a runtime worker. A missing file
-  is `Ok(None)`, and a corrupt or oversized file is a typed decode error; both
-  fall back in `restore` and never block the torrent. The caller receives a
-  typed `RestoreSource` describing which path was taken, for the session to
-  log once logging exists.
+- Atomic write: create the resume directory in the blocking job, sweep temp
+  files older than 24 hours, write a unique temp in the same directory with
+  `create_new`, `sync_all`, rename over the target, then sync the parent
+  directory on Unix. `create_new` refuses a leftover or planted file at a
+  candidate name instead of following or reusing it. On Windows, the rename
+  replaces an existing target and retries sharing or lock violations. A failed
+  save removes its own temp and leaves the previous document untouched; a
+  crash can leave one temp, which a later save sweeps after a day. The sweep
+  matches only regular files named like the temp pattern and ignores every
+  error, so it never touches the document or unrelated files.
+- Blocking I/O: load, restore validation and sampling, directory creation,
+  sweep, and write all run on `spawn_blocking`; no file scan or planning loop
+  runs on a runtime worker. A mismatch during planning is not an error: the
+  same blocking job plans again without the document, and the caller receives
+  a typed `RestoreSource` describing which path was taken, for the session to
+  log once logging exists. A missing file is `Ok(None)`, and a corrupt or
+  oversized file is a typed decode error; both fall back in `restore` and
+  never block the torrent. I/O errors name only the document file, never a
+  full path.
 - Save triggers are not wired yet. Item 10 owns them: every 30 seconds while
   active, and on pause, stop, and graceful shutdown. Saves are not per piece.
 

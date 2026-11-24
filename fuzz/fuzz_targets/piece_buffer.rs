@@ -2,7 +2,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+use bt_engine::metainfo::{FileInfo, InfoHash, MetaInfo, Mode};
 use bt_engine::piece::{BLOCK_LEN, MemoryBudget, PeerKey, PieceBuffer, PieceSpec};
+use bt_engine::storage::layout::FileMap;
 
 /// Largest piece the target builds: five 16 KiB blocks, including a short last
 /// block. Keeps every case fast enough for coverage-guided fuzzing; the 64 MiB
@@ -29,7 +31,23 @@ fuzz_target!(|data: &[u8]| {
         .torrent_budget(piece_len as u64)
         .expect("torrent budget");
     let reservation = torrent.try_reserve(piece_len).expect("reservation");
-    let spec = PieceSpec::new(0, 0, piece_len, [0; 20]).expect("piece spec");
+    let meta = MetaInfo {
+        info_hash: InfoHash::from_bytes([0; 20]),
+        name: "fuzz".to_owned(),
+        mode: Mode::Single,
+        files: vec![FileInfo {
+            path: vec!["fuzz".to_owned()],
+            length: piece_len as u64,
+        }],
+        total_length: piece_len as u64,
+        piece_length: piece_len as u64,
+        piece_hashes: vec![[0; 20]],
+        announce: None,
+        announce_list: Vec::new(),
+        private: false,
+    };
+    let map = FileMap::build(&meta).expect("file map");
+    let spec = PieceSpec::from_metainfo(&map, &meta, 0).expect("piece spec");
     let mut buffer = PieceBuffer::new(spec, reservation).expect("piece buffer");
 
     let blocks = buffer.block_count();

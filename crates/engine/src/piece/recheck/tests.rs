@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::bitfield::Bitfield;
 use crate::metainfo::{FileInfo, InfoHash, MetaInfo, Mode, PIECE_HASH_LENGTH};
+use crate::piece::verify::HashGate;
 use crate::piece::{HashPool, PieceSpecError};
 use crate::storage::backend::{StorageConfig, StorageError, UnsafeReason};
 use crate::storage::layout::FileMap;
@@ -720,6 +721,85 @@ async fn batching_uses_one_hash_job_per_batch() {
         "2 MiB at 1 MiB per batch uses two jobs, not eight chunks"
     );
     assert_eq!(pool.active_jobs(), 0);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn the_next_batch_is_read_while_the_current_batch_hashes() {
+    let fixture = Fixture::new(&[(&["a.bin"], 2 * MIB)], 2 * MIB);
+    let storage = fixture.open().await;
+    let pool = Arc::new(HashPool::new());
+    let (gate, mut entered) = HashGate::new();
+    pool.set_test_gate(Arc::clone(&gate));
+    let rechecker = Arc::new(fixture.rechecker(storage.clone(), Arc::clone(&pool)));
+    let base = Arc::new(fixture.base());
+
+    let task = {
+        let rechecker = Arc::clone(&rechecker);
+        let base = Arc::clone(&base);
+        tokio::spawn(async move {
+            rechecker
+                .run(RecheckSelection::All, &base, &RecheckCancel::new(), None)
+                .await
+        })
+    };
+
+    entered
+        .recv()
+        .await
+        .expect("first hash job entered the gate");
+
+    // While the first batch is held in the gate, the second batch must already
+    // be read. Without overlap this stays at four reads.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if storage.read_count().await.expect("read count") >= 8 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second batch was not read while the first batch hashed"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    gate.open();
+    let outcome = task.await.expect("task").expect("recheck");
+    assert_eq!(outcome.present(), 1);
+    assert_eq!(pool.started_jobs(), 2);
+
+    drop(rechecker);
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_short_read_in_the_overlapped_batch_still_abandons_the_piece() {
+    let fixture = Fixture::new(&[(&["a.bin"], 2 * MIB)], 2 * MIB);
+    fixture.truncate_file(0, MIB + 100 * KIB);
+    let storage = fixture.open().await;
+    let rechecker = fixture.rechecker(storage.clone(), Arc::new(HashPool::new()));
+
+    // Four reads fill the first batch, the fifth returns 100 KiB of the
+    // 256 KiB it asked for. A sixth read would hit the injected failure.
+    storage.fail_read_after(5).await.expect("arm read failure");
+
+    let selection = [0u32];
+    let outcome = rechecker
+        .run(
+            RecheckSelection::Only(&selection),
+            &fixture.base(),
+            &RecheckCancel::new(),
+            None,
+        )
+        .await
+        .expect("recheck");
+
+    assert_eq!(outcome.checked(), 1);
+    assert_eq!(outcome.present(), 0);
+    assert_eq!(outcome.absent(), 1);
+    assert_eq!(outcome.bits().count_verified(), 0);
 
     drop(rechecker);
     storage.shutdown().await.expect("shutdown");

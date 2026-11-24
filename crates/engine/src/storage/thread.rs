@@ -282,6 +282,12 @@ impl StorageHandle {
             .await
     }
 
+    /// Number of read requests the worker has processed. Test-only.
+    #[cfg(test)]
+    pub(crate) async fn read_count(&self) -> Result<usize, StorageHandleError> {
+        self.send(|reply| Command::ReadCount { reply }).await
+    }
+
     /// Blocks the worker once this command reaches the front of the queue.
     ///
     /// Returns after the worker has entered the hold, with a sender that
@@ -338,6 +344,10 @@ enum Command {
         reply: Reply<()>,
     },
     #[cfg(test)]
+    ReadCount {
+        reply: Reply<usize>,
+    },
+    #[cfg(test)]
     Hold {
         entered: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -367,6 +377,10 @@ fn reject(command: Command) {
         }
         #[cfg(test)]
         Command::FailReadAfter { reply, .. } => {
+            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
+        }
+        #[cfg(test)]
+        Command::ReadCount { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
@@ -401,9 +415,15 @@ fn run_worker(
     let mut fail_write_after: Option<usize> = None;
     #[cfg(test)]
     let mut fail_read_after: Option<usize> = None;
+    #[cfg(test)]
+    let mut reads = 0usize;
     while let Some(command) = rx.blocking_recv() {
         match command {
             Command::ReadRange { offset, len, reply } => {
+                #[cfg(test)]
+                {
+                    reads = reads.saturating_add(1);
+                }
                 #[cfg(test)]
                 if fail_read_after == Some(0) {
                     fail_read_after = None;
@@ -474,6 +494,10 @@ fn run_worker(
             Command::FailReadAfter { reads, reply } => {
                 fail_read_after = Some(reads);
                 let _ = reply.send(Ok(()));
+            }
+            #[cfg(test)]
+            Command::ReadCount { reply } => {
+                let _ = reply.send(Ok(reads));
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

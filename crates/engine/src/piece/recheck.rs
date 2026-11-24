@@ -4,7 +4,9 @@
 //! hashes them against the metainfo hashes. It never holds a whole piece or a
 //! whole file in memory: data is read in fixed [`RECHECK_CHUNK_LEN`] chunks,
 //! and up to [`RECHECK_CHUNKS_PER_JOB`] chunks are hashed by one blocking job
-//! with an incremental SHA-1 state.
+//! with an incremental SHA-1 state. The next batch is read while the current
+//! batch hashes, so at most two batches are in memory and the storage worker
+//! is not idle while a piece hashes.
 //!
 //! The result is a full [`Bitfield`] returned only after the run finishes.
 //! Selected pieces start clear, so a damaged piece loses any bit it had in the
@@ -255,6 +257,10 @@ impl Rechecker {
     /// When `progress` is set, one update is sent with `try_send` after each
     /// selected piece. Updates are advisory: a full channel drops them,
     /// including the final one, so the returned outcome is the result.
+    ///
+    /// While a batch hashes, the next batch is read, so a piece needs at most
+    /// two batch buffers. A short read in the overlapped batch abandons the
+    /// piece even though the earlier batch was already hashed.
     pub async fn run(
         &self,
         selection: RecheckSelection<'_>,
@@ -289,6 +295,18 @@ impl Rechecker {
         let mut checked = 0u32;
         let mut present = 0u32;
 
+        let send_progress = |piece: u32, checked: u32, present: u32| {
+            if let Some(progress) = progress {
+                let _ = progress.try_send(RecheckProgress {
+                    piece,
+                    checked,
+                    present,
+                    absent: checked - present,
+                    total,
+                });
+            }
+        };
+
         for piece in selection.iter(self.map.piece_count()) {
             if cancel.is_cancelled() {
                 return Err(RecheckError::Cancelled);
@@ -306,71 +324,69 @@ impl Rechecker {
             let mut remaining = spec.length();
             let mut complete = true;
 
-            'piece: while remaining > 0 {
-                let batch_len = remaining.min(RECHECK_BATCH_LEN);
-                let mut batch = Vec::with_capacity(batch_len);
+            let Some(mut batch) = self.read_batch(piece, position, remaining, cancel).await? else {
+                checked += 1;
+                send_progress(piece, checked, present);
+                continue;
+            };
+            let batch_len =
+                u64::try_from(batch.len()).map_err(|_| RecheckError::OffsetOverflow {
+                    piece,
+                    offset: position,
+                })?;
+            position = position
+                .checked_add(batch_len)
+                .ok_or(RecheckError::OffsetOverflow {
+                    piece,
+                    offset: position,
+                })?;
+            remaining -= batch.len();
 
-                while batch.len() < batch_len {
-                    if cancel.is_cancelled() {
-                        return Err(RecheckError::Cancelled);
-                    }
-
-                    let want = (batch_len - batch.len()).min(RECHECK_CHUNK_LEN);
-                    let read = self
-                        .storage
-                        .read_range(position, want)
-                        .await
-                        .map_err(|source| RecheckError::Storage {
-                            piece,
-                            offset: position,
-                            source,
-                        })?;
-
-                    if read.len() > want {
-                        return Err(RecheckError::ReadOverrun {
-                            piece,
-                            offset: position,
-                            requested: want,
-                            got: read.len(),
-                        });
-                    }
-                    if read.len() < want {
-                        // A missing or truncated file means the piece is
-                        // absent. Abandon it on the first short read: later
-                        // chunks cannot make it match, and its cleared bit
-                        // must stay clear.
-                        complete = false;
-                        break 'piece;
-                    }
-
-                    batch.extend_from_slice(&read);
-                    let read_len =
-                        u64::try_from(want).map_err(|_| RecheckError::OffsetOverflow {
-                            piece,
-                            offset: position,
-                        })?;
-                    position =
-                        position
-                            .checked_add(read_len)
-                            .ok_or(RecheckError::OffsetOverflow {
-                                piece,
-                                offset: position,
-                            })?;
-                    remaining -= want;
-                }
-
+            loop {
                 if cancel.is_cancelled() {
                     return Err(RecheckError::Cancelled);
                 }
 
-                hasher = self
-                    .pool
-                    .run_job(move || {
+                // Hash the current batch while the next one is read. Only these
+                // two batches exist at once, and only one hash job runs per
+                // piece, so the shared pool still sees one recheck permit.
+                let hash = self.pool.run_job({
+                    let batch = std::mem::take(&mut batch);
+                    move || {
                         hasher.update(&batch);
                         hasher
-                    })
-                    .await
-                    .map_err(RecheckError::HashTask)?;
+                    }
+                });
+
+                if remaining == 0 {
+                    hasher = hash.await.map_err(RecheckError::HashTask)?;
+                    break;
+                }
+
+                let (hashed, next) =
+                    tokio::join!(hash, self.read_batch(piece, position, remaining, cancel));
+                hasher = hashed.map_err(RecheckError::HashTask)?;
+
+                let Some(next) = next? else {
+                    // A short read in the overlapped batch means the piece is
+                    // absent. The current batch was already hashed, but the
+                    // result is discarded and the cleared bit stays clear.
+                    complete = false;
+                    break;
+                };
+                let next_len =
+                    u64::try_from(next.len()).map_err(|_| RecheckError::OffsetOverflow {
+                        piece,
+                        offset: position,
+                    })?;
+                position = position
+                    .checked_add(next_len)
+                    .ok_or(RecheckError::OffsetOverflow {
+                        piece,
+                        offset: position,
+                    })?;
+                remaining -= next.len();
+                batch = next;
             }
 
             checked += 1;
@@ -386,15 +402,7 @@ impl Rechecker {
                 }
             }
 
-            if let Some(progress) = progress {
-                let _ = progress.try_send(RecheckProgress {
-                    piece,
-                    checked,
-                    present,
-                    absent: checked - present,
-                    total,
-                });
-            }
+            send_progress(piece, checked, present);
         }
 
         Ok(RecheckOutcome {
@@ -403,6 +411,68 @@ impl Rechecker {
             present,
             absent: checked - present,
         })
+    }
+
+    /// Reads the next full batch of a piece.
+    ///
+    /// Returns `None` when storage returns fewer bytes than the batch needs,
+    /// which means the piece is absent. A returned batch is exactly
+    /// `remaining.min(RECHECK_BATCH_LEN)` bytes.
+    async fn read_batch(
+        &self,
+        piece: u32,
+        mut position: u64,
+        remaining: usize,
+        cancel: &RecheckCancel,
+    ) -> Result<Option<Vec<u8>>, RecheckError> {
+        let batch_len = remaining.min(RECHECK_BATCH_LEN);
+        let mut batch = Vec::with_capacity(batch_len);
+
+        while batch.len() < batch_len {
+            if cancel.is_cancelled() {
+                return Err(RecheckError::Cancelled);
+            }
+
+            let want = (batch_len - batch.len()).min(RECHECK_CHUNK_LEN);
+            let read = self
+                .storage
+                .read_range(position, want)
+                .await
+                .map_err(|source| RecheckError::Storage {
+                    piece,
+                    offset: position,
+                    source,
+                })?;
+
+            if read.len() > want {
+                return Err(RecheckError::ReadOverrun {
+                    piece,
+                    offset: position,
+                    requested: want,
+                    got: read.len(),
+                });
+            }
+            if read.len() < want {
+                // A missing or truncated file means the piece is absent. The
+                // caller abandons it on the first short read: later chunks
+                // cannot make it match, and its cleared bit must stay clear.
+                return Ok(None);
+            }
+
+            batch.extend_from_slice(&read);
+            let read_len = u64::try_from(want).map_err(|_| RecheckError::OffsetOverflow {
+                piece,
+                offset: position,
+            })?;
+            position = position
+                .checked_add(read_len)
+                .ok_or(RecheckError::OffsetOverflow {
+                    piece,
+                    offset: position,
+                })?;
+        }
+
+        Ok(Some(batch))
     }
 
     fn acquire(&self) -> Result<RunningGuard<'_>, RecheckError> {

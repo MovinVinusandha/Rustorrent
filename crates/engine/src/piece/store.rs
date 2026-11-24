@@ -19,8 +19,10 @@
 //! writes are idempotent, calling [`store_verified`] again is safe.
 //!
 //! The returned [`StoredPiece`] has no public constructor: only a complete
-//! chunk run produces one, and [`Bitfield::mark_stored`] is the only way to
-//! set a verified bit from it.
+//! chunk run produces one. [`Bitfield::mark_stored`] is the only way to set a
+//! bit for a newly stored piece;
+//! [`Bitfield::from_bytes`](crate::bitfield::Bitfield::from_bytes) is the
+//! resume exception.
 //!
 //! [`Bitfield::mark_stored`]: crate::bitfield::Bitfield::mark_stored
 

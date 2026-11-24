@@ -8,10 +8,11 @@
 //! Every index access is checked and returns a typed error; malformed byte
 //! slices are rejected rather than normalized.
 //!
-//! Bits are set only through [`Bitfield::mark_stored`], which takes a
-//! [`StoredPiece`] produced by a complete write after a hash match. The
-//! generic setter is private. [`Bitfield::from_bytes`] restores resume data,
-//! and [`Bitfield::clear_piece`] / [`Bitfield::clear`] invalidate pieces; an
+//! [`Bitfield::mark_stored`] is the only way to set a bit for a newly stored
+//! piece: it takes a [`StoredPiece`] produced by a complete write after a hash
+//! match. [`Bitfield::from_bytes`] is the resume exception, restoring bits that
+//! a previous session wrote. The generic setter is private, and
+//! [`Bitfield::clear_piece`] / [`Bitfield::clear`] invalidate pieces; an
 //! invalidation can never create false trust.
 
 use std::fmt;
@@ -149,9 +150,10 @@ impl Bitfield {
     /// Sets the bit for a piece that was completely written after its SHA-1
     /// matched.
     ///
-    /// This is the only way to set a bit. It is synchronous by design, so a
-    /// caller never holds a `&mut Bitfield` across an await: call it after
-    /// [`store_verified`](crate::piece::store_verified) returns.
+    /// This is the only way to set a bit for a newly stored piece;
+    /// [`Bitfield::from_bytes`] is the resume exception. It is synchronous by
+    /// design, so a caller never holds a `&mut Bitfield` across an await: call
+    /// it after [`store_verified`](crate::piece::store_verified) returns.
     pub fn mark_stored(&mut self, stored: &StoredPiece) -> Result<(), BitfieldError> {
         self.set(stored.piece(), true)
     }

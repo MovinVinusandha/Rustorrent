@@ -557,12 +557,13 @@ where the code differs from the design above.
   `size_of::<Option<PeerKey>>()` per 16 KiB block, at most 64 KiB for a 64 MiB
   piece. Both are bounded and never sized by peer input, so they are not part
   of the 128 MiB piece budget (the M1 finding).
-- **Verified bits have one setter.** `Bitfield::set` is private to the bitfield
-  module. `mark_stored(&StoredPiece)` is the only way to set a bit and is
-  synchronous, so no `&mut Bitfield` is held across an await; `from_bytes`
-  restores resume data, and `clear_piece` / `clear` only invalidate. A test
-  drives the pipeline and asserts the bit stays clear after a hash mismatch and
-  after a failed chunk, then becomes set only after a successful retry.
+- **Verified bits have one setter for new pieces.** `Bitfield::set` is private
+  to the bitfield module. `mark_stored(&StoredPiece)` is the only way to set a
+  bit for a newly stored piece and is synchronous, so no `&mut Bitfield` is
+  held across an await; `from_bytes` is the resume exception, and `clear_piece`
+  / `clear` only invalidate. A test drives the pipeline and asserts the bit
+  stays clear after a hash mismatch and after a failed chunk, then becomes set
+  only after a successful retry.
 - **Test hooks are compiled out of release builds.** The hash gate and the
   injected `DiskFull` write failure exist only under `#[cfg(test)]`; the
   release `bt-engine` library and `bt-tui` binary were checked for their

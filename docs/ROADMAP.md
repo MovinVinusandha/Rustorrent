@@ -29,8 +29,9 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
       `store_verified(storage, &VerifiedPiece) -> Result<StoredPiece, WriteError>`
       borrows the piece, so a failed chunk is retried without re-downloading.
       `StoredPiece` has no public constructor, and
-      `Bitfield::mark_stored(&StoredPiece)` is the only way to set a verified
-      bit; it is synchronous, so no `&mut Bitfield` is held across an await.
+      `Bitfield::mark_stored(&StoredPiece)` is the only way to set a bit for a
+      newly stored piece; `Bitfield::from_bytes` is the resume exception. It is
+      synchronous, so no `&mut Bitfield` is held across an await.
       The bit stays false after a failed chunk and becomes true only after a
       complete write. The 1 MiB chunk copy is outside the piece budget
       (bounded, not peer-sized). The bitfield's generic setter is private;
@@ -39,7 +40,8 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     - [ ] 3c-3. Streaming recheck: hash existing data in bounded chunks, rebuild
       the verified bitmap, treat missing or short data as absent.
   - [ ] 3d. Resume data: bencode-based, versioned, atomic write, validation
-    against files, fallback to recheck.
+    against files, fallback to recheck. Persist verified bits only after
+    `Storage::sync()` succeeds or a recheck confirms the data.
   - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
     recorded in the `FileMap`, never follow links, and never remove directories
     outside the root. Route deletion through the storage worker as a command so
@@ -60,7 +62,8 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     blocks when it wants strict expiry: expiry happens only on an explicit
     sweep.
   - Must own one `PieceAssembler` and one `TorrentBudget` handle per torrent,
-    dropping both when the torrent is removed.
+    dropping both when the torrent is removed. One `HashPool` is shared by the
+    whole session and hashes pieces from every torrent.
   - Must introduce a per-torrent state object that owns the `Bitfield`, the
     `TorrentBudget` handle, and the spec factory, and carries the info-hash.
     `mark_stored` checks that hash, so a `StoredPiece` from one torrent cannot

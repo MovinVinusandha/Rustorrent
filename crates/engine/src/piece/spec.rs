@@ -1,9 +1,9 @@
 //! Piece identity and hash metadata.
 //!
 //! A [`PieceSpec`] ties one piece index to the exact byte range it covers and
-//! the SHA-1 hash it must match. The last piece may be shorter than the
-//! torrent's declared piece length, so the length is always taken from the
-//! actual range and converted with checked arithmetic.
+//! the SHA-1 hash it must match (normally taken from metainfo). The last piece
+//! may be shorter than the torrent's declared piece length, so the length is
+//! always taken from the actual range and converted with checked arithmetic.
 
 use thiserror::Error;
 
@@ -156,7 +156,7 @@ impl PieceSpec {
         self.length
     }
 
-    /// Expected SHA-1 hash.
+    /// Expected SHA-1 hash, normally taken from metainfo.
     pub fn hash(&self) -> [u8; PIECE_HASH_LENGTH] {
         self.hash
     }

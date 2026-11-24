@@ -5,8 +5,8 @@
 //! whose permit moves into the blocking closure, so it covers actual hashing,
 //! and the [`PieceBuffer`] moves with it. Dropping the outer future therefore
 //! cannot leak the piece's memory reservation: the buffer (and its
-//! [`PieceReservation`](crate::piece::PieceReservation)) is owned by the
-//! blocking job and dropped when that job ends.
+//! [`PieceReservation`]) is owned by the blocking job and dropped when that
+//! job ends.
 //!
 //! Only a matching SHA-1 produces a [`VerifiedPiece`], and the type has no
 //! public constructor. A mismatch returns the sorted, deduplicated contributor
@@ -170,7 +170,8 @@ fn verify_buffer(buffer: PieceBuffer) -> Result<VerifiedPiece, VerifyError> {
     }
 }
 
-/// A completed piece whose bytes matched the metainfo SHA-1.
+/// A completed piece whose bytes matched the spec's SHA-1 (normally taken from
+/// metainfo).
 ///
 /// No public constructor exists: only [`HashPool::verify`] success builds one.
 /// The piece keeps its memory reservation until it is dropped, including while
@@ -254,12 +255,13 @@ pub enum VerifyError {
         /// Blocks in the piece.
         blocks: u32,
     },
-    /// The SHA-1 of the assembled bytes does not match the metainfo hash.
-    #[error("piece {piece} SHA-1 does not match the metainfo hash")]
+    /// The SHA-1 of the assembled bytes does not match the spec's hash
+    /// (normally taken from metainfo).
+    #[error("piece {piece} SHA-1 does not match the expected hash")]
     HashMismatch {
         /// Piece index.
         piece: u32,
-        /// Hash from metainfo.
+        /// Expected hash from the piece spec.
         expected: [u8; PIECE_HASH_LENGTH],
         /// Hash of the assembled bytes.
         found: [u8; PIECE_HASH_LENGTH],
@@ -337,6 +339,7 @@ impl HashGate {
     pub(crate) fn open(&self) {
         self.state.lock().expect("hash gate state").open = true;
         let release = self.release.lock().expect("hash gate release");
+        // Fixed release budget: tests use far fewer than 1024 waiters.
         for _ in 0..1024 {
             let _ = release.send(());
         }

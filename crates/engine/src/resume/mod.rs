@@ -7,11 +7,13 @@
 
 mod format;
 mod restore;
+mod save;
 
 pub use format::{
-    DecodeError, EncodeError, MAX_RESUME_BYTES, RESUME_VERSION, ResumeDocument, ResumeFile,
-    decode_document, encode_document, layout_fingerprint,
+    DecodeError, EncodeError, MAX_RESUME_BYTES, MTIME_UNAVAILABLE, RESUME_VERSION, ResumeDocument,
+    ResumeFile, decode_document, encode_document, layout_fingerprint,
 };
 pub use restore::{
     RestoreError, RestorePlan, SPOT_CHECK_PIECES, ValidationError, plan_restore, validate_document,
 };
+pub use save::{ResumeStore, SaveError};

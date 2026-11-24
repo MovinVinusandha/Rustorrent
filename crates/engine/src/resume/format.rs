@@ -45,6 +45,13 @@ pub const MAX_RESUME_BYTES: usize = 16 * 1024 * 1024;
 /// Number of bytes in an info-hash or layout fingerprint.
 const HASH_BYTES: usize = 20;
 
+/// Modification time stored when the platform cannot report one.
+///
+/// The smallest signed integer is outside the range a real filesystem time
+/// maps to, so an observed time never equals it. Restore treats such an entry
+/// as stale and rechecks the pieces it covers.
+pub const MTIME_UNAVAILABLE: i64 = i64::MIN;
+
 /// One file entry in a resume document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumeFile {
@@ -54,9 +61,9 @@ pub struct ResumeFile {
     pub observed_size: u64,
     /// Modification time observed on disk, in nanoseconds since the epoch.
     ///
-    /// `i64::MIN` means the platform could not report a value that fits in
-    /// `i64`. Such an entry never matches an observed time, so every piece it
-    /// covers is rechecked.
+    /// [`MTIME_UNAVAILABLE`] means the platform could not report a value that
+    /// fits in `i64`. Such an entry never matches an observed time, so every
+    /// piece it covers is rechecked.
     pub mtime_ns: i64,
 }
 

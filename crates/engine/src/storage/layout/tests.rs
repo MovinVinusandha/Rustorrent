@@ -372,6 +372,14 @@ fn skips_zero_length_files() {
             },
         ]
     );
+    assert_eq!(
+        map.segments(2..5).collect::<Vec<_>>(),
+        vec![Segment {
+            file_index: 2,
+            offset_in_file: 0,
+            len: 3,
+        }]
+    );
     assert!(map.segments(2..2).next().is_none());
     assert_eq!(map.files_for_piece(0).collect::<Vec<_>>(), vec![0, 2]);
     assert_eq!(map.files_for_piece(1).collect::<Vec<_>>(), vec![2]);

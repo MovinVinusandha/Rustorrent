@@ -399,11 +399,20 @@ impl FileMap {
     pub fn segments(&self, range: Range<u64>) -> impl Iterator<Item = Segment> + '_ {
         let start = range.start;
         let end = range.end.min(self.total_length);
-        let files: &[MappedFile] = if start < end { &self.files } else { &[] };
+        let (base, files): (usize, &[MappedFile]) = if start < end {
+            let first = self
+                .files
+                .partition_point(|file| file.offset + file.length <= start);
+            (first, &self.files[first..])
+        } else {
+            (0, &[])
+        };
 
         files
             .iter()
             .enumerate()
+            .map(move |(index, file)| (base + index, file))
+            .take_while(move |(_, file)| file.offset < end)
             .filter_map(move |(file_index, file)| {
                 let file_end = file.offset + file.length;
                 let segment_start = start.max(file.offset);

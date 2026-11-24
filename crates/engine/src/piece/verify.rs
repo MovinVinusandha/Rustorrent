@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use sha1::{Digest, Sha1};
 use thiserror::Error;
-use tokio::sync::{AcquireError, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 
 use super::{PeerKey, PieceBuffer, PieceReservation, PieceSpec};
@@ -95,12 +95,10 @@ impl HashPool {
             });
         }
 
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_: AcquireError| VerifyError::PoolClosed)?;
+        // The pool owns the semaphore and never closes it, so this cannot
+        // fail. Keeping the whole result alive still holds the permit when one
+        // was acquired, without an error path or a panic.
+        let permit = self.permits.clone().acquire_owned().await;
 
         #[cfg(test)]
         let gate = self.gate.lock().expect("hash gate lock").clone();
@@ -268,9 +266,6 @@ pub enum VerifyError {
         /// Sorted, deduplicated peers that supplied blocks.
         contributors: Vec<PeerKey>,
     },
-    /// The pool's semaphore was closed; this only happens during shutdown.
-    #[error("hash pool is closed")]
-    PoolClosed,
     /// The blocking hash task panicked or was cancelled by the runtime.
     #[error("piece hashing task failed")]
     TaskFailed(#[source] JoinError),

@@ -170,8 +170,6 @@ impl Bitfield {
     /// other way. No [`StoredPiece`] is needed because recheck writes nothing:
     /// the evidence is that every byte of the piece was read through the
     /// storage handle and the incremental SHA-1 matched the expected hash.
-    // The recheck module that calls this is added in the next commit.
-    #[allow(dead_code)]
     pub(crate) fn mark_rechecked_present(&mut self, piece: u32) -> Result<(), BitfieldError> {
         self.set(piece, true)
     }

@@ -205,6 +205,7 @@ fn plan_spot_checks_every_piece_of_a_tiny_torrent() {
 
     assert_eq!(plan.bits().count_verified(), 0);
     assert_eq!(plan.recheck(), &[0, 1]);
+    assert_eq!(plan.spot_checks(), &[0, 1]);
 }
 
 #[test]
@@ -301,6 +302,7 @@ fn plan_spot_checks_five_spread_pieces() {
     let plan = plan_restore(&map, &info_hash(), Some(&document), &observed).expect("plan");
 
     assert_eq!(plan.recheck(), &[0, 2, 4, 6, 9]);
+    assert_eq!(plan.spot_checks(), &[0, 2, 4, 6, 9]);
     for piece in [0, 2, 4, 6, 9] {
         assert!(!plan.bits().get(piece).expect("get"), "piece {piece}");
     }
@@ -316,6 +318,7 @@ fn plan_rechecks_every_readable_piece_without_a_document() {
     let plan = plan_restore(&map, &info_hash(), None, &[present(20, 100)]).expect("plan");
     assert_eq!(plan.bits().count_verified(), 0);
     assert_eq!(plan.recheck(), &[0, 1]);
+    assert!(plan.spot_checks().is_empty());
 
     let plan = plan_restore(&map, &info_hash(), None, &[present(15, 100)]).expect("plan");
     assert_eq!(plan.bits().count_verified(), 0);

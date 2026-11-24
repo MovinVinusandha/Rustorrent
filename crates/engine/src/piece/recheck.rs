@@ -30,7 +30,7 @@ use tokio::task::JoinError;
 
 use super::{HashPool, PieceSpec, PieceSpecError};
 use crate::bitfield::{Bitfield, BitfieldError};
-use crate::metainfo::{MetaInfo, PIECE_HASH_LENGTH};
+use crate::metainfo::{InfoHash, MetaInfo, PIECE_HASH_LENGTH};
 use crate::storage::layout::FileMap;
 use crate::storage::thread::{MAX_RANGE_LEN, StorageHandle, StorageHandleError};
 
@@ -239,6 +239,21 @@ impl Rechecker {
             pool,
             running: AtomicBool::new(false),
         })
+    }
+
+    /// Returns the file map this rechecker was built for.
+    pub fn file_map(&self) -> &FileMap {
+        self.map.as_ref()
+    }
+
+    /// Returns the torrent's info-hash.
+    pub fn info_hash(&self) -> InfoHash {
+        self.meta.info_hash
+    }
+
+    /// Returns the storage handle recheck reads run through.
+    pub fn storage(&self) -> &StorageHandle {
+        &self.storage
     }
 
     /// Rechecks the selected pieces and returns the updated bitfield.

@@ -105,6 +105,7 @@ pub enum RestoreError {
 pub struct RestorePlan {
     bits: Bitfield,
     recheck: Vec<u32>,
+    spot: Vec<u32>,
 }
 
 impl RestorePlan {
@@ -120,9 +121,20 @@ impl RestorePlan {
     /// [`RecheckSelection::Only`](crate::piece::RecheckSelection::Only).
     ///
     /// The indices are strictly increasing. An empty slice means no bytes need
-    /// to be read.
+    /// to be read. The spot-check pieces are included.
     pub fn recheck(&self) -> &[u32] {
         &self.recheck
+    }
+
+    /// Up to [`SPOT_CHECK_PIECES`] verified pieces sampled for a spot check.
+    ///
+    /// The indices are strictly increasing and are also present in
+    /// [`recheck`](Self::recheck). They are empty when planning without a
+    /// document. If any of them fails to verify, the caller must fall back to
+    /// a full recheck because metadata alone no longer proves the remaining
+    /// verified pieces are intact.
+    pub fn spot_checks(&self) -> &[u32] {
+        &self.spot
     }
 
     /// Consumes the plan and returns its base bitfield and recheck selection.
@@ -229,7 +241,7 @@ pub fn plan_restore(
 
     let readable = clear_unreadable_pieces(map, observed, &mut bits)?;
 
-    let mut recheck = match document {
+    let (mut recheck, spot) = match document {
         Some(document) => {
             let stale = clear_stale_pieces(document, map, observed, &mut bits)?;
             let spot = spot_check_pieces(&bits, SPOT_CHECK_PIECES);
@@ -241,16 +253,20 @@ pub fn plan_restore(
                 .into_iter()
                 .filter(|piece| readable.binary_search(piece).is_ok())
                 .collect();
-            recheck.extend(spot);
-            recheck
+            recheck.extend(spot.iter().copied());
+            (recheck, spot)
         }
-        None => readable,
+        None => (readable, Vec::new()),
     };
 
     recheck.sort_unstable();
     recheck.dedup();
 
-    Ok(RestorePlan { bits, recheck })
+    Ok(RestorePlan {
+        bits,
+        recheck,
+        spot,
+    })
 }
 
 /// Clears pieces covered by files whose exact size or modification time

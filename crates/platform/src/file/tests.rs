@@ -13,6 +13,22 @@ fn path_in(dir: &TempDir, name: &str) -> PathBuf {
     dir.path().join(name)
 }
 
+/// Sorted file names in `dir`, for assertions about leftovers.
+fn entries(dir: &TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) {
     while !data.is_empty() {
         let written = file.write_at(data, offset).expect("write_at");
@@ -213,7 +229,7 @@ fn write_atomic_creates_target_without_leaving_a_temp_file() {
     write_atomic(&target, b"first").expect("write atomic");
 
     assert_eq!(std::fs::read(&target).expect("read target"), b"first");
-    assert!(!target.with_file_name("0000.resume.tmp").exists());
+    assert_eq!(entries(&dir), ["0000.resume"]);
 }
 
 #[test]
@@ -225,23 +241,59 @@ fn write_atomic_replaces_an_existing_target() {
     write_atomic(&target, b"new").expect("write atomic");
 
     assert_eq!(std::fs::read(&target).expect("read target"), b"new");
+    assert_eq!(entries(&dir), ["0000.resume"]);
 }
 
 #[test]
-fn write_atomic_overwrites_a_leftover_truncated_temp_file() {
+fn write_atomic_leaves_a_file_at_the_old_temp_name_alone() {
     let dir = temp_dir();
     let target = path_in(&dir, "0000.resume");
-    let temp = path_in(&dir, "0000.resume.tmp");
-    std::fs::write(&target, b"old").expect("write old target");
-    std::fs::write(&temp, b"d3:cor").expect("write leftover temp");
-
-    // A leftover temp file must never change what the target contains.
-    assert_eq!(std::fs::read(&target).expect("read target"), b"old");
+    let leftover = path_in(&dir, "0000.resume.tmp");
+    std::fs::write(&leftover, b"d3:cor").expect("write leftover temp");
 
     write_atomic(&target, b"new").expect("write atomic");
 
     assert_eq!(std::fs::read(&target).expect("read target"), b"new");
-    assert!(!temp.exists());
+    assert_eq!(
+        std::fs::read(&leftover).expect("read leftover"),
+        b"d3:cor",
+        "the old deterministic temp name is not this call's temp file"
+    );
+    assert_eq!(entries(&dir), ["0000.resume", "0000.resume.tmp"]);
+}
+
+#[test]
+fn concurrent_writes_leave_one_complete_target_and_no_temp_file() {
+    use std::sync::{Arc, Barrier};
+
+    const PAYLOADS: [&[u8]; 2] = [b"first payload", b"second payload"];
+
+    let dir = temp_dir();
+    let target = path_in(&dir, "0000.resume");
+    let barrier = Arc::new(Barrier::new(PAYLOADS.len()));
+    let writers: Vec<_> = PAYLOADS
+        .iter()
+        .map(|payload| {
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            let payload = *payload;
+            std::thread::spawn(move || {
+                barrier.wait();
+                write_atomic(&target, payload)
+            })
+        })
+        .collect();
+
+    for writer in writers {
+        writer.join().expect("writer thread").expect("write atomic");
+    }
+
+    let written = std::fs::read(&target).expect("read target");
+    assert!(
+        PAYLOADS.contains(&written.as_slice()),
+        "target must hold one complete payload, never a mixture"
+    );
+    assert_eq!(entries(&dir), ["0000.resume"]);
 }
 
 #[test]
@@ -249,13 +301,12 @@ fn write_atomic_failure_keeps_the_target_and_removes_the_temp() {
     let dir = temp_dir();
     let target = path_in(&dir, "target");
     std::fs::create_dir(&target).expect("create target directory");
-    let temp = path_in(&dir, "target.tmp");
 
     let result = write_atomic(&target, b"new");
 
     assert!(result.is_err(), "rename over a directory must fail");
     assert!(target.is_dir(), "target directory must be unchanged");
-    assert!(!temp.exists(), "failed write must clean up its temp file");
+    assert_eq!(entries(&dir), ["target"], "failed write must clean up");
 }
 
 #[test]
@@ -277,13 +328,28 @@ fn write_atomic_rejects_a_path_without_a_file_name() {
 }
 
 #[test]
-fn temp_path_appends_the_suffix_to_the_full_name() {
+fn temp_path_builds_a_unique_name_next_to_the_target() {
     let path = Path::new("/tmp/abc.resume");
 
-    assert_eq!(
-        temp_path(path).expect("temp path"),
-        Path::new("/tmp/abc.resume.tmp")
+    let first = temp_path(path).expect("temp path");
+    let second = temp_path(path).expect("temp path");
+
+    let name = first
+        .file_name()
+        .expect("temp file name")
+        .to_string_lossy()
+        .into_owned();
+    let suffix = name
+        .strip_prefix("abc.resume.tmp.")
+        .expect("temp name keeps the target name");
+    let parts: Vec<&str> = suffix.split('.').collect();
+    assert_eq!(parts.len(), 3, "expected pid, counter, and nanos in {name}");
+    assert!(
+        parts.iter().all(|part| part.parse::<u64>().is_ok()),
+        "temp name parts must be numbers: {name}"
     );
+    assert_eq!(first.parent(), path.parent());
+    assert_ne!(first, second, "each call must get its own temp name");
 }
 
 #[cfg(windows)]

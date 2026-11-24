@@ -246,6 +246,11 @@ impl Rechecker {
         self.map.as_ref()
     }
 
+    /// Clones the shared file map for a blocking job.
+    pub(crate) fn shared_map(&self) -> Arc<FileMap> {
+        Arc::clone(&self.map)
+    }
+
     /// Returns the torrent's info-hash.
     pub fn info_hash(&self) -> InfoHash {
         self.meta.info_hash

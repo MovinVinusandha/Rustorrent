@@ -49,8 +49,11 @@ Command in / Event out. InProcess client (channels) and Remote client
   `<data-local>/resume`; one file per torrent named
   `<info-hash-hex>.resume`. The document is canonical bencode, version 1,
   capped at 16 MiB, records no absolute paths, and is written atomically
-  through a temp file. It stores the verified bitfield and exact observed
-  size/mtime per file; the format and restore rules are in ADR 0002 section 7.
+  through a uniquely named temp in the same directory; saves sweep temps older
+  than 24 hours. Run one daemon per resume directory: the temp names are unique
+  but not a cross-process lock. It stores the verified bitfield and exact
+  observed size/mtime per file; the format and restore rules are in ADR 0002
+  section 7.
 - Piece data lives only in the download directory. Missing or short files
   mean absent pieces, never a reason to delete or truncate user files.
 

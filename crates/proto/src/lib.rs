@@ -284,6 +284,8 @@ pub mod error_code {
     pub const TORRENT_NOT_FOUND: &str = "torrent_not_found";
     /// The command is recognized but not implemented yet.
     pub const NOT_IMPLEMENTED: &str = "not_implemented";
+    /// The engine and client disagree about the command/event API version.
+    pub const API_VERSION_MISMATCH: &str = "api_version_mismatch";
 }
 
 /// Successful reply to a [`Command`].
@@ -297,6 +299,16 @@ pub enum Reply {
         /// Identifier assigned to the new torrent.
         id: TorrentId,
     },
+}
+
+/// A snapshot whose API version differs from the one this build speaks.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("snapshot API version {found} does not match {expected}")]
+pub struct ApiVersionMismatch {
+    /// Version this build speaks.
+    pub expected: u32,
+    /// Version carried by the snapshot.
+    pub found: u32,
 }
 
 /// Full engine state for a new or reconnecting client.
@@ -320,6 +332,18 @@ impl Snapshot {
             torrents: Vec::new(),
             stats: GlobalStats::default(),
             limits: Limits::default(),
+        }
+    }
+
+    /// Checks that this snapshot speaks this build's [`API_VERSION`].
+    pub fn check_api_version(&self) -> Result<(), ApiVersionMismatch> {
+        if self.api_version == API_VERSION {
+            Ok(())
+        } else {
+            Err(ApiVersionMismatch {
+                expected: API_VERSION,
+                found: self.api_version,
+            })
         }
     }
 }
@@ -526,6 +550,26 @@ mod tests {
             stats: GlobalStats::default(),
             limits: Limits::default(),
         });
+    }
+
+    #[test]
+    fn snapshot_version_check_accepts_the_current_version() {
+        assert!(Snapshot::empty(API_VERSION).check_api_version().is_ok());
+    }
+
+    #[test]
+    fn snapshot_version_check_reports_both_versions() {
+        let error = Snapshot::empty(API_VERSION + 1)
+            .check_api_version()
+            .expect_err("a mismatched version must fail");
+
+        assert_eq!(
+            error,
+            ApiVersionMismatch {
+                expected: API_VERSION,
+                found: API_VERSION + 1,
+            }
+        );
     }
 
     #[test]

@@ -68,6 +68,14 @@ impl InProcessClient {
     /// This must be called inside a Tokio runtime. It returns
     /// [`error_code::ENGINE_UNAVAILABLE`] otherwise.
     pub fn spawn() -> Result<Self, EngineError> {
+        Self::spawn_with_api_version(API_VERSION)
+    }
+
+    /// Starts the in-process stub reporting `api_version` in its snapshots.
+    ///
+    /// Production code passes [`API_VERSION`]; tests use another value to
+    /// exercise the snapshot version check.
+    fn spawn_with_api_version(api_version: u32) -> Result<Self, EngineError> {
         let handle = Handle::try_current().map_err(|_| {
             EngineError::new(
                 error_code::ENGINE_UNAVAILABLE,
@@ -77,7 +85,7 @@ impl InProcessClient {
 
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let snapshot = Arc::new(RwLock::new(Snapshot::empty(API_VERSION)));
+        let snapshot = Arc::new(RwLock::new(Snapshot::empty(api_version)));
 
         let task = handle.spawn(run_stub(command_rx, events.clone(), Arc::clone(&snapshot)));
 
@@ -111,7 +119,11 @@ impl EngineClient for InProcessClient {
     }
 
     async fn snapshot(&self) -> Result<Snapshot, EngineError> {
-        Ok(self.snapshot.read().await.clone())
+        let snapshot = self.snapshot.read().await.clone();
+        snapshot.check_api_version().map_err(|error| {
+            EngineError::new(error_code::API_VERSION_MISMATCH, error.to_string())
+        })?;
+        Ok(snapshot)
     }
 
     fn subscribe(&self) -> EventStream {
@@ -184,10 +196,14 @@ async fn handle_command(
         }
         Command::Pause { id } => set_state(snapshot, id, TorrentState::Paused).await,
         Command::Resume { id } => set_state(snapshot, id, TorrentState::Downloading).await,
-        Command::Remove {
-            id,
-            delete_files: _,
-        } => {
+        Command::Remove { id, delete_files } => {
+            if delete_files {
+                return Err(EngineError::new(
+                    error_code::NOT_IMPLEMENTED,
+                    "deleting torrent files is not implemented",
+                ));
+            }
+
             let mut state = snapshot.write().await;
             let before = state.torrents.len();
             state.torrents.retain(|torrent| torrent.id != id);
@@ -289,7 +305,7 @@ fn stub_name(source: &Source) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bt_proto::{AddOptions, Priority};
+    use bt_proto::{API_VERSION, AddOptions, Priority};
     use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
 
@@ -384,6 +400,60 @@ mod tests {
             .expect_err("stub must report not implemented");
 
         assert_eq!(error.code, error_code::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn mismatched_snapshot_version_is_rejected() {
+        let client = InProcessClient::spawn_with_api_version(API_VERSION + 1).expect("runtime");
+
+        let error = client
+            .snapshot()
+            .await
+            .expect_err("snapshot version must be checked");
+
+        assert_eq!(error.code, error_code::API_VERSION_MISMATCH);
+        assert!(error.message.contains(&(API_VERSION + 1).to_string()));
+    }
+
+    #[tokio::test]
+    async fn delete_files_removal_is_rejected() {
+        let client = InProcessClient::spawn().expect("runtime");
+        let reply = client
+            .send(Command::AddTorrent(AddOptions::new(Source::Magnet(
+                "magnet:?xt=urn:btih:abc".to_owned(),
+            ))))
+            .await
+            .expect("add torrent");
+        let id = match reply {
+            Reply::Added { id } => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let error = client
+            .send(Command::Remove {
+                id: id.clone(),
+                delete_files: true,
+            })
+            .await
+            .expect_err("deleting files must be rejected");
+        assert_eq!(error.code, error_code::NOT_IMPLEMENTED);
+        assert_eq!(client.snapshot().await.expect("snapshot").torrents.len(), 1);
+
+        client
+            .send(Command::Remove {
+                id,
+                delete_files: false,
+            })
+            .await
+            .expect("remove without deleting files");
+        assert!(
+            client
+                .snapshot()
+                .await
+                .expect("snapshot")
+                .torrents
+                .is_empty()
+        );
     }
 
     #[tokio::test]

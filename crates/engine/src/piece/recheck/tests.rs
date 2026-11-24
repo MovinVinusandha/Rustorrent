@@ -11,7 +11,9 @@ use crate::bitfield::Bitfield;
 use crate::metainfo::{FileInfo, InfoHash, MetaInfo, Mode, PIECE_HASH_LENGTH};
 use crate::piece::verify::HashGate;
 use crate::piece::{HashPool, PieceSpecError};
-use crate::storage::backend::{StorageConfig, StorageError, UnsafeReason};
+#[cfg(unix)]
+use crate::storage::backend::UnsafeReason;
+use crate::storage::backend::{StorageConfig, StorageError};
 use crate::storage::layout::FileMap;
 use crate::storage::thread::{MAX_RANGE_LEN, StorageHandle, StorageHandleError};
 
@@ -118,6 +120,7 @@ impl Fixture {
         self.root.join(file.to_path())
     }
 
+    #[cfg(unix)]
     fn temp_path(&self, name: &str) -> PathBuf {
         self._dir.path().join(name)
     }

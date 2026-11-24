@@ -123,6 +123,51 @@ impl<'a> PartialEq for Value<'a> {
 impl<'a> Eq for Value<'a> {}
 
 impl<'a> Value<'a> {
+    /// Builds an integer value.
+    pub fn int(value: i64) -> Self {
+        Self {
+            kind: Kind::Int(value),
+            span: 0..0,
+        }
+    }
+
+    /// Builds a byte-string value.
+    pub fn bytes(value: &'a [u8]) -> Self {
+        Self {
+            kind: Kind::Bytes(value),
+            span: 0..0,
+        }
+    }
+
+    /// Builds a list value.
+    pub fn list(values: Vec<Value<'a>>) -> Self {
+        Self {
+            kind: Kind::List(values),
+            span: 0..0,
+        }
+    }
+
+    /// Builds a dictionary value with canonical key order.
+    ///
+    /// Entries are sorted by raw key bytes before they are stored, so callers
+    /// may pass keys in any order. Duplicate keys are rejected because a
+    /// canonical dictionary cannot contain them; the returned error uses
+    /// offset `0` because the value was built rather than decoded.
+    pub fn dict(mut entries: Vec<(&'a [u8], Value<'a>)>) -> Result<Self, Error> {
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+
+        for pair in entries.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(Error::DuplicateDictKey { offset: 0 });
+            }
+        }
+
+        Ok(Self {
+            kind: Kind::Dict(entries.into_iter().collect()),
+            span: 0..0,
+        })
+    }
+
     /// Returns the integer value, or `None` for another value kind.
     pub fn as_int(&self) -> Option<i64> {
         match &self.kind {

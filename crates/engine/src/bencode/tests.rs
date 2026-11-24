@@ -314,6 +314,49 @@ fn encodes_canonical_input_byte_for_byte() {
 }
 
 #[test]
+fn constructors_encode_canonical_values() {
+    let value = Value::dict(vec![
+        (b"z", Value::int(1)),
+        (b"a", Value::bytes(b"x")),
+        (b"m", Value::list(vec![Value::int(2), Value::int(3)])),
+    ])
+    .expect("dictionary");
+    let encoded = encode(&value).expect("encode");
+
+    assert_eq!(encoded, b"d1:a1:x1:mli2ei3ee1:zi1ee");
+    assert_eq!(decode(&encoded).expect("decode"), value);
+}
+
+#[test]
+fn constructors_sort_unsorted_keys() {
+    let value = Value::dict(vec![
+        (b"z", Value::int(1)),
+        (b"a", Value::int(2)),
+        (b"m", Value::int(3)),
+    ])
+    .expect("dictionary");
+    let encoded = encode(&value).expect("encode");
+
+    assert_eq!(encoded, b"d1:ai2e1:mi3e1:zi1ee");
+    assert_eq!(decode(&encoded).expect("decode"), value);
+}
+
+#[test]
+fn constructors_reject_duplicate_keys() {
+    let result = Value::dict(vec![(b"a", Value::int(1)), (b"a", Value::int(2))]);
+
+    assert!(matches!(result, Err(Error::DuplicateDictKey { offset: 0 })));
+}
+
+#[test]
+fn constructors_have_empty_spans() {
+    let value = Value::dict(vec![(b"a", Value::int(1))]).expect("dictionary");
+
+    assert_eq!(value.span(), 0..0);
+    assert_eq!(value.as_dict().expect("dict").len(), 1);
+}
+
+#[test]
 fn encode_into_appends() {
     let value = decode(b"i1e").unwrap();
     let mut out = b"prefix".to_vec();

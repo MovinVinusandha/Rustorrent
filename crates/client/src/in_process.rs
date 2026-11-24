@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bt_proto::{
-    Command, EngineError, Event, Reply, Snapshot, Source, TorrentDelta, TorrentId, TorrentState,
-    TorrentSummary, error_code,
+    API_VERSION, Command, EngineError, Event, Reply, Snapshot, Source, TorrentDelta, TorrentId,
+    TorrentState, TorrentSummary, error_code,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
@@ -77,7 +77,7 @@ impl InProcessClient {
 
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let snapshot = Arc::new(RwLock::new(Snapshot::empty(bt_engine::API_VERSION)));
+        let snapshot = Arc::new(RwLock::new(Snapshot::empty(API_VERSION)));
 
         let task = handle.spawn(run_stub(command_rx, events.clone(), Arc::clone(&snapshot)));
 

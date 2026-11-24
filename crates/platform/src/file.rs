@@ -9,6 +9,14 @@ use std::fs::{File as StdFile, Metadata, OpenOptions};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Suffix that marks a temporary file created by [`write_atomic`].
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// Separates temp files created by the same process in the same nanosecond.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A file handle with positioned reads and writes.
 #[derive(Debug)]
@@ -141,16 +149,19 @@ pub fn create_new(path: &Path) -> io::Result<File> {
 
 /// Writes `bytes` to `path` atomically.
 ///
-/// Data is written to `<file name>.tmp` in the same directory, flushed with
-/// `sync_all`, then renamed over the target. On Unix the parent directory is
-/// synced after the rename. On Windows the rename is retried briefly when the
-/// target is temporarily open by another process; that retry blocks the caller
-/// for at most a few hundred milliseconds.
+/// Data is written to a uniquely named temp file in the same directory,
+/// flushed with `sync_all`, then renamed over the target. The name is
+/// `<file name>.tmp.<pid>.<counter>.<nanos>`, and the temp is opened with
+/// `create_new`, so a leftover or planted file is never reused. On Unix the
+/// parent directory is synced after the rename. On Windows the rename is
+/// retried briefly when the target is temporarily open by another process;
+/// that retry blocks the caller for at most a few hundred milliseconds.
 ///
-/// A crash leaves either the old target or the new target, never a mixture. A
-/// leftover temp file is truncated by the next call and is never read as the
-/// target. The temp path is opened with normal create semantics, so it follows
-/// a symlink placed there; callers must pass a user-private directory.
+/// A crash leaves either the old target or the new target, never a mixture.
+/// Concurrent writers use separate temp files, so the last rename wins and the
+/// target is always one complete document. A failed write removes its own temp
+/// file; a process that dies mid-write leaves one behind, which the next call
+/// ignores and callers must sweep.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp = temp_path(path)?;
     let result = write_and_rename(&temp, path, bytes);
@@ -161,19 +172,33 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     sync_parent(path)
 }
 
-/// Appends `.tmp` to the full file name, keeping the target stem intact.
+/// Builds a unique temp path next to `path`.
+///
+/// The pid separates processes, the process-wide counter separates calls in
+/// one process, and the timestamp separates runs that reuse the pid. No
+/// randomness is needed because `create_new` refuses an existing name.
 fn temp_path(path: &Path) -> io::Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
     let mut temp = name.to_os_string();
-    temp.push(".tmp");
+    temp.push(format!(
+        "{TEMP_SUFFIX}.{}.{}.{}",
+        std::process::id(),
+        counter,
+        nanos
+    ));
     Ok(path.with_file_name(temp))
 }
 
 /// Writes the temp file, flushes it, then renames it over the target.
 fn write_and_rename(temp: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = StdFile::create(temp)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);

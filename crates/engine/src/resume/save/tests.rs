@@ -1,5 +1,7 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 
@@ -80,6 +82,39 @@ async fn open(root: &Path, map: &Arc<FileMap>) -> StorageHandle {
     .expect("open storage")
 }
 
+/// Sorted file names in `dir`.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("list directory")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Backdates `path` by `age` so the sweep sees an old file.
+fn set_age(path: &Path, age: Duration) {
+    let modified = SystemTime::now()
+        .checked_sub(age)
+        .expect("clock before the epoch");
+    let file = std::fs::File::options()
+        .append(true)
+        .open(path)
+        .expect("open file");
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .expect("set mtime");
+}
+
+fn document_name() -> String {
+    format!("{}.resume", info_hash())
+}
+
 #[tokio::test]
 async fn save_writes_a_valid_document_and_leaves_no_temp_file() {
     let (dir, root) = fixture();
@@ -119,14 +154,129 @@ async fn save_writes_a_valid_document_and_leaves_no_temp_file() {
         other => panic!("unexpected observation: {other:?}"),
     }
 
-    let temp = resume_dir.join(format!("{}.resume.tmp", info_hash()));
-    assert!(!temp.exists(), "the temporary file must be renamed away");
-    let entries = std::fs::read_dir(&resume_dir)
-        .expect("list resume directory")
-        .count();
-    assert_eq!(entries, 1);
+    assert_eq!(names_in(&resume_dir), [document_name()]);
 
     storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn stale_temps_are_swept_but_recent_and_foreign_files_survive() {
+    let (dir, root) = fixture();
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume directory");
+    let map = map_with(&[(&["a.bin"], 4)], 4);
+    write_file(&root, &["a.bin"], &[0x77; 4]);
+    let storage = open(&root, &map).await;
+    let store = ResumeStore::new(resume_dir.clone());
+
+    let stale = resume_dir.join(format!("{}.tmp.1.2.3", document_name()));
+    let recent = resume_dir.join(format!("{}.tmp.4.5.6", document_name()));
+    let malformed = resume_dir.join(format!("{}.tmp.7.8", document_name()));
+    let foreign = resume_dir.join("notes.txt");
+    for path in [&stale, &recent, &malformed, &foreign] {
+        std::fs::write(path, b"junk").expect("write file");
+    }
+    set_age(&stale, Duration::from_secs(25 * 60 * 60));
+    set_age(&malformed, Duration::from_secs(25 * 60 * 60));
+
+    store
+        .save(
+            info_hash(),
+            &map,
+            Bitfield::new(1).expect("bitfield"),
+            &storage,
+        )
+        .await
+        .expect("save");
+
+    assert!(!stale.exists(), "an old temp must be swept");
+    assert!(recent.exists(), "a recent temp may belong to a live save");
+    assert!(malformed.exists(), "only the temp pattern is swept");
+    assert!(foreign.exists(), "unrelated files must survive");
+    assert!(store.document_path(&info_hash()).is_file());
+
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn concurrent_saves_leave_one_valid_document_and_no_temp_files() {
+    let (dir, root) = fixture();
+    let resume_dir = dir.path().join("resume");
+    let map = map_with(&[(&["a.bin"], 8)], 4);
+    write_file(&root, &["a.bin"], &[0x88; 8]);
+    let storage = open(&root, &map).await;
+    let first = Bitfield::from_bytes(&[0b01], 2).expect("bitfield");
+    let second = Bitfield::from_bytes(&[0b10], 2).expect("bitfield");
+    let store_a = ResumeStore::new(resume_dir.clone());
+    let store_b = ResumeStore::new(resume_dir.clone());
+
+    let (saved_a, saved_b) = tokio::join!(
+        store_a.save(info_hash(), &map, first.clone(), &storage),
+        store_b.save(info_hash(), &map, second.clone(), &storage),
+    );
+    saved_a.expect("first save");
+    saved_b.expect("second save");
+
+    let bytes = std::fs::read(store_a.document_path(&info_hash())).expect("read document");
+    let document = decode_document(&bytes).expect("decode document");
+    assert!(
+        document.bitfield == first || document.bitfield == second,
+        "the document must be one complete snapshot, never a mixture"
+    );
+    assert_eq!(names_in(&resume_dir), [document_name()]);
+
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_failed_write_names_the_document_but_not_the_directory() {
+    let (dir, root) = fixture();
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume directory");
+    let map = map_with(&[(&["a.bin"], 4)], 4);
+    write_file(&root, &["a.bin"], &[0x99; 4]);
+    let storage = open(&root, &map).await;
+    let store = ResumeStore::new(resume_dir.clone());
+    std::fs::create_dir(store.document_path(&info_hash())).expect("document directory");
+
+    let error = store
+        .save(
+            info_hash(),
+            &map,
+            Bitfield::new(1).expect("bitfield"),
+            &storage,
+        )
+        .await
+        .expect_err("rename over a directory must fail");
+
+    match &error {
+        SaveError::Write { name, .. } => assert_eq!(name, &document_name()),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(
+        message.contains(&document_name()),
+        "the message must name the document: {message}"
+    );
+    assert!(
+        !message.contains(resume_dir.to_str().expect("utf-8 path")),
+        "the message must not contain the directory: {message}"
+    );
+
+    storage.shutdown().await.expect("shutdown");
+}
+
+#[test]
+fn only_well_formed_resume_temp_names_match() {
+    assert!(is_resume_temp(OsStr::new("abc.resume.tmp.1.2.3")));
+    assert!(is_resume_temp(OsStr::new("abc.resume.resume.tmp.1.2.3")));
+    assert!(!is_resume_temp(OsStr::new("abc.resume")));
+    assert!(!is_resume_temp(OsStr::new("abc.resume.tmp")));
+    assert!(!is_resume_temp(OsStr::new("abc.resume.tmp.1.2")));
+    assert!(!is_resume_temp(OsStr::new("abc.resume.tmp.1.2.3.4")));
+    assert!(!is_resume_temp(OsStr::new("abc.resume.tmp.a.2.3")));
+    assert!(!is_resume_temp(OsStr::new("abc.resume.tmp.1..3")));
+    assert!(!is_resume_temp(OsStr::new(".resume.tmp.1.2.3")));
 }
 
 #[tokio::test]

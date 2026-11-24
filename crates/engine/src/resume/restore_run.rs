@@ -5,12 +5,20 @@
 //! recheck when a spot check fails. A missing or unusable document is not an
 //! error; it just means every readable piece is rechecked.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use super::{LoadError, RestoreError, ResumeStore, ValidationError, plan_restore};
+use super::{
+    LoadError, RestoreError, RestorePlan, ResumeDocument, ResumeStore, ValidationError,
+    plan_restore,
+};
 use crate::bitfield::Bitfield;
+use crate::metainfo::InfoHash;
 use crate::piece::{RecheckCancel, RecheckError, RecheckProgress, RecheckSelection, Rechecker};
+use crate::storage::ObservedFile;
+use crate::storage::layout::FileMap;
 use crate::storage::thread::StorageHandleError;
 
 /// Why a restore used the bits it did.
@@ -77,9 +85,40 @@ pub enum RestoreRunError {
     /// The observed files and the torrent did not line up.
     #[error("could not plan resume restore: {0}")]
     Plan(#[from] RestoreError),
+    /// The blocking planning task was cancelled or panicked.
+    #[error("resume restore planning task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
     /// The recheck stopped with an error or was cancelled.
     #[error(transparent)]
     Recheck(#[from] RecheckError),
+}
+
+/// Plans a restore on the blocking pool.
+///
+/// Validation and sampling scan the whole bitfield, so they must not run on a
+/// runtime worker. A document that does not describe the torrent is not an
+/// error: the same job plans again without it, and the validation error is
+/// returned so the caller can report the fallback.
+async fn plan_with_fallback(
+    map: Arc<FileMap>,
+    info_hash: InfoHash,
+    document: Option<ResumeDocument>,
+    observed: Vec<ObservedFile>,
+) -> Result<(Option<ValidationError>, RestorePlan), RestoreRunError> {
+    let planned = tokio::task::spawn_blocking(move || {
+        match plan_restore(&map, &info_hash, document.as_ref(), &observed) {
+            Ok(plan) => Ok((None, plan)),
+            Err(RestoreError::Invalid(error)) => {
+                let plan = plan_restore(&map, &info_hash, None, &observed)?;
+                Ok((Some(error), plan))
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(RestoreRunError::Task)?;
+
+    planned.map_err(RestoreRunError::Plan)
 }
 
 impl ResumeStore {
@@ -103,7 +142,6 @@ impl ResumeStore {
         cancel: &RecheckCancel,
         progress: Option<&mpsc::Sender<RecheckProgress>>,
     ) -> Result<RestoreOutcome, RestoreRunError> {
-        let map = rechecker.file_map();
         let info_hash = rechecker.info_hash();
         let (document, mut source) = match self.load(&info_hash).await {
             Ok(Some(document)) => (Some(document), RestoreSource::Resume),
@@ -112,14 +150,11 @@ impl ResumeStore {
         };
 
         let observed = rechecker.storage().observe_files().await?;
-        let plan = match plan_restore(map, &info_hash, document.as_ref(), &observed) {
-            Ok(plan) => plan,
-            Err(RestoreError::Invalid(error)) => {
-                source = RestoreSource::Invalid(error);
-                plan_restore(map, &info_hash, None, &observed)?
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let (invalid, plan) =
+            plan_with_fallback(rechecker.shared_map(), info_hash, document, observed).await?;
+        if let Some(error) = invalid {
+            source = RestoreSource::Invalid(error);
+        }
 
         let first = rechecker
             .run(

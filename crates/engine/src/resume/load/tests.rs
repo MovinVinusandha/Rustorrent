@@ -67,6 +67,31 @@ async fn load_rejects_an_oversized_document() {
 }
 
 #[tokio::test]
+async fn load_errors_name_the_document_but_not_the_directory() {
+    let dir = TempDir::new().expect("create temp dir");
+    let store = ResumeStore::new(dir.path().join("resume"));
+    let info_hash = InfoHash::from_bytes([0x66; 20]);
+    fs::create_dir_all(store.directory()).expect("create resume directory");
+    fs::create_dir(store.document_path(&info_hash)).expect("document directory");
+
+    // Reading a directory fails on every platform, but through a different
+    // call: `File::open` on Windows, `read_to_end` elsewhere.
+    let error = store.load(&info_hash).await.expect_err("read a directory");
+
+    match &error {
+        LoadError::Io { name, .. } => {
+            assert_eq!(name, &format!("{info_hash}.resume"));
+        }
+        other => panic!("unexpected load result: {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(
+        !message.contains(store.directory().to_str().expect("utf-8 path")),
+        "the message must not contain the directory: {message}"
+    );
+}
+
+#[tokio::test]
 async fn load_reports_a_corrupt_document_as_a_decode_error() {
     let dir = TempDir::new().expect("create temp dir");
     let store = ResumeStore::new(dir.path().join("resume"));

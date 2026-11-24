@@ -189,7 +189,9 @@ async fn global_budget_blocks_until_a_reservation_is_dropped() {
     );
 
     let mut pending = Box::pin(second.reserve(bytes(1)));
-    let early = timeout(Duration::from_millis(50), &mut pending).await;
+    // A zero deadline polls the reservation once: it must stay pending, which
+    // proves it is waiting for global bytes without relying on wall-clock time.
+    let early = timeout(Duration::ZERO, &mut pending).await;
     assert!(early.is_err(), "reservation should wait for global bytes");
 
     drop(one);

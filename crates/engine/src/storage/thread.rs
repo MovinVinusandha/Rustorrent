@@ -310,10 +310,23 @@ impl StorageHandle {
             .await
     }
 
-    /// Number of read requests the worker has processed. Test-only.
-    #[cfg(test)]
-    pub(crate) async fn read_count(&self) -> Result<usize, StorageHandleError> {
-        self.send(|reply| Command::ReadCount { reply }).await
+    /// Waits until the worker has processed at least `reads` read requests.
+    ///
+    /// Test-only. One waiter at a time; arming a second one drops the first.
+    pub(crate) async fn await_reads(&self, reads: usize) -> Result<(), StorageHandleError> {
+        let (reached, reached_rx) = oneshot::channel();
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| StorageHandleError::WorkerStopped)?;
+        permit.send(Command::NotifyReadAt {
+            count: reads,
+            reached,
+        });
+        reached_rx
+            .await
+            .map_err(|_| StorageHandleError::WorkerStopped)
     }
 
     /// Number of observe-file commands the worker has processed. Test-only.
@@ -383,12 +396,13 @@ enum Command {
         reply: Reply<()>,
     },
     #[cfg(test)]
-    ReadCount {
+    ObserveCount {
         reply: Reply<usize>,
     },
     #[cfg(test)]
-    ObserveCount {
-        reply: Reply<usize>,
+    NotifyReadAt {
+        count: usize,
+        reached: oneshot::Sender<()>,
     },
     #[cfg(test)]
     Hold {
@@ -426,13 +440,11 @@ fn reject(command: Command) {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
         #[cfg(test)]
-        Command::ReadCount { reply } => {
-            let _ = reply.send(Err(StorageHandleError::ShuttingDown));
-        }
-        #[cfg(test)]
         Command::ObserveCount { reply } => {
             let _ = reply.send(Err(StorageHandleError::ShuttingDown));
         }
+        #[cfg(test)]
+        Command::NotifyReadAt { .. } => {}
         #[cfg(test)]
         Command::Hold { .. } => {}
         #[cfg(test)]
@@ -468,6 +480,8 @@ fn run_worker(
     #[cfg(test)]
     let mut reads = 0usize;
     #[cfg(test)]
+    let mut notify_read_at: Option<(usize, oneshot::Sender<()>)> = None;
+    #[cfg(test)]
     let mut observe_requests = 0usize;
     while let Some(command) = rx.blocking_recv() {
         match command {
@@ -475,6 +489,12 @@ fn run_worker(
                 #[cfg(test)]
                 {
                     reads = reads.saturating_add(1);
+                    let armed = notify_read_at
+                        .as_ref()
+                        .is_some_and(|(count, _)| reads >= *count);
+                    if armed && let Some((_, reached)) = notify_read_at.take() {
+                        let _ = reached.send(());
+                    }
                 }
                 #[cfg(test)]
                 if fail_read_after == Some(0) {
@@ -563,12 +583,16 @@ fn run_worker(
                 let _ = reply.send(Ok(()));
             }
             #[cfg(test)]
-            Command::ReadCount { reply } => {
-                let _ = reply.send(Ok(reads));
-            }
-            #[cfg(test)]
             Command::ObserveCount { reply } => {
                 let _ = reply.send(Ok(observe_requests));
+            }
+            #[cfg(test)]
+            Command::NotifyReadAt { count, reached } => {
+                if reads >= count {
+                    let _ = reached.send(());
+                } else {
+                    notify_read_at = Some((count, reached));
+                }
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

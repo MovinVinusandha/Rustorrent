@@ -1230,14 +1230,16 @@ fn classify_maps_windows_file_in_use() {
 fn system_time_ns_handles_epoch_and_overflow() {
     assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH), Some(0));
 
-    let max = Duration::from_nanos(i64::MAX as u64);
-    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH + max), Some(i64::MAX));
-    assert_eq!(
-        system_time_ns(SystemTime::UNIX_EPOCH - max),
-        Some(-i64::MAX)
-    );
+    // Windows stores SystemTime in 100 ns ticks, so use a representable value
+    // for the exact boundary instead of i64::MAX nanoseconds.
+    let max_ns = (i64::MAX / 100) * 100;
+    let max = Duration::from_nanos(u64::try_from(max_ns).expect("positive bound"));
+    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH + max), Some(max_ns));
+    assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH - max), Some(-max_ns));
 
-    let too_far = Duration::from_nanos(i64::MAX as u64 + 1);
+    // Clearly beyond the i64 nanosecond range and representable on every
+    // supported platform (roughly 300 years from the epoch).
+    let too_far = Duration::from_secs(300 * 365 * 24 * 60 * 60);
     assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH + too_far), None);
     assert_eq!(system_time_ns(SystemTime::UNIX_EPOCH - too_far), None);
 }

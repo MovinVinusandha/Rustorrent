@@ -350,12 +350,14 @@ e
   Syncing before observing guarantees every recorded bit was written before
   the flush began. The snapshot is consumed so a later bitfield change cannot
   leak into an earlier document. A per-torrent save lease rejects a second
-  concurrent save with `AlreadySaving`; the lease is released on success,
-  error, or cancellation.
+  concurrent save with `AlreadySaving`. The blocking write task owns the
+  lease, so dropping the save future cannot admit a second writer; the lease
+  is released when the write finishes or fails.
 - Atomic write: create the resume directory in the blocking task, write the
   temporary file in the same directory, `sync_all`, rename over the target,
-  then sync the parent directory on Unix. On Windows, retry the rename, then
-  replace. A failed save leaves the previous document untouched.
+  then sync the parent directory on Unix. On Windows, the rename replaces an
+  existing target and retries sharing or lock violations. A failed save
+  leaves the previous document untouched.
 - Blocking I/O: the load, directory creation, and write all run on
   `spawn_blocking`; no file operation runs on a runtime worker. A missing file
   is `Ok(None)`, and a corrupt or oversized file is a typed decode error; both

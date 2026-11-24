@@ -8,6 +8,7 @@ pub mod bencode;
 pub mod bitfield;
 pub mod metainfo;
 pub mod piece;
+pub mod removal;
 pub mod resume;
 pub mod storage;
 

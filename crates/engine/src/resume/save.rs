@@ -113,7 +113,7 @@ impl ResumeStore {
             return Err(SaveError::PieceCount { expected, found });
         }
 
-        let lease = self.acquire(info_hash)?;
+        let lease = self.acquire(info_hash).ok_or(SaveError::AlreadySaving)?;
 
         storage.sync().await?;
         let observed = storage.observe_files().await?;
@@ -147,23 +147,52 @@ impl ResumeStore {
         Ok(())
     }
 
+    /// Deletes the resume document and this torrent's leftover temp files.
+    ///
+    /// The save lease is taken first, so a concurrent save yields
+    /// [`RemoveError::AlreadySaving`] instead of waiting. A missing document
+    /// or resume directory is a success. The document is removed first; a
+    /// real I/O error is returned and temp files are left alone. A temp file
+    /// that is not a regular file is never touched.
+    ///
+    /// Errors name the document file, never a full path. Callers must treat
+    /// that name as user data and not log it without consent.
+    pub async fn remove(&self, info_hash: InfoHash) -> Result<ResumeRemoval, RemoveError> {
+        let lease = self.acquire(info_hash).ok_or(RemoveError::AlreadySaving)?;
+        let dir = self.dir.clone();
+        let name = self.document_name(&info_hash);
+        tokio::task::spawn_blocking(move || {
+            let result = remove_document(&dir, &name);
+            drop(lease);
+            result
+        })
+        .await
+        .map_err(RemoveError::Task)?
+    }
+
     /// Reserves the save slot for one torrent.
-    fn acquire(&self, info_hash: InfoHash) -> Result<SaveLease, SaveError> {
+    fn acquire(&self, info_hash: InfoHash) -> Option<SaveLease> {
         let mut saving = self.saving.lock().unwrap_or_else(PoisonError::into_inner);
         if !saving.insert(info_hash) {
-            return Err(SaveError::AlreadySaving);
+            return None;
         }
         drop(saving);
 
-        Ok(SaveLease {
+        Some(SaveLease {
             saving: Arc::clone(&self.saving),
             info_hash,
         })
     }
+
+    /// Holds the save slot for one torrent. Test-only.
+    #[cfg(test)]
+    pub(crate) fn hold_save_lease(&self, info_hash: InfoHash) -> SaveLease {
+        self.acquire(info_hash).expect("test save lease")
+    }
 }
 
 /// Holds the save slot until the blocking write finishes or is dropped.
-struct SaveLease {
+pub(crate) struct SaveLease {
     saving: Arc<Mutex<BTreeSet<InfoHash>>>,
     info_hash: InfoHash,
 }
@@ -217,6 +246,35 @@ pub enum SaveError {
     },
     /// The blocking write task was cancelled or panicked.
     #[error("resume save task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+}
+
+/// Outcome of deleting one torrent's resume data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeRemoval {
+    /// `true` when the document itself existed and was deleted.
+    pub document_removed: bool,
+    /// Number of leftover temp files deleted for this torrent.
+    pub temps_removed: usize,
+}
+
+/// Errors returned while removing resume data.
+#[derive(Debug, Error)]
+pub enum RemoveError {
+    /// Another save or removal is already running for this torrent.
+    #[error("a resume save is already running for this torrent")]
+    AlreadySaving,
+    /// The document could not be deleted.
+    #[error("could not remove resume document {name}: {source}")]
+    Remove {
+        /// Document file name, never a full path.
+        name: String,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// The blocking removal task was cancelled or panicked.
+    #[error("resume removal task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
 }
 
@@ -277,6 +335,53 @@ fn write_document(dir: &Path, path: &Path, name: &str, bytes: &[u8]) -> Result<(
     })
 }
 
+/// Deletes the document, then this torrent's temp files.
+fn remove_document(dir: &Path, name: &str) -> Result<ResumeRemoval, RemoveError> {
+    let document_removed = match std::fs::remove_file(dir.join(name)) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(RemoveError::Remove {
+                name: name.to_owned(),
+                source,
+            });
+        }
+    };
+
+    Ok(ResumeRemoval {
+        document_removed,
+        temps_removed: remove_temps(dir, name),
+    })
+}
+
+/// Deletes regular temp files that belong to exactly this document.
+///
+/// Best-effort: removal errors and unreadable entries are ignored, matching
+/// the stale-temp sweep. A symlink or directory with a temp name is skipped.
+fn remove_temps(dir: &Path, document: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+
+    for entry in entries.flatten() {
+        if !is_temp_for(&entry.file_name(), document) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+
+    removed
+}
+
 /// Removes temp files left behind by an interrupted atomic write.
 ///
 /// Only regular files named `<document>.resume.tmp.<pid>.<counter>.<nanos>`
@@ -319,9 +424,25 @@ fn is_resume_temp(name: &OsStr) -> bool {
     let Some((document, suffix)) = name.rsplit_once(".resume.tmp.") else {
         return false;
     };
-    if document.is_empty() {
+    !document.is_empty() && is_temp_suffix(suffix)
+}
+
+/// Returns `true` when `name` is a temp file of exactly `document`.
+fn is_temp_for(name: &OsStr, document: &str) -> bool {
+    let Some(name) = name.to_str() else {
         return false;
-    }
+    };
+    let Some(suffix) = name
+        .strip_prefix(document)
+        .and_then(|rest| rest.strip_prefix(".tmp."))
+    else {
+        return false;
+    };
+    is_temp_suffix(suffix)
+}
+
+/// Returns `true` for the `<pid>.<counter>.<nanos>` part of a temp name.
+fn is_temp_suffix(suffix: &str) -> bool {
     let mut parts = suffix.split('.');
     matches!(
         (parts.next(), parts.next(), parts.next(), parts.next()),

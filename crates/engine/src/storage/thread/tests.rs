@@ -187,6 +187,35 @@ async fn out_of_range_write_is_typed_and_worker_survives() {
 }
 
 #[tokio::test]
+async fn injected_read_failure_is_typed_and_worker_survives() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 8)]);
+    let handle = open(&root, map).await;
+
+    handle
+        .write_range(0, b"abcdefgh".to_vec())
+        .await
+        .expect("write");
+    handle.fail_read_after(1).await.expect("arm read failure");
+
+    assert_eq!(
+        handle.read_range(0, 4).await.expect("first read"),
+        b"abcd".to_vec()
+    );
+    match handle.read_range(4, 4).await {
+        Err(StorageHandleError::Storage(StorageError::PermissionDenied { .. })) => {}
+        other => panic!("expected an injected permission error, got {other:?}"),
+    }
+    assert_eq!(
+        handle.read_range(4, 4).await.expect("read after error"),
+        b"efgh".to_vec()
+    );
+
+    close(handle).await;
+}
+
+#[tokio::test]
 async fn oversized_ranges_are_rejected_before_sending() {
     let dir = temp_dir();
     let root = root_in(&dir);

@@ -253,7 +253,7 @@ Piece assembly belongs to 3c; storage never allocates piece-sized buffers.
 - Per-torrent share: `min(2 * piece_length, 64 MiB)`; at least one piece must
   fit, and metainfo caps `piece_length` at 64 MiB.
 - Enforcement: a byte-counting semaphore. A piece is requested only after its
-  full `piece_length` is reserved. In-flight pieces per torrent:
+  actual piece length is reserved. In-flight pieces per torrent:
   `max(1, share / piece_length)`.
 - When the budget is exhausted, new piece requests wait; blocks already in
   flight are never dropped.
@@ -524,3 +524,46 @@ where the code differs from the design above.
   stack. `bt-engine` enables only the tokio `sync` and `rt` features; `macros`
   and `time` are dev-dependencies. The stripped release `bt-tui` binary stayed
   at 770,856 bytes.
+- **Piece hashing runs above the storage thread.** 3c-2b adds `HashPool`,
+  which computes SHA-1 on `spawn_blocking` with a configurable cap (default 2,
+  `HashPool::with_max_jobs`). The semaphore permit and the whole `PieceBuffer`
+  move into the blocking closure, so cancelling the outer future cannot leak
+  the piece reservation or a job slot; the blocking job drops both when it
+  finishes. An incomplete buffer is rejected before a permit is taken. A hash
+  mismatch returns the sorted, deduplicated `PeerKey` contributors for later
+  statistical blame, drops the bytes, and makes the engine re-request the full
+  piece; no peer is banned at this layer.
+- **`VerifiedPiece` and `StoredPiece` have no public constructors.** Only a
+  successful hash comparison produces a `VerifiedPiece`, and only a complete
+  chunk run produces a `StoredPiece`. The verified piece keeps the piece
+  reservation until the caller drops it, including while it is being written.
+- **Verified writes borrow the piece.** `store_verified(&StorageHandle,
+  &VerifiedPiece)` writes 1 MiB chunks (`MAX_RANGE_LEN`) and returns a typed
+  `WriteError` that names the failed chunk index, absolute offset, and length.
+  A failure leaves the piece unverified but keeps the bytes with the caller, so
+  a disk-full error can be retried after space is freed without re-downloading.
+  Chunk writes are positioned, so storing the same piece twice is harmless. An
+  offset beyond the torrent surfaces as the storage layer's
+  `StorageError::OutOfRange` wrapped in the chunk error, never as a panic.
+  There is still no per-piece fsync.
+- **A cancelled store can leave a prefix on disk.** Dropping `store_verified`
+  midway leaves the chunks already written, and a chunk already enqueued on the
+  worker may still execute (3c-1 contract). Because the caller still owns the
+  piece and the writes are idempotent, a fresh call is safe and rewrites the
+  whole piece.
+- **The 1 MiB chunk copy and the attribution array are outside the budget.**
+  The piece data remains covered by its `PieceReservation`; each chunk adds a
+  transient copy of at most 1 MiB, and the per-block peer array costs
+  `size_of::<Option<PeerKey>>()` per 16 KiB block, at most 64 KiB for a 64 MiB
+  piece. Both are bounded and never sized by peer input, so they are not part
+  of the 128 MiB piece budget (the M1 finding).
+- **Verified bits have one setter.** `Bitfield::set` is private to the bitfield
+  module. `mark_stored(&StoredPiece)` is the only way to set a bit and is
+  synchronous, so no `&mut Bitfield` is held across an await; `from_bytes`
+  restores resume data, and `clear_piece` / `clear` only invalidate. A test
+  drives the pipeline and asserts the bit stays clear after a hash mismatch and
+  after a failed chunk, then becomes set only after a successful retry.
+- **Test hooks are compiled out of release builds.** The hash gate and the
+  injected `DiskFull` write failure exist only under `#[cfg(test)]`; the
+  release `bt-engine` library and `bt-tui` binary were checked for their
+  strings.

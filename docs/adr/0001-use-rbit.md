@@ -1,15 +1,23 @@
 # ADR 0001: Use rbit as the protocol building-block library
 
-- Status: Proposed (dependency not added yet)
+- Status: Deferred — not adopted (revisit at roadmap item 4)
 - Date: 2026-11-22
 - Deciders: project owner
 - Supersedes: none
 - Related: `docs/RBIT_REPORT.md`, `docs/BEP_STATUS.md`
 
+## Status update (2026-11-24)
+
+This decision was not carried out: the dependency was never added. The engine
+implements bencode, v1 metainfo, path mapping, storage, piece verification, and
+resume in-tree, and roadmap item 4 evaluates rbit (or another library) only for
+the tracker and DHT pieces still ahead. No `Cargo.toml` mentions rbit. The
+constraints and checklist below stay valid if item 4 reopens adoption.
+
 ## Context
 
-`AGENTS.md` states that the engine uses `rbit` for building blocks. The engine
-must speak BitTorrent (BEP 3, 23, 15, 12, 9, 10, 5) for v0.1, and writing
+`AGENTS.md` stated at the time that the engine used `rbit` for building
+blocks. The engine must speak BitTorrent (BEP 3, 23, 15, 12, 9, 10, 5) for v0.1, and writing
 bencode, metainfo, peer wire, trackers, and DHT from scratch is weeks of work
 with a high chance of subtle protocol bugs.
 

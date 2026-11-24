@@ -6,9 +6,12 @@ Engine is a library; TUI and GUI talk to it only through `EngineClient`.
 
 ## Workspace layout
 - crates/proto: message types only, no logic, serde derives
-- crates/engine: core logic (uses `rbit` for building blocks)
-- crates/client: EngineClient trait; InProcess and Remote impls
-- crates/daemon: headless binary exposing the API
+- crates/engine: core logic (bencode, metainfo, storage, and piece
+  verification implemented here; `rbit` is not adopted and is evaluated for
+  trackers and DHT at roadmap item 4)
+- crates/client: EngineClient trait; InProcessClient today, Remote planned for
+  v0.2
+- crates/daemon: headless binary exposing the API (scaffold until v0.2)
 - crates/tui: ratatui + crossterm front-end
 - crates/platform: OS-specific code behind cfg
 
@@ -16,7 +19,8 @@ Engine is a library; TUI and GUI talk to it only through `EngineClient`.
 - Never implement protocol details from memory. Read docs/beps/bep_XXXX.md
   first. If the note is missing or unclear, STOP and ask.
 - No `unwrap()`/`expect()` in non-test code. Use `thiserror` errors.
-- No `unsafe` without a comment explaining why and a test.
+- No `unsafe`: every crate inherits `unsafe_code = "forbid"` from the
+  workspace lints.
 - All parsers of network/file input must handle malformed data without
   panicking, and get a fuzz target.
 - TUI/GUI code must not import engine internals; use crates/client only.

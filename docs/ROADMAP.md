@@ -72,7 +72,7 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     recorded in the `FileMap`, never follow links, and never remove directories
     outside the root. Route deletion through the storage worker as a command so
     it runs on the storage thread and cannot race open handles. The API stub
-    currently ignores `delete_files`.
+    currently rejects `delete_files: true` with `NOT_IMPLEMENTED`.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame
@@ -105,6 +105,38 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 
 Done when: real torrent and magnet link download and seed on Windows,
 Linux and macOS, and survive restart.
+
+## Workspace review triage
+
+Recorded 2026-11-24 from the read-only whole-workspace review of `main`
+(`ae62a18`, same tree as `206f2ed`).
+
+Before item 4:
+- [x] Inherit the workspace `[lints]` in every crate so `missing_docs` and
+  `unsafe_code` are enforced by CI's `-D warnings`.
+- [x] Reconcile `AGENTS.md`, `ARCHITECTURE.md`, ADR 0001, ADR 0002, and
+  `BEP_STATUS.md` with the code.
+- [ ] Harden resume saves: a unique temp file per save (pid + process-wide
+  counter + nanosecond timestamp) created with `create_new`, atomic rename,
+  and a sweep of stale `*.resume.tmp.*` older than 24 hours. No cross-process
+  lock file; keep the in-process lease as an efficiency measure and document
+  one daemon per resume directory.
+- [ ] CI: build the fuzz crate and add weekly fuzz and `cargo deny` schedules.
+
+Blocking prerequisites of item 10:
+- [ ] Non-blocking TUI command dispatch: send commands from a task, feed
+  replies back as an `Input` variant, and keep the event loop render-only.
+- [ ] Own the storage worker: `JoinHandle` in `State`, join on shutdown, and a
+  consuming `close(self)` that returns the final sync result.
+- [ ] Session storage pool with a global file-handle budget.
+- [ ] Engine integration test of storage -> verify -> store -> recheck ->
+  resume through the public API.
+- [ ] Client contract test suite parameterized over `EngineClient` impls.
+
+Later:
+- [ ] Narrow and de-duplicate the engine public surface to one export style.
+- [ ] Make `EngineError` codes a checked type.
+- [ ] Windows durability, file-identity, and path-cap tests.
 
 ## v0.2
 BEP 11, 14, 6, 27, 19, 20. Queue, sequential mode, labels, settings file.

@@ -755,18 +755,13 @@ async fn the_next_batch_is_read_while_the_current_batch_hashes() {
         .expect("first hash job entered the gate");
 
     // While the first batch is held in the gate, the second batch must already
-    // be read. Without overlap this stays at four reads.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if storage.read_count().await.expect("read count") >= 8 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the second batch was not read while the first batch hashed"
-        );
-        tokio::task::yield_now().await;
-    }
+    // be read. Without overlap this stays at four reads. The worker signals the
+    // eighth read, so the wait does not poll or depend on wall-clock timing;
+    // the generous timeout only turns a regression into a failure.
+    tokio::time::timeout(std::time::Duration::from_secs(30), storage.await_reads(8))
+        .await
+        .expect("the second batch was not read while the first batch hashed")
+        .expect("read notification");
 
     gate.open();
     let outcome = task.await.expect("task").expect("recheck");

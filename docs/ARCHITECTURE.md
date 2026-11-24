@@ -26,19 +26,22 @@ Modules:
 - Planned: `tracker`, `peer`, `picker`, `choker`, `ratelimit`, `magnet`,
   `dht`, `session`, `settings`.
 
-Threads and tasks: one storage OS thread owns the open-file cache and all
-positioned I/O; async code talks to it through a bounded request queue and
-`StorageHandle`. Piece hashing runs on the blocking pool through a shared
-`HashPool`, never on a runtime worker. A recheck reads 256 KiB chunks and
-hashes 1 MiB batches with an incremental SHA-1 state, overlapping one read
-with one hash. Resume load and save use `spawn_blocking`. The per-torrent
-session tasks, tracker, and peer tasks arrive with items 4-10; the session
-will own one `Rechecker`, one `PieceAssembler`, and one budget handle per
-torrent, plus one shared `HashPool`.
+Threads and tasks: one storage OS thread per `StorageHandle` owns the
+open-file cache and all positioned I/O; async code talks to it through a
+bounded request queue. That is one worker per torrent today; roadmap item 10
+replaces it with one session worker and a global handle budget. Piece hashing
+runs on the blocking pool through a shared `HashPool`, never on a runtime
+worker. A recheck reads 256 KiB chunks and hashes 1 MiB batches with an
+incremental SHA-1 state, overlapping one read with one hash. Resume load and
+save use `spawn_blocking` (bounded, non-cancellable jobs; see ADR 0002). The
+per-torrent session tasks, tracker, and peer tasks arrive with items 4-10;
+the session will own one `Rechecker`, one `PieceAssembler`, and one budget
+handle per torrent, plus one shared `HashPool`.
 
 ## API (proto + client)
-Command in / Event out. InProcess client (channels) and Remote client
-(local socket JSON-RPC). Versioned messages. See skill engine-api-design.
+Command in / Event out. `InProcessClient` (channels) exists today; a Remote
+client over a local socket is planned for v0.2. Versioned messages: a snapshot
+whose `API_VERSION` differs is rejected. See skill engine-api-design.
 
 ## Data on disk
 - Config directory: OS-specific path chosen by the daemon/platform later via
@@ -59,10 +62,12 @@ Command in / Event out. InProcess client (channels) and Remote client
 
 ## Security model
 Untrusted: every byte from peers, trackers, DHT, .torrent files.
-Local API: socket permissions + token; no network binding by default.
+Local API (planned, v0.2): socket permissions + token; no network binding by
+default.
 
 ## Decisions
 See docs/adr/. Record every significant choice (library, protocol, format).
 
 ## Open questions
-- (e.g. which rbit parts to adopt vs replace)
+- rbit adoption is deferred to item 4 (ADR 0001); no other questions are
+  recorded.

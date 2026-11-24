@@ -15,3 +15,6 @@ bt-client.workspace = true
 bt-platform.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -157,7 +157,6 @@ name = "bt-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bt-engine",
  "bt-proto",
  "tokio",
  "tokio-stream",

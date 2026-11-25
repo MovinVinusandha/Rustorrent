@@ -358,10 +358,7 @@ fn the_save_lease_allows_one_save_per_torrent_and_is_released() {
     let store = ResumeStore::new(dir.path().join("resume"));
 
     let lease = store.acquire(info_hash()).expect("first lease");
-    assert!(matches!(
-        store.acquire(info_hash()),
-        Err(SaveError::AlreadySaving)
-    ));
+    assert!(store.acquire(info_hash()).is_none());
 
     let other = store
         .acquire(InfoHash::from_bytes([0x77; 20]))
@@ -507,4 +504,150 @@ fn document_path_is_the_lowercase_hex_info_hash() {
         store.document_path(&info_hash()),
         dir.path().join(format!("{}.resume", "5a".repeat(20)))
     );
+}
+
+#[tokio::test]
+async fn remove_deletes_the_document_and_only_this_torrents_temps() {
+    let dir = TempDir::new().expect("create temp dir");
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume dir");
+    let store = ResumeStore::new(resume_dir.clone());
+    let hash = info_hash();
+    let other = InfoHash::from_bytes([0x77; 20]);
+    let document = store.document_path(&hash);
+    std::fs::write(&document, b"doc").expect("write document");
+    let temp = resume_dir.join(format!("{}.tmp.1.2.3", store.document_name(&hash)));
+    std::fs::write(&temp, b"temp").expect("write temp");
+    let other_temp = resume_dir.join(format!("{}.tmp.1.2.3", store.document_name(&other)));
+    std::fs::write(&other_temp, b"other").expect("write other temp");
+    let unrelated = resume_dir.join("notes.txt");
+    std::fs::write(&unrelated, b"keep").expect("write unrelated file");
+
+    let removal = store.remove(hash).await.expect("remove");
+
+    assert!(removal.document_removed);
+    assert_eq!(removal.temps_removed, 1);
+    assert!(!document.exists());
+    assert!(!temp.exists());
+    assert!(other_temp.exists());
+    assert!(unrelated.exists());
+
+    let second = store.remove(hash).await.expect("second remove");
+    assert!(!second.document_removed);
+    assert_eq!(second.temps_removed, 0);
+}
+
+#[tokio::test]
+async fn remove_reports_a_save_in_progress_without_waiting() {
+    let dir = TempDir::new().expect("create temp dir");
+    let store = ResumeStore::new(dir.path().join("resume"));
+    let lease = store.hold_save_lease(info_hash());
+
+    let error = store
+        .remove(info_hash())
+        .await
+        .expect_err("save is running");
+
+    assert!(matches!(error, RemoveError::AlreadySaving));
+
+    drop(lease);
+    store.remove(info_hash()).await.expect("lease released");
+}
+
+#[tokio::test]
+async fn remove_reports_a_real_io_error_with_the_document_name() {
+    let dir = TempDir::new().expect("create temp dir");
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume dir");
+    let store = ResumeStore::new(resume_dir);
+    let hash = info_hash();
+    std::fs::create_dir(store.document_path(&hash)).expect("directory in place of document");
+
+    let error = store.remove(hash).await.expect_err("must fail");
+
+    match error {
+        RemoveError::Remove { name, .. } => {
+            assert_eq!(name, store.document_name(&hash));
+            assert!(
+                !name.contains('/') && !name.contains('\\'),
+                "the error must name the document, not a path"
+            );
+        }
+        other => panic!("expected an I/O failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remove_does_not_create_a_missing_resume_directory() {
+    let dir = TempDir::new().expect("create temp dir");
+    let resume_dir = dir.path().join("resume");
+    let store = ResumeStore::new(resume_dir.clone());
+
+    let removal = store.remove(info_hash()).await.expect("missing is success");
+
+    assert!(!removal.document_removed);
+    assert_eq!(removal.temps_removed, 0);
+    assert!(!resume_dir.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remove_never_follows_a_symlink_named_like_a_temp() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("create temp dir");
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume dir");
+    let store = ResumeStore::new(resume_dir.clone());
+    let hash = info_hash();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"keep").expect("write target");
+    let link = resume_dir.join(format!("{}.tmp.1.2.3", store.document_name(&hash)));
+    symlink(&target, &link).expect("create symlink");
+
+    let removal = store.remove(hash).await.expect("remove");
+
+    assert!(!removal.document_removed);
+    assert_eq!(removal.temps_removed, 0);
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&target).expect("read target"), b"keep");
+}
+
+#[test]
+fn temp_names_match_only_the_exact_document() {
+    let document = "abc.resume";
+
+    assert!(is_temp_for(OsStr::new("abc.resume.tmp.1.2.3"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume.tmp.1.2"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume.tmp.1.2.3.4"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume.tmp.x.2.3"), document));
+    assert!(!is_temp_for(OsStr::new("xabc.resume.tmp.1.2.3"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume"), document));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remove_unlinks_a_symlinked_document_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("create temp dir");
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume dir");
+    let store = ResumeStore::new(resume_dir);
+    let hash = info_hash();
+    let document = store.document_path(&hash);
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"keep").expect("write target");
+    symlink(&target, &document).expect("create symlink");
+
+    let removal = store.remove(hash).await.expect("remove");
+
+    assert!(removal.document_removed);
+    assert!(std::fs::symlink_metadata(&document).is_err());
+    assert_eq!(std::fs::read(&target).expect("read target"), b"keep");
 }

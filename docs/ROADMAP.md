@@ -7,7 +7,7 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 
 - [ ] 1. proto types and EngineClient trait (bootstrap)
 - [x] 2. Bencode + metainfo parsing, fuzz targets
-- [ ] 3. Storage: file mapping, piece verification, resume data.
+- [x] 3. Storage: file mapping, piece verification, resume data, removal.
   - [x] 3a. Path sanitization and file layout mapping (pure, no I/O).
     Sanitize torrent paths per operating system before creating any file.
     Test at least `..\..\x`, `C:\x`, and `C:x`. Detect case-insensitive and
@@ -65,14 +65,18 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     sample of up to five verified pieces (all of them for small torrents), and
     falls back to a full recheck on a failed sample or an invalid document.
     Missing, corrupt, and mismatched documents never block a torrent, and
-    resume files are not deleted. A future optional mode may trust size/mtime
-    only and skip the sample, trading detection for a faster start; save
-    triggers belong to item 10. See ADR 0002.
-  - [ ] Torrent removal: implement `Remove { delete_files }`. Delete only files
-    recorded in the `FileMap`, never follow links, and never remove directories
-    outside the root. Route deletion through the storage worker as a command so
-    it runs on the storage thread and cannot race open handles. The API stub
-    currently rejects `delete_files: true` with `NOT_IMPLEMENTED`.
+    restore never deletes resume files. A future optional mode may trust
+    size/mtime only and skip the sample, trading detection for a faster start;
+    save triggers belong to item 10. See ADR 0002.
+  - [x] Torrent removal: engine support for `Remove { delete_files }`. Resume
+    data is deleted first, then data through chunked storage-worker commands.
+    Deletion covers only `FileMap` files and the torrent's own empty
+    directories, never follows links, never lists the download directory,
+    never removes the root, and re-checks ancestors plus final identity before
+    every unlink or `remove_dir`. Reports carry relative paths and exact
+    counts, and a partial failure leaves the storage retryable. The in-process
+    API stub still rejects `delete_files: true` with `NOT_IMPLEMENTED` until
+    item 10 wires the session. See ADR 0002 section 8.
 - [ ] 4. Tracker announce (HTTP, then UDP)
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame
@@ -100,6 +104,12 @@ BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     piece stores for it. The session owns exactly one `Rechecker` per torrent;
     each one rejects a second concurrent run with `AlreadyRunning`, and
     resume-data validation (3d) uses the same exclusion.
+  - Must make removal safe by state: stop downloads, peers, rechecks, and
+    resume saves for the torrent, call `removal::remove_torrent` (resume data
+    first, then `StorageHandle::remove_data`), surface the `RemoveOutcome`
+    without logging paths, and only then drop its `StorageHandle` and
+    per-torrent state. The in-process stub's `delete_files: true` rejection is
+    removed here.
 - [ ] 11. TUI: list, add, details, limits
 - [ ] 12. Cross-platform CI green, tag v0.1.0
 
@@ -116,12 +126,12 @@ Before item 4:
   `unsafe_code` are enforced by CI's `-D warnings`.
 - [x] Reconcile `AGENTS.md`, `ARCHITECTURE.md`, ADR 0001, ADR 0002, and
   `BEP_STATUS.md` with the code.
-- [ ] Harden resume saves: a unique temp file per save (pid + process-wide
+- [x] Harden resume saves: a unique temp file per save (pid + process-wide
   counter + nanosecond timestamp) created with `create_new`, atomic rename,
   and a sweep of stale `*.resume.tmp.*` older than 24 hours. No cross-process
   lock file; keep the in-process lease as an efficiency measure and document
   one daemon per resume directory.
-- [ ] CI: build the fuzz crate and add weekly fuzz and `cargo deny` schedules.
+- [x] CI: build the fuzz crate and add weekly fuzz and `cargo deny` schedules.
 
 Blocking prerequisites of item 10:
 - [ ] Non-blocking TUI command dispatch: send commands from a task, feed

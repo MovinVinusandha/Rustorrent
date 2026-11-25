@@ -20,4 +20,4 @@ pub use restore::{
     RestoreError, RestorePlan, SPOT_CHECK_PIECES, ValidationError, plan_restore, validate_document,
 };
 pub use restore_run::{RestoreOutcome, RestoreRunError, RestoreSource};
-pub use save::{ResumeStore, SaveError};
+pub use save::{RemoveError, ResumeRemoval, ResumeStore, SaveError};

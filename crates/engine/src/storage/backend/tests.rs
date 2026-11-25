@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 use super::*;
+use crate::metainfo::{FileInfo, InfoHash, MetaInfo, Mode};
 use crate::storage::layout::MappedFile;
 
 fn temp_dir() -> TempDir {
@@ -56,6 +57,102 @@ fn raw_map(components: &[&str]) -> Arc<FileMap> {
         pieces: 0..0,
     };
     Arc::new(FileMap::from_mapped_files(vec![file], 0, 1, 0))
+}
+
+fn collision_map() -> Arc<FileMap> {
+    let meta = MetaInfo {
+        info_hash: InfoHash::from_bytes([0u8; 20]),
+        name: "top".to_owned(),
+        mode: Mode::Multi,
+        files: vec![
+            FileInfo {
+                path: vec!["top".to_owned(), "A.txt".to_owned()],
+                length: 0,
+            },
+            FileInfo {
+                path: vec!["top".to_owned(), "a.txt".to_owned()],
+                length: 0,
+            },
+        ],
+        total_length: 0,
+        piece_length: 1,
+        piece_hashes: Vec::new(),
+        announce: None,
+        announce_list: Vec::new(),
+        private: false,
+    };
+    Arc::new(FileMap::build(&meta).expect("build collision map"))
+}
+
+/// Builds a storage object without the open-time path validation.
+///
+/// Removal must defend itself even when a caller constructs a hostile
+/// `FileMap` by hand, so these tests bypass `Storage::open`.
+fn open_unchecked(root: &Path, map: Arc<FileMap>) -> Storage {
+    let files = map
+        .files()
+        .iter()
+        .map(|_| PreparedFile {
+            path: root.to_path_buf(),
+            existed: true,
+            id: None,
+        })
+        .collect();
+
+    Storage {
+        root: root.to_path_buf(),
+        map,
+        config: StorageConfig::default(),
+        files,
+        seen_inodes: BTreeSet::new(),
+        handles: HandleCache::new(1).expect("handle cache"),
+        created_dirs: CreatedDirs::default(),
+        removed: false,
+        removal_failed: false,
+        removal_plan: None,
+    }
+}
+
+fn remove_all(storage: &mut Storage) -> RemovalReport {
+    let mut report = RemovalReport::default();
+    let mut start = 0usize;
+
+    loop {
+        let chunk = storage
+            .remove_files(start, REMOVE_CHUNK_ITEMS)
+            .expect("remove chunk");
+        let count = chunk.items.len();
+        for item in chunk.items {
+            report.record(item);
+        }
+
+        if chunk.done {
+            return report;
+        }
+        assert!(count > 0, "a non-final chunk must make progress");
+        start = start.saturating_add(count);
+    }
+}
+
+fn remove_all_dirs(storage: &mut Storage) -> RemovalReport {
+    let mut report = RemovalReport::default();
+    let mut start = 0usize;
+
+    loop {
+        let chunk = storage
+            .remove_directories(start, REMOVE_CHUNK_ITEMS)
+            .expect("remove directory chunk");
+        let count = chunk.items.len();
+        for item in chunk.items {
+            report.record(item);
+        }
+
+        if chunk.done {
+            return report;
+        }
+        assert!(count > 0, "a non-final chunk must make progress");
+        start = start.saturating_add(count);
+    }
 }
 
 fn open(root: &Path, map: Arc<FileMap>) -> Result<Storage, StorageError> {
@@ -516,7 +613,8 @@ fn ensure_parent_dirs_rejects_file_component() {
     let root = root_in(&dir);
     fs::write(root.join("a"), b"x").expect("write file");
 
-    let error = ensure_parent_dirs(&root, &["a".to_owned()]).expect_err("file parent must fail");
+    let error = ensure_parent_dirs(&root, &["a".to_owned()], &mut CreatedDirs::default())
+        .expect_err("file parent must fail");
     assert!(matches!(
         error,
         StorageError::UnsafePath {
@@ -537,7 +635,8 @@ fn ensure_parent_dirs_rejects_symlink() {
     }
 
     let before = snapshot(&outside);
-    let error = ensure_parent_dirs(&root, &["a".to_owned()]).expect_err("symlink parent must fail");
+    let error = ensure_parent_dirs(&root, &["a".to_owned()], &mut CreatedDirs::default())
+        .expect_err("symlink parent must fail");
     assert!(matches!(
         error,
         StorageError::UnsafePath {
@@ -1023,7 +1122,8 @@ fn invalid_component_error_stays_under_root() {
         }
     }
 
-    let error = ensure_parent_dirs(&root, &["..".to_owned()]).expect_err("raw component must fail");
+    let error = ensure_parent_dirs(&root, &["..".to_owned()], &mut CreatedDirs::default())
+        .expect_err("raw component must fail");
     match error {
         StorageError::UnsafePath { path, reason } => {
             assert_eq!(reason, UnsafeReason::InvalidComponent);
@@ -1249,4 +1349,714 @@ fn system_time_ns_handles_pre_epoch_times() {
     let before = SystemTime::UNIX_EPOCH - Duration::from_secs(3_600);
 
     assert_eq!(system_time_ns(before), Some(-3_600_000_000_000));
+}
+
+#[test]
+fn remove_files_deletes_mapped_files_and_reports_relative_paths() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[
+        (&["top", "a"], 3),
+        (&["top", "b"], 0),
+        (&["top", "sub", "c"], 0),
+    ]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"abc").expect("write");
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.removed_count, 3);
+    assert_eq!(report.already_missing_count, 0);
+    assert_eq!(report.failed_count, 0);
+    assert!(!report.truncated);
+    for path in &report.removed {
+        assert!(path.is_relative(), "report path must be relative: {path:?}");
+        assert_ne!(path, Path::new(""));
+    }
+    assert!(report.removed.contains(&PathBuf::from("top/a")));
+    assert!(report.removed.contains(&PathBuf::from("top/b")));
+    assert!(report.removed.contains(&PathBuf::from("top/sub/c")));
+
+    assert!(!root.join("top").join("a").exists());
+    assert!(!root.join("top").join("b").exists());
+    assert!(!root.join("top").join("sub").join("c").exists());
+}
+
+#[test]
+fn remove_files_reports_missing_files_and_is_idempotent() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 0), (&["top", "b"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    fs::remove_file(root.join("top").join("a")).expect("remove one file");
+
+    let first = remove_all(&mut storage);
+    assert_eq!(first.removed_count, 1);
+    assert_eq!(first.already_missing_count, 1);
+    assert_eq!(first.failed_count, 0);
+    assert!(first.already_missing.contains(&PathBuf::from("top/a")));
+
+    let second = remove_all(&mut storage);
+    assert_eq!(second.removed_count, 0);
+    assert_eq!(second.already_missing_count, 2);
+    assert_eq!(second.failed_count, 0);
+    assert!(!root.join("top").join("a").exists());
+    assert!(!root.join("top").join("b").exists());
+}
+
+#[test]
+fn remove_files_rejects_a_final_symlink_without_following_it() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside.txt");
+    fs::write(&outside, b"secret").expect("write outside");
+    let map = map_with(&[(&["top", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    fs::remove_file(root.join("top").join("a")).expect("remove file");
+    if !create_file_symlink(&outside, &root.join("top").join("a")) {
+        return;
+    }
+
+    let before = snapshot(&outside);
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.removed_count, 0);
+    match &report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::Symlink) => {}
+        other => panic!("expected a symlink failure, got {other:?}"),
+    }
+    assert_eq!(report.failed[0].path, PathBuf::from("top/a"));
+    assert_eq!(snapshot(&outside), before);
+    assert!(
+        fs::symlink_metadata(root.join("top").join("a"))
+            .expect("link metadata")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn remove_files_rejects_a_symlinked_ancestor_swapped_after_open() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("victim"), b"keep").expect("write victim");
+    let map = map_with(&[(&["top", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    fs::remove_file(root.join("top").join("a")).expect("remove file");
+    fs::remove_dir(root.join("top")).expect("remove dir");
+    if !create_dir_symlink(&outside, &root.join("top")) {
+        return;
+    }
+
+    let before = snapshot(&outside);
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    match &report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::Symlink) => {}
+        other => panic!("expected a symlink failure, got {other:?}"),
+    }
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn remove_files_rejects_hostile_components_without_joining_them() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("victim"), b"keep").expect("write victim");
+    let before = snapshot(&outside);
+
+    let hostile = Arc::new(FileMap::from_mapped_files(
+        vec![
+            MappedFile {
+                original_path: vec!["..".to_owned(), "victim".to_owned()],
+                disk_components: vec!["..".to_owned(), "victim".to_owned()],
+                length: 0,
+                offset: 0,
+                pieces: 0..0,
+            },
+            MappedFile {
+                original_path: vec![outside.join("victim").to_string_lossy().into_owned()],
+                disk_components: vec![outside.join("victim").to_string_lossy().into_owned()],
+                length: 0,
+                offset: 0,
+                pieces: 0..0,
+            },
+        ],
+        0,
+        1,
+        0,
+    ));
+    let mut storage = open_unchecked(&root, hostile);
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.failed_count, 2);
+    for failure in &report.failed {
+        assert!(failure.path.is_relative(), "path {:?}", failure.path);
+        match failure.error {
+            RemovalError::Unsafe(UnsafeReason::InvalidComponent) => {}
+            ref other => panic!("expected an invalid component, got {other:?}"),
+        }
+    }
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn remove_files_rejects_a_symlinked_directory_from_a_hand_built_map() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("victim"), b"keep").expect("write victim");
+    if !create_dir_symlink(&outside, &root.join("link")) {
+        return;
+    }
+    let before = snapshot(&outside);
+
+    let map = Arc::new(FileMap::from_mapped_files(
+        vec![MappedFile {
+            original_path: vec!["link".to_owned(), "victim".to_owned()],
+            disk_components: vec!["link".to_owned(), "victim".to_owned()],
+            length: 0,
+            offset: 0,
+            pieces: 0..0,
+        }],
+        0,
+        1,
+        0,
+    ));
+    let mut storage = open_unchecked(&root, map);
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    match &report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::Symlink) => {}
+        other => panic!("expected a symlink failure, got {other:?}"),
+    }
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn remove_files_drops_open_and_dirty_handles_before_unlinking() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 1), (&["top", "b"], 1)]);
+    let mut storage = open_with(&root, map, cap_config(1)).expect("open");
+    storage.write_range(0, b"ab").expect("write");
+    assert_eq!(storage.handles.entries.len(), 1);
+    assert!(storage.handles.needs_sync.contains(&0));
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.removed_count, 2);
+    assert_eq!(report.failed_count, 0);
+    assert!(storage.handles.entries.is_empty());
+    assert!(storage.handles.needs_sync.is_empty());
+    assert!(!root.join("top").join("a").exists());
+    assert!(!root.join("top").join("b").exists());
+}
+
+#[test]
+fn remove_files_uses_the_disk_path_for_collision_renames() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = collision_map();
+    let mut storage = open(&root, map).expect("open");
+    assert!(root.join("top").join("A.txt").is_file());
+    assert!(root.join("top").join("a~1.txt").is_file());
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.removed_count, 2);
+    assert!(report.removed.contains(&PathBuf::from("top/A.txt")));
+    assert!(report.removed.contains(&PathBuf::from("top/a~1.txt")));
+    assert!(!root.join("top").join("A.txt").exists());
+    assert!(!root.join("top").join("a~1.txt").exists());
+}
+
+#[test]
+fn remove_files_reports_a_directory_where_a_file_was_mapped() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    fs::remove_file(root.join("top").join("a")).expect("remove file");
+    fs::create_dir(root.join("top").join("a")).expect("create dir");
+    fs::write(root.join("top").join("a").join("user.txt"), b"keep").expect("write user file");
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.removed_count, 0);
+    match &report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::WrongKind) => {}
+        other => panic!("expected a wrong-kind failure, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read(root.join("top").join("a").join("user.txt")).expect("read user file"),
+        b"keep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_files_continues_after_a_permission_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["blocked", "a"], 0), (&["open", "b"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    let blocked = root.join("blocked");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).expect("make read-only");
+
+    let report = remove_all(&mut storage);
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore mode");
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.removed_count, 1);
+    match &report.failed[0].error {
+        RemovalError::PermissionDenied(_) => {}
+        other => panic!("expected a permission failure, got {other:?}"),
+    }
+    assert!(root.join("blocked").join("a").exists());
+    assert!(!root.join("open").join("b").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn remove_files_reports_a_read_only_file_without_clearing_the_attribute() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["blocked", "a"], 0), (&["open", "b"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    let path = root.join("blocked").join("a");
+    let original = fs::metadata(&path).expect("metadata").permissions();
+    let mut permissions = original.clone();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions).expect("make read-only");
+
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.removed_count, 1);
+    match &report.failed[0].error {
+        RemovalError::PermissionDenied(_) => {}
+        other => panic!("expected a permission failure, got {other:?}"),
+    }
+    assert!(path.exists());
+    assert!(
+        fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .readonly()
+    );
+
+    fs::set_permissions(&path, original).expect("restore permissions");
+}
+
+#[test]
+fn removal_report_caps_each_list_but_keeps_exact_counts() {
+    let mut report = RemovalReport::default();
+    let total = MAX_REPORT_PATHS + 1;
+
+    for index in 0..total {
+        report.record(RemovalItemOutcome::Removed(PathBuf::from(format!(
+            "removed-{index}"
+        ))));
+        report.record(RemovalItemOutcome::AlreadyMissing(PathBuf::from(format!(
+            "missing-{index}"
+        ))));
+        report.record(RemovalItemOutcome::NotEmpty(PathBuf::from(format!(
+            "kept-{index}"
+        ))));
+        report.record(RemovalItemOutcome::Failed {
+            path: PathBuf::from(format!("failed-{index}")),
+            error: RemovalError::Io(io::Error::other("test failure")),
+        });
+    }
+
+    assert_eq!(report.removed_count, total);
+    assert_eq!(report.already_missing_count, total);
+    assert_eq!(report.not_empty_count, total);
+    assert_eq!(report.failed_count, total);
+    assert_eq!(report.removed.len(), MAX_REPORT_PATHS);
+    assert_eq!(report.already_missing.len(), MAX_REPORT_PATHS);
+    assert_eq!(report.not_empty.len(), MAX_REPORT_PATHS);
+    assert_eq!(report.failed.len(), MAX_REPORT_PATHS);
+    assert!(report.truncated);
+}
+
+#[test]
+fn remove_directories_removes_created_directories_deepest_first() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[
+        (&["top", "sub", "deep", "a"], 0),
+        (&["top", "other", "b"], 0),
+    ]);
+    let mut storage = open(&root, map).expect("open");
+
+    let files = remove_all(&mut storage);
+    assert_eq!(files.removed_count, 2);
+    assert_eq!(files.failed_count, 0);
+
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.removed_count, 4);
+    assert_eq!(report.already_missing_count, 0);
+    assert_eq!(report.not_empty_count, 0);
+    assert_eq!(report.failed_count, 0);
+    assert!(!report.truncated);
+
+    let position = |path: &str| {
+        report
+            .removed
+            .iter()
+            .position(|entry| entry == &PathBuf::from(path))
+            .expect("removed path is reported")
+    };
+    assert!(position("top/sub/deep") < position("top/sub"));
+    assert!(position("top/sub") < position("top"));
+    assert!(position("top/other") < position("top"));
+    assert!(!root.join("top").exists());
+    assert!(root.exists(), "the download root must never be removed");
+}
+
+#[test]
+fn remove_directories_leaves_a_pre_existing_top_folder() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    fs::create_dir(root.join("top")).expect("create pre-existing top");
+    let map = map_with(&[(&["top", "sub", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+
+    remove_all(&mut storage);
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.removed_count, 1);
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(report.removed, vec![PathBuf::from("top/sub")]);
+    assert!(root.join("top").is_dir(), "pre-existing top must survive");
+    assert!(!root.join("top").join("sub").exists());
+}
+
+#[test]
+fn remove_directories_reports_a_non_empty_directory_as_success() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    remove_all(&mut storage);
+    fs::write(root.join("top").join("user.txt"), b"keep").expect("write user file");
+
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.removed_count, 0);
+    assert_eq!(report.not_empty_count, 1);
+    assert_eq!(report.not_empty, vec![PathBuf::from("top")]);
+    assert_eq!(report.failed_count, 0);
+    assert_eq!(
+        fs::read(root.join("top").join("user.txt")).expect("read user file"),
+        b"keep"
+    );
+}
+
+#[test]
+fn remove_directories_reports_missing_directories_and_is_idempotent() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    remove_all(&mut storage);
+    fs::remove_dir(root.join("top")).expect("remove directory");
+
+    let first = remove_all_dirs(&mut storage);
+    assert_eq!(first.removed_count, 0);
+    assert_eq!(first.already_missing_count, 1);
+    assert_eq!(first.already_missing, vec![PathBuf::from("top")]);
+    assert_eq!(first.failed_count, 0);
+
+    let second = remove_all_dirs(&mut storage);
+    assert_eq!(second.already_missing_count, 1);
+    assert_eq!(second.failed_count, 0);
+}
+
+#[test]
+fn remove_directories_rejects_a_symlinked_directory_swapped_after_open() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(outside.join("victim"), b"keep").expect("write victim");
+    let map = map_with(&[(&["top", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    remove_all(&mut storage);
+    fs::remove_dir(root.join("top")).expect("remove directory");
+    if !create_dir_symlink(&outside, &root.join("top")) {
+        return;
+    }
+
+    let before = snapshot(&outside);
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.removed_count, 0);
+    match &report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::Symlink) => {}
+        other => panic!("expected a symlink failure, got {other:?}"),
+    }
+    assert_eq!(report.failed[0].path, PathBuf::from("top"));
+    assert_eq!(snapshot(&outside), before);
+}
+
+#[test]
+fn remove_directories_reports_a_file_where_a_directory_was_mapped() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "sub", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    remove_all(&mut storage);
+    fs::remove_dir(root.join("top").join("sub")).expect("remove sub directory");
+    fs::write(root.join("top").join("sub"), b"keep").expect("write file in place of dir");
+
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    match &report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::WrongKind) => {}
+        other => panic!("expected a wrong-kind failure, got {other:?}"),
+    }
+    assert_eq!(report.failed[0].path, PathBuf::from("top/sub"));
+    assert_eq!(report.not_empty_count, 1);
+    assert_eq!(report.not_empty, vec![PathBuf::from("top")]);
+    assert_eq!(
+        fs::read(root.join("top").join("sub")).expect("read user file"),
+        b"keep"
+    );
+}
+
+#[test]
+fn remove_directories_rejects_hostile_components_without_joining_them() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let victim = dir.path().join("victim");
+    fs::write(&victim, b"keep").expect("write victim");
+    let before = snapshot(dir.path());
+    let mut storage = open_unchecked(&root, raw_map(&["..", "victim"]));
+
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.failed_count, 1);
+    assert_eq!(report.removed_count, 0);
+    match report.failed[0].error {
+        RemovalError::Unsafe(UnsafeReason::InvalidComponent) => {}
+        ref other => panic!("expected an invalid component, got {other:?}"),
+    }
+    assert!(report.failed[0].path.is_relative());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn remove_directories_falls_back_to_the_structural_layout_after_a_restart() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "sub", "a"], 4)]);
+    let mut storage = open(&root, Arc::clone(&map)).expect("open");
+    storage.write_range(0, b"data").expect("write");
+    remove_all(&mut storage);
+    assert!(root.join("top").join("sub").is_dir());
+    drop(storage);
+
+    let mut storage = open(&root, map).expect("reopen");
+    let report = remove_all_dirs(&mut storage);
+
+    assert_eq!(report.removed_count, 2);
+    assert_eq!(report.failed_count, 0);
+    assert!(report.removed.contains(&PathBuf::from("top/sub")));
+    assert!(report.removed.contains(&PathBuf::from("top")));
+    assert!(!root.join("top").exists());
+}
+
+#[test]
+fn a_completed_removal_rejects_data_operations() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"data").expect("write");
+    storage.begin_removal();
+
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 0);
+    let dirs = remove_all_dirs(&mut storage);
+    assert_eq!(dirs.failed_count, 0);
+    assert!(storage.finish_removal());
+
+    let mut buf = [0u8; 4];
+    assert!(matches!(
+        storage.read_range(0, &mut buf),
+        Err(StorageError::Removed)
+    ));
+    assert!(matches!(
+        storage.write_range(0, b"data"),
+        Err(StorageError::Removed)
+    ));
+    assert!(matches!(
+        storage.observe_files(0, 1),
+        Err(StorageError::Removed)
+    ));
+    assert!(!root.join("top").exists());
+    storage.close().expect("close after removal");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_removal_pass_does_not_mark_the_storage_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["blocked", "a"], 4), (&["open", "b"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"aaaabbbb").expect("write");
+    let blocked = root.join("blocked");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).expect("make read-only");
+
+    storage.begin_removal();
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 1);
+    let dirs = remove_all_dirs(&mut storage);
+    assert_eq!(dirs.failed_count, 0);
+    assert!(!storage.finish_removal());
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore mode");
+    storage
+        .write_range(0, b"data")
+        .expect("a failed pass must leave the storage usable");
+
+    storage.begin_removal();
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 0);
+    let dirs = remove_all_dirs(&mut storage);
+    assert_eq!(dirs.failed_count, 0);
+    assert!(storage.finish_removal());
+    assert!(!root.join("blocked").exists());
+}
+
+#[test]
+fn directory_not_empty_accepts_both_posix_errors() {
+    assert!(directory_not_empty(&io::Error::from(
+        io::ErrorKind::DirectoryNotEmpty
+    )));
+    assert!(directory_not_empty(&io::Error::from(
+        io::ErrorKind::AlreadyExists
+    )));
+    assert!(!directory_not_empty(&io::Error::from(
+        io::ErrorKind::PermissionDenied
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn same_target_requires_the_same_kind_and_inode() {
+    let dir = temp_dir();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    fs::write(&first, b"one").expect("write first");
+    fs::write(&second, b"two").expect("write second");
+    let first_meta = fs::symlink_metadata(&first).expect("first metadata");
+    let second_meta = fs::symlink_metadata(&second).expect("second metadata");
+
+    assert!(same_target(
+        &first_meta,
+        &first_meta,
+        file_id(&first_meta),
+        file_id(&first_meta)
+    ));
+    assert!(!same_target(
+        &first_meta,
+        &second_meta,
+        file_id(&first_meta),
+        file_id(&second_meta)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_file_forgets_its_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"data").expect("write");
+    let metadata = fs::symlink_metadata(root.join("a.bin")).expect("metadata");
+    let id = FileId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    assert!(storage.seen_inodes.contains(&id));
+
+    storage.begin_removal();
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.removed_count, 1);
+    assert!(!storage.seen_inodes.contains(&id));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_failure_keeps_the_storage_usable() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    let map = map_with(&[(&["top", "a"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"data").expect("write");
+
+    storage.begin_removal();
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 0);
+    fs::remove_dir(root.join("top")).expect("remove directory");
+    if !create_dir_symlink(&outside, &root.join("top")) {
+        return;
+    }
+    let dirs = remove_all_dirs(&mut storage);
+
+    assert_eq!(dirs.failed_count, 1);
+    assert!(!storage.finish_removal());
+
+    fs::remove_file(root.join("top")).expect("remove symlink");
+    storage
+        .write_range(0, b"data")
+        .expect("a directory failure must leave the storage usable");
+    assert!(root.join("top").join("a").is_file());
+}
+
+#[test]
+fn tracked_directory_removal_does_not_materialize_the_plan() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "sub", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    remove_all(&mut storage);
+    storage.begin_removal();
+
+    let chunk = storage.remove_directories(0, 1).expect("first chunk");
+
+    assert_eq!(chunk.items.len(), 1);
+    assert!(
+        storage.removal_plan.is_none(),
+        "tracked directories must not be copied into a plan"
+    );
 }

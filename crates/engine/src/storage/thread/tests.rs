@@ -848,3 +848,40 @@ async fn remove_data_keeps_unowned_files_and_still_marks_removed() {
     }
     close(handle).await;
 }
+
+#[tokio::test]
+async fn removal_rejects_an_overlapping_pass_and_releases_the_slot() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "a"], 4)]);
+    let handle = open(&root, map).await;
+    handle
+        .write_range(0, b"data".to_vec())
+        .await
+        .expect("write");
+
+    handle.state.removing.store(true, Ordering::Release);
+    match handle.remove_data().await {
+        Err(StorageHandleError::RemovalInProgress) => {}
+        other => panic!("expected an overlapping-pass rejection, got {other:?}"),
+    }
+    assert!(root.join("top").join("a").is_file());
+    handle.state.removing.store(false, Ordering::Release);
+
+    let report = handle.remove_data().await.expect("removal after release");
+
+    assert_eq!(report.failed_count, 0);
+    assert!(!handle.state.removing.load(Ordering::Acquire));
+    close(handle).await;
+}
+
+#[test]
+fn removal_guard_releases_the_slot_on_drop() {
+    let flag = AtomicBool::new(true);
+
+    {
+        let _guard = RemovalGuard { removing: &flag };
+    }
+
+    assert!(!flag.load(Ordering::Acquire));
+}

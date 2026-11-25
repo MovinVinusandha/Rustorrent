@@ -262,7 +262,7 @@ pub struct ResumeRemoval {
 #[derive(Debug, Error)]
 pub enum RemoveError {
     /// Another save or removal is already running for this torrent.
-    #[error("a resume save is already running for this torrent")]
+    #[error("another resume operation is already running for this torrent")]
     AlreadySaving,
     /// The document could not be deleted.
     #[error("could not remove resume document {name}: {source}")]

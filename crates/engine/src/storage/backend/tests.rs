@@ -95,6 +95,7 @@ fn open_unchecked(root: &Path, map: Arc<FileMap>) -> Storage {
         .map(|_| PreparedFile {
             path: root.to_path_buf(),
             existed: true,
+            id: None,
         })
         .collect();
 
@@ -1949,4 +1950,114 @@ fn a_failed_removal_pass_does_not_mark_the_storage_removed() {
     assert_eq!(dirs.failed_count, 0);
     assert!(storage.finish_removal());
     assert!(!root.join("blocked").exists());
+}
+
+#[test]
+fn directory_not_empty_accepts_both_posix_errors() {
+    assert!(directory_not_empty(&io::Error::from(
+        io::ErrorKind::DirectoryNotEmpty
+    )));
+    assert!(directory_not_empty(&io::Error::from(
+        io::ErrorKind::AlreadyExists
+    )));
+    assert!(!directory_not_empty(&io::Error::from(
+        io::ErrorKind::PermissionDenied
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn same_target_requires_the_same_kind_and_inode() {
+    let dir = temp_dir();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    fs::write(&first, b"one").expect("write first");
+    fs::write(&second, b"two").expect("write second");
+    let first_meta = fs::symlink_metadata(&first).expect("first metadata");
+    let second_meta = fs::symlink_metadata(&second).expect("second metadata");
+
+    assert!(same_target(
+        &first_meta,
+        &first_meta,
+        file_id(&first_meta),
+        file_id(&first_meta)
+    ));
+    assert!(!same_target(
+        &first_meta,
+        &second_meta,
+        file_id(&first_meta),
+        file_id(&second_meta)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_file_forgets_its_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["a.bin"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"data").expect("write");
+    let metadata = fs::symlink_metadata(root.join("a.bin")).expect("metadata");
+    let id = FileId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    assert!(storage.seen_inodes.contains(&id));
+
+    storage.begin_removal();
+    let report = remove_all(&mut storage);
+
+    assert_eq!(report.removed_count, 1);
+    assert!(!storage.seen_inodes.contains(&id));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_failure_keeps_the_storage_usable() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).expect("create outside");
+    let map = map_with(&[(&["top", "a"], 4)]);
+    let mut storage = open(&root, map).expect("open");
+    storage.write_range(0, b"data").expect("write");
+
+    storage.begin_removal();
+    let files = remove_all(&mut storage);
+    assert_eq!(files.failed_count, 0);
+    fs::remove_dir(root.join("top")).expect("remove directory");
+    if !create_dir_symlink(&outside, &root.join("top")) {
+        return;
+    }
+    let dirs = remove_all_dirs(&mut storage);
+
+    assert_eq!(dirs.failed_count, 1);
+    assert!(!storage.finish_removal());
+
+    fs::remove_file(root.join("top")).expect("remove symlink");
+    storage
+        .write_range(0, b"data")
+        .expect("a directory failure must leave the storage usable");
+    assert!(root.join("top").join("a").is_file());
+}
+
+#[test]
+fn tracked_directory_removal_does_not_materialize_the_plan() {
+    let dir = temp_dir();
+    let root = root_in(&dir);
+    let map = map_with(&[(&["top", "sub", "a"], 0)]);
+    let mut storage = open(&root, map).expect("open");
+    remove_all(&mut storage);
+    storage.begin_removal();
+
+    let chunk = storage.remove_directories(0, 1).expect("first chunk");
+
+    assert_eq!(chunk.items.len(), 1);
+    assert!(
+        storage.removal_plan.is_none(),
+        "tracked directories must not be copied into a plan"
+    );
 }

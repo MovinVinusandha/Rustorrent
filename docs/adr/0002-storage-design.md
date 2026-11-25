@@ -390,7 +390,12 @@ e
   attempts data removal and reports both outcomes, because the data files are
   the user-visible payload and a stale document is validated against the
   layout and ignored. `AlreadySaving` is different: a save is still writing the
-  document, so the data phase is skipped and the caller can retry.
+  document, so the data phase is skipped and the caller can retry. Only one
+  data-removal pass runs per storage; an overlapping call fails with
+  `RemovalInProgress` and deletes nothing. The save lease covers the document
+  deletion only; because the caller stops saves, a save that starts before the
+  data phase can only write a document that the next restore rejects once the
+  layout changes.
 - **What may be deleted.** Only files recorded in the `FileMap` and
   directories derived from it are candidates. The engine never lists the
   download directory, never uses `remove_dir_all`, never removes the download
@@ -411,15 +416,19 @@ e
 - **Handles and pending syncs.** The cached handle for a file is dropped before
   its path is unlinked, and a pending `needs_sync` entry for it is discarded.
   If the removal then fails and the file is still present, the pending flag is
-  restored so a later `sync` still flushes it.
-- **Directories bottom-up.** Directory removal is planned deepest first, one
-  `remove_dir` at a time. A non-empty directory is kept and reported as
-  `not_empty`, which counts as success: files the client did not create are
-  never deleted. The plan uses directories this `Storage` instance created.
-  After a restart the creation record is gone, so removal falls back to the
-  torrent's own top-level folder and its subfolders. A pre-existing top-level
-  folder is therefore offered only while it is empty; anything inside it is
-  kept.
+  restored so a later `sync` still flushes it. A file that is removed or found
+  missing also leaves the duplicate-inode set, so a later lazy recreate cannot
+  collide with its old identity.
+- **Directories bottom-up.** Directory removal runs one `remove_dir` at a
+  time, always a child before its parent. A non-empty directory is kept and
+  reported as `not_empty`, which counts as success: files the client did not
+  create are never deleted. POSIX may report a non-empty directory as
+  `ENOTEMPTY` or `EEXIST`; both count as `not_empty`. The plan uses directories
+  this `Storage` instance created, iterated in reverse lexicographic order, so
+  no second copy is materialized. After a restart the creation record is gone,
+  so removal falls back to the torrent's own top-level folder and its
+  subfolders, collected once. A pre-existing top-level folder is therefore
+  offered only while it is empty; anything inside it is kept.
 - **Idempotence.** A missing file or directory is `already_missing`, and a
   second removal succeeds without touching anything. Every item gets its own
   result, a failure never stops the rest of the pass, and the pass runs in
@@ -503,6 +512,12 @@ Out of scope for v0.1:
 - **Unicode normalization is not applied.** An NFC/NFD pair can alias on macOS;
   on Unix the inode check reports it as a typed error, and case folding is
   `str::to_lowercase`.
+- **Structural removal planning is proportional to directory count.** After a
+  restart the creation record is empty, so removal collects every directory
+  prefix from the `FileMap` once. A torrent with an extreme number of deep
+  paths can allocate a large plan on the storage thread. The client stub does
+  not expose removal yet; item 10 must set a session-level file and directory
+  limit before wiring untrusted torrents.
 
 ## Consequences
 
@@ -742,12 +757,15 @@ where the code differs from the design above.
 - **Removal is a chunked worker pass.** `BeginRemoval`, `RemoveFiles`,
   `RemoveDirectories`, and `FinishRemoval` are worker commands; one pass sends
   at most 256 items per command. Only `FinishRemoval` marks the storage
-  removed, and only when no item failed. The directory plan is cached for one
-  pass and rebuilt on retry.
+  removed, and only when no item failed. A shared flag rejects an overlapping
+  pass with `RemovalInProgress`, and its guard releases the slot if the caller
+  drops the future.
 - **Directory ownership is recorded during creation.** `ensure_parent_dirs`
   records a directory only when its own `create_dir` succeeds; a concurrent
-  creator that wins the race is not owned. After a restart the set is empty and
-  removal falls back to the structural plan, which still requires every
+  creator that wins the race is not owned. Tracked directories are removed in
+  reverse lexicographic order, which puts every child before its parent without
+  copying the set. After a restart the set is empty and removal falls back to
+  the structural plan, which is collected once and still requires every
   directory to be empty.
 - **Removal state lives in `Storage`.** `removed`, `removal_failed`, and the
   cached plan are storage fields, so a fresh `Storage` starts clean. Reads,

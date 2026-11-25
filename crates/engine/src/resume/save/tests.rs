@@ -617,3 +617,37 @@ async fn remove_never_follows_a_symlink_named_like_a_temp() {
     );
     assert_eq!(std::fs::read(&target).expect("read target"), b"keep");
 }
+
+#[test]
+fn temp_names_match_only_the_exact_document() {
+    let document = "abc.resume";
+
+    assert!(is_temp_for(OsStr::new("abc.resume.tmp.1.2.3"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume.tmp.1.2"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume.tmp.1.2.3.4"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume.tmp.x.2.3"), document));
+    assert!(!is_temp_for(OsStr::new("xabc.resume.tmp.1.2.3"), document));
+    assert!(!is_temp_for(OsStr::new("abc.resume"), document));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remove_unlinks_a_symlinked_document_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().expect("create temp dir");
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).expect("create resume dir");
+    let store = ResumeStore::new(resume_dir);
+    let hash = info_hash();
+    let document = store.document_path(&hash);
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"keep").expect("write target");
+    symlink(&target, &document).expect("create symlink");
+
+    let removal = store.remove(hash).await.expect("remove");
+
+    assert!(removal.document_removed);
+    assert!(std::fs::symlink_metadata(&document).is_err());
+    assert_eq!(std::fs::read(&target).expect("read target"), b"keep");
+}

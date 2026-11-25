@@ -283,24 +283,24 @@ impl Storage {
 
         for file in map.files() {
             let path = resolve_file_path(root, file)?;
-            let existed = match fs::symlink_metadata(&path) {
+            let (existed, id) = match fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     check_file(&path, &metadata)?;
                     record_inode(&path, &metadata, &mut seen_inodes)?;
-                    true
+                    (true, file_id(&metadata))
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None),
                 Err(source) => return Err(classify(&path, source)),
             };
 
-            files.push(PreparedFile { path, existed });
+            files.push(PreparedFile { path, existed, id });
         }
 
         prepare_files(
             root,
             map.as_ref(),
             &config,
-            &files,
+            &mut files,
             &mut seen_inodes,
             &mut created_dirs,
         )?;
@@ -654,28 +654,51 @@ impl Storage {
 
     /// Removes one chunk of directories left by a torrent.
     ///
-    /// Only directories this storage instance created are offered, deepest
-    /// first. After a restart, when ownership is unknown, the torrent's own
-    /// top-level folder and its subfolders are offered instead. A non-empty
-    /// directory is kept and reported as a success, so files this client did
-    /// not create are never touched.
+    /// Only directories this storage instance created are offered, always a
+    /// child before its parent. After a restart, when ownership is unknown, the
+    /// torrent's own top-level folder and its subfolders are offered instead. A
+    /// non-empty directory is kept and reported as a success, so files this
+    /// client did not create are never touched.
+    ///
+    /// Tracked directories are iterated from the creation set in reverse
+    /// lexicographic order, which puts every child before its parent without
+    /// materializing a second copy of the plan. The structural fallback is the
+    /// only case that needs a collected plan.
     pub(crate) fn remove_directories(
         &mut self,
         start: usize,
         count: usize,
     ) -> Result<RemovalChunk, StorageError> {
-        if self.removal_plan.is_none() {
-            let plan = self.build_removal_directory_plan();
-            self.removal_plan = Some(plan);
+        if self.created_dirs.is_empty() && self.removal_plan.is_none() {
+            self.removal_plan = Some(self.build_structural_directory_plan());
         }
-        let total = self.removal_plan.as_ref().map_or(0, Vec::len);
+        let total = if self.created_dirs.is_empty() {
+            self.removal_plan.as_ref().map_or(0, Vec::len)
+        } else {
+            self.created_dirs.names().len()
+        };
         let begin = start.min(total);
         let end = begin.saturating_add(count).min(total);
         let mut items = Vec::with_capacity(end.saturating_sub(begin));
         let mut failed = false;
 
-        if let Some(plan) = self.removal_plan.as_ref() {
-            for components in &plan[begin..end] {
+        if self.created_dirs.is_empty() {
+            if let Some(plan) = self.removal_plan.as_ref() {
+                for components in &plan[begin..end] {
+                    let item = self.remove_directory_item(components);
+                    failed |= item.is_failure();
+                    items.push(item);
+                }
+            }
+        } else {
+            for components in self
+                .created_dirs
+                .names()
+                .iter()
+                .rev()
+                .skip(begin)
+                .take(end.saturating_sub(begin))
+            {
                 let item = self.remove_directory_item(components);
                 failed |= item.is_failure();
                 items.push(item);
@@ -691,23 +714,20 @@ impl Storage {
         })
     }
 
-    /// Lists the directories removal may try, deepest first.
-    fn build_removal_directory_plan(&self) -> Vec<Vec<String>> {
+    /// Lists the structural directories removal may try, children first.
+    ///
+    /// Used after a restart, when no directory was tracked. Reverse
+    /// lexicographic order places every descendant before its ancestors.
+    fn build_structural_directory_plan(&self) -> Vec<Vec<String>> {
         let mut dirs = BTreeSet::new();
 
-        if self.created_dirs.is_empty() {
-            for file in self.map.files() {
-                for len in 1..file.disk_components.len() {
-                    dirs.insert(file.disk_components[..len].to_vec());
-                }
+        for file in self.map.files() {
+            for len in 1..file.disk_components.len() {
+                dirs.insert(file.disk_components[..len].to_vec());
             }
-        } else {
-            dirs.extend(self.created_dirs.names().iter().cloned());
         }
 
-        let mut plan: Vec<Vec<String>> = dirs.into_iter().collect();
-        plan.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        plan
+        dirs.into_iter().rev().collect()
     }
 
     /// Removes one directory after re-validating its ancestors and target.
@@ -797,9 +817,7 @@ impl Storage {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 RemovalItemOutcome::AlreadyMissing(report_path)
             }
-            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
-                RemovalItemOutcome::NotEmpty(report_path)
-            }
+            Err(error) if directory_not_empty(&error) => RemovalItemOutcome::NotEmpty(report_path),
             Err(source) => RemovalItemOutcome::Failed {
                 path: report_path,
                 error: removal_error(classify(&path, source)),
@@ -834,6 +852,7 @@ impl Storage {
         let before = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.forget_file_id(index);
                 self.handles.remove_index(index);
                 return RemovalItemOutcome::AlreadyMissing(report_path);
             }
@@ -856,7 +875,10 @@ impl Storage {
 
         match check_ancestors(&self.root, &file.disk_components) {
             Ok(true) => {}
-            Ok(false) => return RemovalItemOutcome::AlreadyMissing(report_path),
+            Ok(false) => {
+                self.forget_file_id(index);
+                return RemovalItemOutcome::AlreadyMissing(report_path);
+            }
             Err(error) => {
                 self.restore_pending(index, &path, pending);
                 return RemovalItemOutcome::Failed {
@@ -869,6 +891,7 @@ impl Storage {
         let after = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.forget_file_id(index);
                 return RemovalItemOutcome::AlreadyMissing(report_path);
             }
             Err(source) => {
@@ -895,8 +918,12 @@ impl Storage {
         }
 
         match fs::remove_file(&path) {
-            Ok(()) => RemovalItemOutcome::Removed(report_path),
+            Ok(()) => {
+                self.forget_file_id(index);
+                RemovalItemOutcome::Removed(report_path)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.forget_file_id(index);
                 RemovalItemOutcome::AlreadyMissing(report_path)
             }
             Err(source) => {
@@ -963,19 +990,23 @@ impl Storage {
                 &mapped.disk_components[..parent_count],
                 &mut self.created_dirs,
             )?;
-            return ensure_file(
+            let id = ensure_file(
                 &path,
                 mapped.length,
                 false,
                 self.config.preallocation,
                 &mut self.seen_inodes,
-            );
+            )?;
+            self.record_file_id(index, id);
+            return Ok(id);
         }
 
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 check_file(&path, &metadata)?;
-                Ok(file_id(&metadata))
+                let id = file_id(&metadata);
+                self.record_file_id(index, id);
+                Ok(id)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 ensure_parent_dirs(
@@ -983,15 +1014,31 @@ impl Storage {
                     &mapped.disk_components[..parent_count],
                     &mut self.created_dirs,
                 )?;
-                ensure_file(
+                let id = ensure_file(
                     &path,
                     mapped.length,
                     false,
                     self.config.preallocation,
                     &mut self.seen_inodes,
-                )
+                )?;
+                self.record_file_id(index, id);
+                Ok(id)
             }
             Err(source) => Err(classify(&path, source)),
+        }
+    }
+
+    /// Stores the identity of the file at `index` after an open or create.
+    fn record_file_id(&mut self, index: usize, id: Option<FileId>) {
+        if let Some(file) = self.files.get_mut(index) {
+            file.id = id;
+        }
+    }
+
+    /// Forgets the identity of a file that no longer exists.
+    fn forget_file_id(&mut self, index: usize) {
+        if let Some(id) = self.files.get_mut(index).and_then(|file| file.id.take()) {
+            self.seen_inodes.remove(&id);
         }
     }
 }
@@ -1353,11 +1400,12 @@ where
     Ok(())
 }
 
-/// A resolved file path and whether it existed before creation.
+/// A resolved file path, whether it existed before creation, and its inode.
 #[derive(Debug)]
 struct PreparedFile {
     path: PathBuf,
     existed: bool,
+    id: Option<FileId>,
 }
 
 /// Creates the paths required by the preallocation policy.
@@ -1365,11 +1413,11 @@ fn prepare_files(
     root: &Path,
     map: &FileMap,
     config: &StorageConfig,
-    files: &[PreparedFile],
+    files: &mut [PreparedFile],
     seen_inodes: &mut BTreeSet<FileId>,
     created_dirs: &mut CreatedDirs,
 ) -> Result<(), StorageError> {
-    for (file, prepared) in map.files().iter().zip(files) {
+    for (file, prepared) in map.files().iter().zip(files.iter_mut()) {
         let needed = file.length == 0 || config.preallocation == Preallocation::SetLen;
         if !needed {
             continue;
@@ -1377,7 +1425,7 @@ fn prepare_files(
 
         let parent_count = file.disk_components.len().saturating_sub(1);
         ensure_parent_dirs(root, &file.disk_components[..parent_count], created_dirs)?;
-        let _ = ensure_file(
+        prepared.id = ensure_file(
             &prepared.path,
             file.length,
             prepared.existed,
@@ -1599,6 +1647,17 @@ fn resolve_file_path(root: &Path, file: &MappedFile) -> Result<PathBuf, StorageE
     }
 
     Ok(path)
+}
+
+/// Returns `true` when `remove_dir` failed because the directory is not empty.
+///
+/// POSIX permits `rmdir` to report a non-empty directory as either `ENOTEMPTY`
+/// or `EEXIST`; Rust maps the latter to `AlreadyExists`.
+fn directory_not_empty(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+    )
 }
 
 /// Rejects links and non-directories.

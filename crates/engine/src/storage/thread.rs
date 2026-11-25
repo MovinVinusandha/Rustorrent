@@ -66,6 +66,9 @@ pub enum StorageHandleError {
         /// Maximum accepted length.
         max: usize,
     },
+    /// Another removal pass is already running on this storage.
+    #[error("a removal pass is already running on this storage")]
+    RemovalInProgress,
     /// The worker thread could not be spawned.
     #[error("could not spawn the storage thread")]
     Spawn(#[source] std::io::Error),
@@ -92,8 +95,20 @@ pub struct StorageHandle {
 
 struct State {
     shutting_down: AtomicBool,
+    removing: AtomicBool,
     #[cfg(test)]
     exit: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+/// Releases the removal slot when a pass ends, including on cancellation.
+struct RemovalGuard<'a> {
+    removing: &'a AtomicBool,
+}
+
+impl Drop for RemovalGuard<'_> {
+    fn drop(&mut self) {
+        self.removing.store(false, Ordering::Release);
+    }
 }
 
 impl StorageHandle {
@@ -131,6 +146,7 @@ impl StorageHandle {
                 tx,
                 state: Arc::new(State {
                     shutting_down: AtomicBool::new(false),
+                    removing: AtomicBool::new(false),
                     #[cfg(test)]
                     exit: Mutex::new(Some(exit_rx)),
                 }),
@@ -220,11 +236,25 @@ impl StorageHandle {
     ///
     /// The caller must stop downloads, rechecks, and resume saves for this
     /// torrent first; requests from other clones are interleaved with the
-    /// removal commands.
+    /// removal commands. Only one removal pass runs at a time: an overlapping
+    /// call returns [`StorageHandleError::RemovalInProgress`] without deleting
+    /// anything.
     ///
     /// The report contains paths relative to the download root. Callers must
     /// treat file names as user data and not log them without consent.
     pub async fn remove_data(&self) -> Result<RemovalReport, StorageHandleError> {
+        if self
+            .state
+            .removing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(StorageHandleError::RemovalInProgress);
+        }
+        let _guard = RemovalGuard {
+            removing: &self.state.removing,
+        };
+
         self.send(|reply| Command::BeginRemoval { reply }).await?;
         let mut report = RemovalReport::default();
 

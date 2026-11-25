@@ -1638,7 +1638,8 @@ fn remove_files_reports_a_read_only_file_without_clearing_the_attribute() {
     let map = map_with(&[(&["blocked", "a"], 0), (&["open", "b"], 0)]);
     let mut storage = open(&root, map).expect("open");
     let path = root.join("blocked").join("a");
-    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+    let original = fs::metadata(&path).expect("metadata").permissions();
+    let mut permissions = original.clone();
     permissions.set_readonly(true);
     fs::set_permissions(&path, permissions).expect("make read-only");
 
@@ -1658,9 +1659,7 @@ fn remove_files_reports_a_read_only_file_without_clearing_the_attribute() {
             .readonly()
     );
 
-    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-    permissions.set_readonly(false);
-    fs::set_permissions(&path, permissions).expect("restore permissions");
+    fs::set_permissions(&path, original).expect("restore permissions");
 }
 
 #[test]

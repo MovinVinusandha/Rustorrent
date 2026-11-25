@@ -454,6 +454,9 @@ e
 - **Windows read-only files.** A read-only file makes deletion fail with a
   permission error; the report returns `RemovalError::PermissionDenied` and the
   attribute is never cleared automatically. The user can change it and retry.
+  Removal checks the attribute itself before unlinking, because
+  `std::fs::remove_file` retries with POSIX delete semantics and would
+  otherwise remove a read-only file without clearing the attribute.
 
 ### 9. Dependencies
 

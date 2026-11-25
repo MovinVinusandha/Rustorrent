@@ -916,6 +916,16 @@ impl Storage {
                 error: RemovalError::Unsafe(UnsafeReason::Changed),
             };
         }
+        if read_only_target(&after) {
+            self.restore_pending(index, &path, pending);
+            return RemovalItemOutcome::Failed {
+                path: report_path,
+                error: RemovalError::PermissionDenied(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the file is read-only",
+                )),
+            };
+        }
 
         match fs::remove_file(&path) {
             Ok(()) => {
@@ -1274,6 +1284,24 @@ fn same_target(
     before.file_type().is_file() == after.file_type().is_file()
         && before.file_type().is_dir() == after.file_type().is_dir()
         && before_id == after_id
+}
+
+/// Returns `true` when a file must not be unlinked because it is read-only.
+///
+/// Windows only. `std::fs::remove_file` retries with POSIX delete semantics and
+/// `FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE`, which would delete a
+/// read-only file without clearing the attribute. Removal keeps the documented
+/// refusal, so a file the user protected is never deleted and the result does
+/// not depend on the Windows version or Rust release.
+#[cfg(windows)]
+fn read_only_target(metadata: &fs::Metadata) -> bool {
+    metadata.permissions().readonly()
+}
+
+/// Returns `false` on platforms where a read-only file has no special meaning.
+#[cfg(not(windows))]
+fn read_only_target(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 /// Converts a storage error into a reportable removal error.

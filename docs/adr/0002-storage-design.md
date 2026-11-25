@@ -425,9 +425,10 @@ e
   create are never deleted. POSIX may report a non-empty directory as
   `ENOTEMPTY` or `EEXIST`; both count as `not_empty`. The plan uses directories
   this `Storage` instance created, iterated in reverse lexicographic order, so
-  no second copy is materialized. After a restart the creation record is gone,
-  so removal falls back to the torrent's own top-level folder and its
-  subfolders, collected once. A pre-existing top-level folder is therefore
+  no second copy is materialized. When the creation record is empty (after a
+  restart, or before any directory was created), removal falls back to the
+  torrent's own top-level folder and its subfolders, collected once. A
+  pre-existing top-level folder is therefore
   offered only while it is empty; anything inside it is kept.
 - **Idempotence.** A missing file or directory is `already_missing`, and a
   second removal succeeds without touching anything. Every item gets its own
@@ -512,12 +513,13 @@ Out of scope for v0.1:
 - **Unicode normalization is not applied.** An NFC/NFD pair can alias on macOS;
   on Unix the inode check reports it as a typed error, and case folding is
   `str::to_lowercase`.
-- **Structural removal planning is proportional to directory count.** After a
-  restart the creation record is empty, so removal collects every directory
-  prefix from the `FileMap` once. A torrent with an extreme number of deep
-  paths can allocate a large plan on the storage thread. The client stub does
-  not expose removal yet; item 10 must set a session-level file and directory
-  limit before wiring untrusted torrents.
+- **Structural removal planning is proportional to directory count.** When the
+  creation record is empty (after a restart, or before any directory was
+  created), removal collects every directory prefix from the `FileMap` once. A
+  torrent with an extreme number of deep paths can allocate a large plan on
+  the storage thread. The client stub does not expose removal yet; item 10
+  must set a session-level file and directory limit before wiring untrusted
+  torrents.
 
 ## Consequences
 
@@ -764,9 +766,9 @@ where the code differs from the design above.
   records a directory only when its own `create_dir` succeeds; a concurrent
   creator that wins the race is not owned. Tracked directories are removed in
   reverse lexicographic order, which puts every child before its parent without
-  copying the set. After a restart the set is empty and removal falls back to
-  the structural plan, which is collected once and still requires every
-  directory to be empty.
+  copying the set. When the set is empty (after a restart, or before any
+  directory was created), removal falls back to the structural plan, which is
+  collected once and still requires every directory to be empty.
 - **Removal state lives in `Storage`.** `removed`, `removal_failed`, and the
   cached plan are storage fields, so a fresh `Storage` starts clean. Reads,
   writes, and observes check `removed`; `sync` becomes a no-op so shutdown can

@@ -3,7 +3,7 @@
 Status key: [ ] todo, [~] in progress, [x] done.
 
 ## v0.1: engine + API + TUI (first release)
-BEPs: 3, 7, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
+BEPs: 3, 7, 23, 15, 12, 27 (tracker rules), 9, 10, 5. See BEP_STATUS.md.
 
 - [ ] 1. proto types and EngineClient trait (bootstrap)
 - [x] 2. Bencode + metainfo parsing, fuzz targets
@@ -81,8 +81,7 @@ BEPs: 3, 7, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
   - [ ] 4a. URL parser, redaction types, peer decoding, response envelope.
   - [ ] 4b. UDP transport (BEP 15).
   - [ ] 4c. Announce state machine (BEP 12/27, backoff).
-  - The `deny.toml` prerequisite PR for the `webpki-roots` license lands
-    before 4d.
+  - The `deny.toml`-only PR for the `webpki-roots` license lands before 4d.
   - [ ] 4d. HTTP transport, then the `https` feature.
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame

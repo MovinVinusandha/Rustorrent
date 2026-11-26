@@ -55,9 +55,11 @@ full document.
   checked IP; SNI is sent only for DNS hostnames, and certificate verification
   uses the hostname or the IP SAN. Every redirect is re-checked.
 - Redaction: `Debug`/`Display` show only `scheme://host[:port]/…`; path,
-  query and fragment stay hidden. Redirect `Location`, `tracker id`,
-  `failure reason` and `warning message` are sanitized (controls stripped,
-  256-byte cap) before any log or UI. Logs keep a length, not the text.
+  query and fragment stay hidden. Logs and errors never contain
+  tracker-supplied text: they keep only a length and a classification. The UI
+  may show `failure reason` and `warning message` after best-effort
+  sanitization (controls stripped, 256-byte cap, URL tokens of at least 4
+  bytes replaced); `tracker id` is suppressed.
 - Tiers: BEP 12 for public torrents (shuffle once, try all trackers in a tier,
   move a success to the front; 32 URLs, 8 tiers, 4 per tier). Private
   torrents use one active tracker and switch only on failure (BEP 27).
@@ -396,17 +398,21 @@ Production constructs the connector from `webpki-roots` alone; this is how the
   bencode decoder is used with its depth limit; no length prefix can allocate
   beyond the body.
 - The body must be a bencode dictionary. `failure reason` is checked first and
-  produces `TrackerError::Rejected`. `warning message` is stored as a
-  sanitized message. `interval` and `min interval` are integers in seconds;
-  missing `interval` means 1800. The effective interval is
-  `clamp(max(interval, min_interval), 60, 86400)`. `complete` and `incomplete`
-  are optional non-negative counters. `tracker id` is an optional byte string
-  capped at 256 bytes and kept per tracker for HTTP announces. Both tracker
-  strings are sanitized before they can reach a log or the UI: UTF-8 lossy,
-  control characters stripped, 256-byte cap, and passkey-like substrings of
-  the tracker URL replaced with `<redacted>` (section 9). The tracker ID is
-  opaque: it is echoed only to the tracker that issued it, is never logged,
-  and its `Debug` form prints only its length.
+  produces `TrackerError::Rejected { message: TrackerMessage }`. `warning
+  message` is stored as a `TrackerMessage`. `interval` and `min interval` are
+  integers in seconds; missing `interval` means 1800. The effective interval
+  is `clamp(max(interval, min_interval), 60, 86400)`. `complete` and
+  `incomplete` are optional non-negative counters. `tracker id` is an optional
+  `TrackerId` capped at 256 bytes and kept per tracker for HTTP announces.
+- `TrackerMessage` stores the tracker bytes and exposes
+  `sanitized_text(&TrackerUrl)` for the UI. Sanitization is best-effort:
+  UTF-8 lossy, control characters stripped, 256-byte cap, and every path
+  segment, query name, query value and fragment of the announce URL of at
+  least 4 bytes replaced with `<redacted>` (section 9). `Debug` and `Display`
+  print only the length; logs and errors record only a length and a
+  classification, never the text.
+- `TrackerId` is opaque: it is echoed only to the tracker that issued it, is
+  never displayed, and its `Debug` and `Display` forms print only its length.
 - Unknown keys are ignored. `peers` and `peers6` are decoded per the BEP 23
   and BEP 7 notes.
 - The `Content-Type` header is ignored; trackers frequently send
@@ -580,8 +586,8 @@ keep it off outside tests and self-hosting.
 - `numwant`: 50 for `started`, `completed` and periodic announces; 0 for
   `stopped`.
 - `compact=1` on every HTTP announce. UDP has no such parameter.
-- `trackerid` is sent only to the HTTP tracker that returned it, and is
-  dropped when the active tracker changes.
+- `trackerid` is stored as a `TrackerId`, sent only to the HTTP tracker that
+  returned it, and is dropped when the active tracker changes.
 - `ip`, `ipv4` and `ipv6` parameters are never sent. The UDP IP field is 0.
 - `event` is `started` on the first announce, `completed` once when the
   download finishes, `stopped` on pause, removal or shutdown, and omitted
@@ -605,7 +611,7 @@ Per torrent, the state is:
 - `pending_event: Option<AnnounceEvent>`;
 - `consecutive_failures: u32`;
 - `completed_sent: bool`;
-- `tracker_id: Option<Vec<u8>>`;
+- `tracker_id: Option<TrackerId>`;
 - `last_interval: Duration`.
 
 ### Schedule
@@ -724,24 +730,36 @@ Redaction keeps `scheme://host[:port]` and replaces the rest:
   passkey in a redirect target is redacted the same way. A malformed
   `Location` never reaches a log or error raw; it becomes the fixed
   placeholder.
-- Tracker `failure reason` and `warning message` are sanitized separately:
-  UTF-8 lossy conversion, control characters stripped, 256-byte cap, and any
-  occurrence of the raw URL, its raw path, its query values (any length), and
-  its path segments of 8 bytes or more replaced with `<redacted>`. Both go
-  through the same helper; neither is special-cased. The sanitized text may
-  be shown to the user, but logs record only a length and a fixed "tracker
-  message" field, never the text.
-- `tracker id` is opaque bytes and is never displayed. It is capped at 256
-  bytes, sent back only to the tracker that issued it, and its `Debug` form
-  prints only its length. It is percent-encoded byte by byte when echoed.
+- Tracker `failure reason` and `warning message` are stored as
+  `TrackerMessage`. Sanitization is best-effort: UTF-8 lossy conversion,
+  control characters stripped, 256-byte cap, and the announce URL tokenized
+  into path segments, query names, query values and fragment. Every token of
+  at least 4 bytes is replaced with `<redacted>`, case-insensitively and after
+  percent-decoding. Tokens shorter than 4 bytes are not replaced; this is a
+  documented limit. The sanitized text may be shown in the UI through
+  `sanitized_text()`; logs and errors record only a length and a
+  classification.
+- `TrackerId` is a newtype over the opaque bytes. It is never displayed, is
+  capped at 256 bytes, is sent back only to the tracker that issued it, and
+  its `Debug` and `Display` forms print only its length. It is percent-encoded
+  byte by byte when echoed.
+- `TrackerMessage` `Debug` and `Display` also print only the length; the UI
+  must call `sanitized_text()` explicitly. This keeps a stray `?error` or
+  `?response` in a log from printing tracker text.
+- A log or error "classification" is a fixed label such as `rejected`,
+  `warning` or `malformed`; it is never derived from tracker text.
 - Tests cover a passkey in the query, a passkey in the path, userinfo, IPv6,
   default and non-default ports, uppercase scheme and host, a fragment,
   malformed inputs, and a 4096-byte URL. Each test asserts that the secret
   substring is absent from `Debug`, `Display`, and every error string. Further
   tests cover a `Location` with a passkey, a `failure reason` that echoes the
-  URL, a `warning message` with control characters, and a `tracker id` that
-  contains a passkey: none of the raw bytes may appear in a log line, an
-  error, or the status snapshot.
+  URL, a `warning message` with control characters, a `tracker id` that
+  contains a passkey, a path segment of 3 and 4 bytes, a fragment passkey, a
+  percent-encoded echo, a passkey in the HTTP reason phrase, and a UDP error
+  packet that echoes the URL: none of the raw bytes may appear in a log line,
+  an error, or the status snapshot. The `Debug` and `Display` of
+  `AnnounceRequest`, `AnnounceResponse`, `TrackerId` and `TrackerMessage` are
+  formatted in each test.
 
 ## 10. Trait boundary and types
 
@@ -773,13 +791,17 @@ Types (engine-internal, `crates/engine/src/tracker`):
 
 - `AnnounceRequest { url: TrackerUrl, info_hash: InfoHash, peer_id: PeerId,
   port: u16, stats: AnnounceStats, event: AnnounceEvent, num_want: i32,
-  key: u32, tracker_id: Option<Vec<u8>>, redirect: RedirectPolicy }`
+  key: u32, tracker_id: Option<TrackerId>, redirect: RedirectPolicy }`
 - `AnnounceStats { uploaded: u64, downloaded: u64, left: u64 }`
 - `AnnounceEvent { None, Started, Completed, Stopped }`
 - `RedirectPolicy { Public, SameHostOnly }`
 - `AnnounceResponse { interval: Duration, min_interval: Option<Duration>,
   complete: Option<u64>, incomplete: Option<u64>, peers: Vec<SocketAddr>,
-  tracker_id: Option<Vec<u8>>, warning: Option<TrackerMessage> }`
+  tracker_id: Option<TrackerId>, warning: Option<TrackerMessage> }`
+- `TrackerId`: opaque bytes capped at 256; `Debug` and `Display` print only
+  the length.
+- `TrackerMessage`: tracker-supplied bytes plus `sanitized_text(&TrackerUrl)`
+  for the UI; `Debug` and `Display` print only the length.
 - `TrackerError`: `InvalidUrl`, `UnsupportedScheme`, `Dns`, `BlockedTarget`,
   `Connect`, `Tls`, `Timeout`, `HttpStatus(u16)`, `MalformedResponse`,
   `Rejected { message: TrackerMessage }`, `TooLarge`, `Redirect`,
@@ -789,15 +811,18 @@ Types (engine-internal, `crates/engine/src/tracker`):
 - `TrackerStatus`: redacted active URL, last success, next announce, last
   interval, consecutive failures, peer count, last warning flag.
 
-`thiserror` derives the error type; `Display` never contains a raw URL or raw
-tracker message. All parsing returns `Result`, no `unwrap` or `expect` outside
-tests.
+`thiserror` derives the error type; `Display` never contains a raw URL or
+tracker-supplied text. All parsing returns `Result`, no `unwrap` or `expect`
+outside tests.
 
 ## 11. Testing and fuzzing
 
 ### Unit
 
-- URL parser and redaction tables, including malformed inputs.
+- URL parser and redaction tables, including malformed inputs. Tests format
+  `Debug` and `Display` of `TrackerUrl`, `AnnounceRequest`, `AnnounceResponse`,
+  `TrackerId` and `TrackerMessage`, and cover a path segment of 3 and 4 bytes,
+  a fragment passkey, and a percent-encoded echo.
 - BEP 23 and BEP 7 peer decoding vectors, partial records, invalid
   addresses, dedup and caps.
 - HTTP head/body parser vectors: Content-Length, chunked (including a chunk
@@ -862,9 +887,11 @@ tests.
   test, not by the deterministic suite.
 - End-to-end: a metainfo with two tiers, a private torrent, a tracker switch,
   and a session loop that asserts peer churn and event order.
-- Log capture: a failure reason, a warning message, a `Location` and a
-  `tracker id` containing the passkey must not appear in any formatted log
-  line, error, or status snapshot.
+- Log capture: a failure reason, a warning message, a `Location`, a
+  `tracker id`, a passkey in the HTTP reason phrase, and a UDP error packet
+  that echoes the URL must not appear in any formatted log line, error, or
+  status snapshot. Logs record only a length and a classification, never the
+  tracker text.
 
 ### Fuzz
 
@@ -913,8 +940,8 @@ Risks and mitigations:
   the name; re-check on every redirect.
 - Tracker outage: exponential backoff with jitter, and tier backups for
   public torrents.
-- Log leaks: redacted `Debug`/`Display`, sanitized tracker messages, and a
-  log-capture test.
+- Log leaks: length/classification-only logs and errors, sanitized UI text,
+  and a log-capture test.
 - Root store drift: prefer compiled-in roots; document the fallback.
 
 ## 13. Alternatives considered
@@ -987,8 +1014,9 @@ merged before any network code exists. Its commits are:
 3. `feat(tracker): decode compact and list peers` - BEP 23, BEP 7 `peers6`,
    caps, dedup, address filtering, unit tests.
 4. `feat(tracker): decode tracker response envelope` - `failure reason`,
-   interval, counters, `tracker id`, warning sanitization, bounded bencode,
-   `tracker_http_response` fuzz target.
+   interval, counters, `TrackerId`, `TrackerMessage`, warning sanitization,
+   length-only diagnostics, bounded bencode, `tracker_http_response` fuzz
+   target.
 
 Exit criteria for branch 1: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`,

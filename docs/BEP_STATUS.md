@@ -6,7 +6,8 @@ stays unverified.
 
 | BEP | Name | Target | Status | rbit | Module | Tests | Notes |
 |---|---|---|---|---|---|---|---|
-| 3 | Core protocol | v0.1 | in-progress | verify | bencode, metainfo, bitfield, storage, piece, resume | unit + fuzz | bencode, v1 metainfo, layout, verification/write, streaming recheck, and version 1 resume save/restore done; tracker and peer wire are not implemented. Fuzz targets compile in CI and run weekly. Gaps: `.utf-8` keys and legacy text encodings (v0.2) |
+| 3 | Core protocol | v0.1 | in-progress | verify | bencode, metainfo, bitfield, storage, piece, resume | unit + fuzz | bencode, v1 metainfo, layout, verification/write, streaming recheck, and version 1 resume save/restore done; tracker and peer wire are not implemented. Fuzz targets compile in CI and run weekly. Gaps: `.utf-8` keys and legacy text encodings (v0.2). Tracker HTTP fields are described in `docs/beps/bep_0003_tracker.md` |
+| 7 | IPv6 tracker | v0.1 | planned | verify | | | `key` and `peers6` decoding; no dual-family or multi-homed announce |
 | 23 | Compact peers | v0.1 | planned | verify | | | |
 | 15 | UDP tracker | v0.1 | planned | verify | | | |
 | 12 | Multi-tracker | v0.1 | planned | verify | | | |
@@ -16,7 +17,7 @@ stays unverified.
 | 11 | PEX | v0.2 | planned | verify | | | |
 | 14 | LSD | v0.2 | planned | verify | | | |
 | 6 | Fast extension | v0.2 | planned | verify | | | |
-| 27 | Private torrents | v0.2 | planned | n/a | | | `private` flag parsed; no DHT/PEX/LSD yet |
+| 27 | Private torrents | v0.2 | planned | n/a | | | `private` flag, tracker-only policy, single active tracker and no cross-host redirects land in v0.1; DHT/PEX/LSD/web-seed enforcement lands with those components |
 | 19 | Web seeds | v0.2 | planned | verify | | | |
 | 20 | Peer ID conventions | v0.2 | planned | n/a | | | |
 | 42 | DHT security ext. | v0.3 | planned | verify | | | |

@@ -29,7 +29,9 @@ Engine is a library; TUI and GUI talk to it only through `EngineClient`.
 - Do not hardcode paths; use `directories`/platform crate.
 
 ## Workflow
-1. Read this file and the relevant skill (`skill` tool) before coding.
+1. Read this file and the relevant skill (`skill` tool) before coding. For a
+   long ADR (over ~400 lines), read its "Decisions summary" first and open the
+   full text only for the details you need. ADR 0002 and ADR 0003 have one.
 2. Write a failing test first, then implement.
 3. Before finishing, run:
    cargo fmt --all

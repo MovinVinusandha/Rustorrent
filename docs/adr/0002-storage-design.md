@@ -7,6 +7,72 @@
 - Related: `docs/ROADMAP.md` item 3, `.opencode/skills/storage-io/SKILL.md`,
   `docs/beps/bep_0003.md`
 
+## Decisions summary
+
+Read this section first; the rest of the ADR holds the rules, threat model and
+implementation notes. It is kept short so a session can load the decisions
+without the full document.
+
+- Sanitization: one algorithm on every platform. Metainfo parsing rejects bad
+  components; layout mapping re-validates and repairs (`_` for empty, `.`,
+  `..`, separators, controls and Windows-forbidden characters; `_` prefix for
+  reserved device names; trailing dots and spaces replaced; components over
+  255 bytes truncated with `~` plus 8 hex chars). Total, deterministic and
+  idempotent.
+- Layout: `FileMap` is built once from `MetaInfo`, immutable and shared as an
+  `Arc`. `MappedFile` keeps original and sanitized components, length, stream
+  offset, and first/last piece. `segments(Range)` and `files_for_piece` drive
+  positioned I/O. The collision key is the lowercased joined sanitized path;
+  collisions get `~N` before the extension, resolved in torrent order.
+- Limits: the relative path is capped at 1024 bytes; `piece_length` must be
+  non-zero and the piece count exact; total length may not overflow. All
+  violations are typed `LayoutError`s, never panics.
+- Root safety: the download root may be a symlink and is opened once; all
+  paths are relative; `canonicalize` is not used; every ancestor is re-checked
+  with `symlink_metadata` before every open, and on Unix the opened handle's
+  `(dev, ino)` must match. Symlinks, reparse points and wrong-kind components
+  are typed errors.
+- Threads: one dedicated `std::thread` per session, a bounded
+  `mpsc::channel(64)`, oneshot replies, and commands `Open`, `WritePiece`,
+  `ReadPiece`, `Recheck`, `Sync`, `Shutdown`. The thread owns every handle;
+  hashing stays on `spawn_blocking`.
+- Handles: LRU cap 64 per session, peak `cap + 1`; preallocation is off by
+  default; no per-piece fsync. `sync_data` runs on pause, stop and graceful
+  shutdown, and before every resume write. Disk full stops writing and keeps
+  the verified bits.
+- Memory: global piece budget 128 MiB, per torrent
+  `min(2 * piece_length, 64 MiB)`, enforced by a byte semaphore. A stalled
+  piece releases its reservation after a timeout. Only verified bytes reach
+  storage.
+- Resume: version 1 canonical bencode in an explicit directory, named
+  `<info-hash>.resume`, written atomically through a unique temp plus
+  `sync_all`, rename and parent sync, capped at 16 MiB. Run one daemon per
+  directory. Fields: bitfield, per-file length/observed size/mtime,
+  info-hash, layout hash, piece count/length, total length, updated-at and
+  version. No absolute paths.
+- Restore: validate version, hashes, counts and the exact bitfield; a per-file
+  size or mtime mismatch clears the covered pieces; 5 pieces are spot-checked
+  and a failed sample triggers a full recheck. A structural mismatch ignores
+  the document and rechecks readable pieces. Resume data is never deleted.
+- Removal: resume first, then data when requested; only mapped files and
+  derived directories; never the download root, never `remove_dir_all`, never
+  follow a link. Directories are removed bottom-up and a non-empty directory
+  counts as success. Work runs in 256-item chunks, is idempotent, and a clean
+  pass marks the storage removed.
+- Threat model: malicious torrent paths, peers/trackers, corrupt resume data
+  and existing symlinks are in scope. An attacker who can already write to the
+  download tree (TOCTOU, planted hard links) is out of scope for v0.1.
+- Known limits: hard links are accepted; NFC and NFD are not unified (a macOS
+  alias is caught by the inode check); case folding is `str::to_lowercase`;
+  one storage thread serializes I/O across torrents; there is no per-piece
+  durability; and removal planning can be large for extreme directory counts.
+- Dependencies: no `unicode-normalization` (+121.4 KiB, above the 50 KiB
+  budget); `proptest` is a dev-dependency only; the layout uses `std` only.
+- Alternatives: Windows-only sanitization, rejecting collisions,
+  `tokio::fs` per file, `canonicalize`, `openat`/reparse handles, writing
+  before verification and per-piece fsync are rejected for the reasons in the
+  ADR.
+
 ## Context
 
 Metainfo parsing (roadmap item 2) is done: the engine can turn a `.torrent`

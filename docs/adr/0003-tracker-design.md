@@ -101,7 +101,7 @@ Constraints from `AGENTS.md` and the skills:
 - one concern per commit, small diffs.
 
 ADR 0001 deferred the rbit decision to item 4. This ADR covers the tracker
-part of that decision; DHT remains a separate item 5 decision.
+part of that decision; DHT remains a separate item 9 decision.
 
 Current release sizes for reference (Linux x86_64, workspace release profile):
 `bt-daemon` 415,576 bytes and `bt-tui` 772,456 bytes.
@@ -216,7 +216,7 @@ specifies.
 ### Recommendation
 
 Implement in-tree. Reject rbit for tracker announce. Do not close ADR 0001
-globally: DHT at item 5 may still evaluate rbit, and that decision should use
+globally: DHT at item 9 may still evaluate rbit, and that decision should use
 its own measurements.
 
 ## 2. Scope per release
@@ -228,7 +228,7 @@ its own measurements.
   and rejects `https` URLs.
 - Public torrents with BEP 12 tiers and private torrents with BEP 27 rules.
 - The private flag and its tracker rules (one active tracker, same-host
-  redirect, peer drop on switch). DHT (item 5), PEX, LSD and web seeds must
+  redirect, peer drop on switch). DHT (item 9), PEX, LSD and web seeds must
   enforce the flag when they land.
 - BEP 23 compact and list peers, BEP 7 `peers6` and `key`.
 - Events `started`, `completed`, `stopped`; periodic announces; exponential
@@ -665,7 +665,7 @@ Per torrent, the state is:
 
 ### Public torrents (BEP 12)
 
-BEP 12 requires the `announce-list` tier format and says a client that
+BEP 12 defines the `announce-list` tier format and says a client that
 understands it ignores `announce` when the list is present. The ordering,
 caps, shuffle, merge, tier-0 reset and backoff below are our policy; the
 `announce` fallback is a documented deviation.
@@ -716,7 +716,7 @@ backoff below are our policy.
 - Before the first announce to a new tracker, drop every peer connection and
   every peer candidate learned from the old tracker. Downloaded pieces and
   verified progress are kept.
-- v0.1 delivers the private flag and the tracker rules above. DHT (item 5),
+- v0.1 delivers the private flag and the tracker rules above. DHT (item 9),
   PEX, LSD and web seeds are separate components; when each lands, it must
   consult the session-level guard and refuse to run for a private torrent. The
   guard is enforced at the session level, not only by not starting the

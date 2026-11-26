@@ -61,12 +61,16 @@ full document.
   sanitization (controls stripped, 256-byte cap, URL tokens of at least 4
   bytes replaced); `tracker id` is suppressed.
 - Tiers: BEP 12 for public torrents (shuffle once, try all trackers in a tier,
-  move a success to the front; 32 URLs, 8 tiers, 4 per tier). Private
-  torrents use one active tracker and switch only on failure (BEP 27).
+  move a success to the front; 32 URLs, 8 tiers, 4 per tier; every round
+  starts at tier 0). `announce-list` is used when it has at least one valid
+  URL, otherwise `announce`; this is a documented deviation from BEP 12.
+  Private torrents use one active tracker and switch only on failure (BEP 27).
 - State: `started`, `completed`, `stopped`; interval clamped to 60..86400 s;
-  exponential backoff with jitter; one in-flight announce per torrent.
-- Boundary: engine-internal `TrackerTransport` with boxed futures; the client
-  sees only a `TrackerStatus` snapshot.
+  saturating exponential backoff with a capped exponent and jitter; one
+  in-flight announce per torrent.
+- Boundary: engine-internal `TrackerTransport` with boxed futures; `bt-client`
+  defines its own `TrackerStatus` and maps from the engine snapshot. A
+  versioned `bt-proto` type is planned for v0.2.
 - Tests: unit vectors, local HTTP/UDP/TLS trackers, paused-time UDP tests
   (including the 51 s reconnect and the 105 s deadline), log-capture tests, and
   fuzz targets `tracker_url`, `tracker_http_response`,
@@ -115,17 +119,20 @@ Current release sizes for reference (Linux x86_64, workspace release profile):
    approved; otherwise the OS root store through `rustls-native-certs`.
 4. The default target policy allows public addresses only. Loopback, private
    and link-local targets require `TrackerConfig::allow_private_targets`.
-5. Public torrents use the BEP 12 tier rules; private torrents use one active
-   tracker and switch only on failure, per BEP 27.
+5. Public torrents use the BEP 12 tier rules, with `announce` as a fallback
+   when `announce-list` has no URL that passes validation (a documented
+   deviation from BEP 12). Private torrents use one active tracker and switch
+   only on failure, per BEP 27.
 6. Announce responses are decoded from both compact and list peer formats
    (BEP 23) and from `peers6` (BEP 7). UDP is compact by construction.
 7. The tracker exposes a small engine-internal state machine and an
    object-safe `TrackerTransport` trait with boxed futures, so tests can
    replace the network with a scripted fake.
 8. Identity uses placeholder constants: peer ID `-BA0100-` plus 12 random
-   bytes, and user agent `bt-app/0.1`. `BA` is not a registered client code.
-   We do not impersonate another client; a private tracker that whitelists
-   client IDs may refuse this one.
+   bytes, and user agent `bt-app/0.1`. `BA` appears in neither BEP 20's
+   known-client table nor its unidentified list, and is not another client's
+   code. We do not impersonate another client; a private tracker that
+   whitelists client IDs may refuse this one.
 
 ## 1. In-tree implementation versus rbit
 
@@ -171,8 +178,8 @@ configuration.
 
 ### Reading the numbers
 
-- The tracker logic without TLS is cheap: +54 KiB for UDP, +71 KiB for HTTP,
-  +90 KiB for both. This is the part we would write either way.
+- The tracker logic without TLS is cheap: +54 KB for UDP, +71 KB for HTTP,
+  +90 KB for both. This is the part we would write either way.
 - TLS dominates. Adding ring to the HTTP + UDP build costs 968,160 bytes;
   aws-lc costs 1,720,088. The full in-tree tracker is 1,456,488 bytes, about
   3.5 times the current daemon, and the delta over the current daemon is
@@ -220,6 +227,9 @@ its own measurements.
   UDP announce per BEP 15. A `--no-default-features` build keeps HTTP and UDP
   and rejects `https` URLs.
 - Public torrents with BEP 12 tiers and private torrents with BEP 27 rules.
+- The private flag and its tracker rules (one active tracker, same-host
+  redirect, peer drop on switch). DHT (item 5), PEX, LSD and web seeds must
+  enforce the flag when they land.
 - BEP 23 compact and list peers, BEP 7 `peers6` and `key`.
 - Events `started`, `completed`, `stopped`; periodic announces; exponential
   backoff after a failed round.
@@ -443,8 +453,8 @@ Production constructs the connector from `webpki-roots` alone; this is how the
 - Every hop is parsed, resolved, policy-checked and connected from scratch.
   No connection, DNS result or TLS session is reused across hops.
 - Userinfo in a redirect target is rejected, not silently stripped.
-- The total announce budget is 60 seconds across all hops; each hop has 30
-  seconds for DNS, connect, TLS, request and response.
+- The total HTTP announce budget is 60 seconds across all hops; each hop has
+  30 seconds for DNS, connect, TLS, request and response.
 
 ### Timeouts
 
@@ -454,8 +464,13 @@ Production constructs the connector from `webpki-roots` alone; this is how the
 | Connect | 10 seconds, inside the hop budget |
 | TLS handshake | 10 seconds, inside the hop budget |
 | One hop (DNS + connect + TLS + request + response) | 30 seconds |
-| Whole announce including redirects | 60 seconds |
+| Whole HTTP announce including redirects | 60 seconds |
+| DNS permit wait | 2 seconds, then `Dns` |
 | Stopped announce | 2 seconds total, no retries |
+
+These are transport deadlines. The state machine has no outer announce
+timeout; each transport owns its own budget, so the 60-second HTTP budget
+never cuts a UDP attempt and the 105-second UDP deadline never cuts HTTP.
 
 ## 5. UDP behaviour
 
@@ -477,6 +492,8 @@ Summary of the decisions:
   the announce. 50 s is our decision; BEP 15 allows use until 60 s after
   receipt, and a tracker silently ignores an expired ID. The new ID is used
   once the connect response arrives.
+- `num_want` is 50 for a normal announce and 0 for `stopped`, matching the
+  HTTP `numwant` rule.
 - Receive buffer 4096 bytes; 200 peers per response; 6-byte stride on IPv4
   and 18-byte stride on IPv6, selected by the socket family.
 - Transaction IDs are 32 bits from OS randomness, fresh for each connect and
@@ -505,6 +522,8 @@ the resolver returns and to every redirect target.
 | `::/128` | unspecified |
 | `::ffff:0:0/96` | IPv4-mapped IPv6, to avoid check bypass |
 | `2002::/16`, `64:ff9b::/96` | IPv4-embedded transition forms, to avoid check bypass |
+| `2001::/32` | Teredo |
+| `64:ff9b:1::/48` | local-use NAT64 |
 | `192.0.0.0/24` | IETF protocol assignments |
 | `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32` | documentation |
 | `198.18.0.0/15` | benchmarking |
@@ -525,7 +544,8 @@ The setting is for tests and self-hosted trackers. It does not unblock
 multicast, broadcast, unspecified, documentation, benchmarking, IETF
 assignments, transition forms or IPv4-mapped forms. Transition forms are
 blocked rather than translated, so an IPv6-only host with NAT64 can reach
-native IPv6 trackers but not IPv4 trackers through the well-known prefix. A
+native IPv6 trackers but not IPv4 trackers through the well-known or local-use
+prefix. A
 private tracker on a LAN uses a private address and requires the setting.
 Enabling it in a daemon that loads untrusted torrents lets a tracker reach
 loopback and LAN services, including cloud metadata at `169.254.169.254`;
@@ -550,11 +570,15 @@ keep it off outside tests and self-hosting.
   sent; `ServerName::IpAddress` is used and the certificate must contain a
   matching IP SAN. Connecting to the IP without this would verify the wrong
   name.
-- Resolution uses `tokio::net::lookup_host`, which runs the system resolver on
-  tokio's blocking pool. The caller wraps it in the 5-second timeout. Dropping
-  the future does not cancel the blocking call, so a hung resolver keeps one
-  blocking thread until it returns; the one-announce-per-torrent rule and the
-  per-hop budget bound how many lookups can be outstanding.
+- Resolution runs the system resolver on tokio's blocking pool through
+  `spawn_blocking` with `ToSocketAddrs`, not `lookup_host`, so the semaphore
+  permit can move into the blocking closure. A process-wide semaphore of 8
+  permits bounds concurrent lookups. The permit is acquired before the call
+  and released only when the blocking call returns, even if the announce
+  future was dropped; a hung resolver can therefore hold at most 8 blocking
+  threads. Waiting for a permit has a 2-second queue timeout, after which the
+  announce fails with `Dns`. The 5-second lookup timeout starts after the
+  permit is acquired. Dropping the future does not cancel the blocking call.
 - An IP-literal URL is parsed and checked directly, with no DNS.
 - Hostnames are ASCII only: no IDNA, no Unicode. Labels are LDH, at most 63
   bytes, total at most 253 bytes, one trailing dot allowed and stripped.
@@ -629,19 +653,34 @@ Per torrent, the state is:
 - A successful announce sets `next_announce = now + effective_interval` and
   resets `consecutive_failures`.
 - A failed round sets
-  `next_announce = now + min(30 * 2^(failures-1), 1800)` seconds, with ±20%
-  jitter. The first retry is about 30 seconds, then 60, 120, 240, 480, 960,
-  and 1800 at the cap. Jitter avoids a thundering herd after a tracker
-  outage.
+  `next_announce = now + min(30 * 2^min(failures - 1, 6), 1800)` seconds,
+  with ±20% jitter. The failure count uses saturating addition and the
+  exponent is capped at 6, so `u32::MAX` failures still produce the
+  1800-second cap and cannot overflow. The first retry is about 30 seconds,
+  then 60, 120, 240, 480, 960, and 1800 at the cap. Jitter avoids a
+  thundering herd after a tracker outage.
 - The interval is clamped to 60..86400 seconds, and `min interval` can only
   raise it. An interval of 0 or a negative value is treated as missing and
   becomes 1800.
 
 ### Public torrents (BEP 12)
 
+BEP 12 requires the `announce-list` tier format and says a client that
+understands it ignores `announce` when the list is present. The ordering,
+caps, shuffle, merge, tier-0 reset and backoff below are our policy; the
+`announce` fallback is a documented deviation.
+
+- `announce-list` is used when it contains at least one URL that passes
+  `TrackerUrl` validation, even if other entries are unusable. If it contains
+  no usable URL, the single `announce` URL is used as a one-tracker list if
+  it passes the same validation; otherwise there is no usable tracker.
+  `announce` is never merged into a usable `announce-list`. This deviates from
+  BEP 12's "ignore `announce`" rule on purpose: the BEP assumes a well-formed
+  list, and the fallback keeps a torrent with a damaged list usable. The BEP 12
+  note records the same rule.
 - One shuffle at load with OS randomness; the order is stable for the
   session. Tests inject a fixed order.
-- Start at the last tier that succeeded, or tier 0 if none ever did.
+- Every announce round starts at tier 0.
 - Within a tier, try trackers sequentially in order, up to 4 per tier. Every
   tracker in the tier is attempted even after one succeeds; the peer lists of
   all successes in that tier are merged, deduplicated, and capped at 200 new
@@ -650,33 +689,48 @@ Per torrent, the state is:
   backups and are not contacted in that round.
 - Move the first successful tracker in the tier to the front, keeping the
   relative order of the rest. Failed trackers stay in place and are retried
-  next round.
+  next round. A success resets nothing else: the rest of the candidate order
+  and the active tracker are unchanged.
 - If every tracker in every tier fails, the round fails and the backoff
-  applies. The next round starts at the last successful tier, or tier 0.
+  applies. The next round starts at tier 0.
 - Caps: 32 URLs, 8 tiers, 4 per tier. Duplicate normalized URLs are removed;
-  invalid schemes, empty hosts and bad ports are dropped with counters.
-- If no usable URL remains, the torrent has no tracker and the session gets a
-  typed error; no request is made.
+  invalid schemes, empty hosts and bad ports are dropped with counters. The
+  caps are applied at parse time, before any private flattening.
+- If no usable URL remains, the torrent has no tracker and the session gets
+  `TrackerError::NoUsableTracker`; no request is made.
 
 ### Private torrents (BEP 27)
 
+BEP 27 requires the `private=1` flag, that only the private tracker is used,
+that one tracker is active at a time and switched only on failure, and that
+peer connections are dropped on a switch. It also says DHT, PEX and LSD would
+subvert that access control. The ordering, redirect rule, web-seed rule and
+backoff below are our policy.
+
 - Flatten the tiers into one ordered list, shuffle once, and keep exactly one
-  active tracker.
+  active tracker. The 32-URL, 8-tier and 4-per-tier caps are applied at parse
+  time before flattening, so the flattened list holds at most 32 URLs.
 - The active tracker is used until it fails. On failure, the next candidate
   becomes active immediately; only after every candidate has failed does the
   round back off.
 - Before the first announce to a new tracker, drop every peer connection and
   every peer candidate learned from the old tracker. Downloaded pieces and
   verified progress are kept.
-- DHT, PEX, LSD and web seeds are disabled at the session level for a private
-  torrent, not merely absent by default.
+- v0.1 delivers the private flag and the tracker rules above. DHT (item 5),
+  PEX, LSD and web seeds are separate components; when each lands, it must
+  consult the session-level guard and refuse to run for a private torrent. The
+  guard is enforced at the session level, not only by not starting the
+  components, so a future component cannot opt in by accident.
 - Incoming connections are still accepted; BEP 27 restricts outgoing peer
   discovery, not listening.
-- A redirect is followed only to the same host, with the same port unless the
-  scheme upgrades from `http` to `https` (then the default https port is
-  allowed). A cross-host redirect fails the announce; the target is never
-  added to the candidate list.
-- A private torrent with no usable tracker fails without contacting anything.
+- A redirect is followed only to the same host and the same effective port
+  (defaults 80 and 443), with a trailing dot normalized; an `http` to `https`
+  upgrade is allowed only to the default https port, and a downgrade is
+  rejected. `RedirectPolicy::SameHostOnly` is carried in `AnnounceRequest` and
+  enforced by the transport. A cross-host redirect fails before a second
+  request; the target is never added to the candidate list.
+- A private torrent with no usable tracker fails with
+  `TrackerError::NoUsableTracker` without contacting anything.
 
 ## 9. URL parsing and redaction
 
@@ -763,8 +817,10 @@ Redaction keeps `scheme://host[:port]` and replaces the rest:
 
 ## 10. Trait boundary and types
 
-The tracker is engine-internal; `bt-proto` is not extended and the TUI/GUI
-see only a `TrackerStatus` snapshot through `bt-client`.
+The tracker is engine-internal; `bt-proto` is not extended in v0.1. `bt-client`
+defines its own `TrackerStatus` and maps from the engine snapshot, so the TUI
+and GUI do not depend on engine types. A versioned `bt-proto` type is planned
+for v0.2.
 
 ```rust
 pub trait TrackerTransport: Send + Sync {
@@ -780,8 +836,9 @@ pub trait TrackerTransport: Send + Sync {
 - `Send + Sync` because the session is async and may move the tracker between
   workers.
 - Dropping the returned future cancels the announce; the transport closes its
-  socket. The state machine also wraps the call in an outer timeout as
-  defence in depth.
+  socket. There is no outer announce timeout: each transport owns its own
+  deadlines, so a UDP attempt is not cut at 60 seconds and a `stopped`
+  announce uses its 2-second budget.
 - The production implementation is `NetworkTransport`, which dispatches on
   the URL scheme to the HTTP and UDP transports. Tests inject a
   `FakeTransport` that records requests and returns scripted responses,
@@ -805,7 +862,7 @@ Types (engine-internal, `crates/engine/src/tracker`):
 - `TrackerError`: `InvalidUrl`, `UnsupportedScheme`, `Dns`, `BlockedTarget`,
   `Connect`, `Tls`, `Timeout`, `HttpStatus(u16)`, `MalformedResponse`,
   `Rejected { message: TrackerMessage }`, `TooLarge`, `Redirect`,
-  `Cancelled`, `Io`.
+  `Cancelled`, `NoUsableTracker`, `Io`.
 - `TrackerEvent`: `AnnounceSucceeded`, `AnnounceFailed`, `PeersReceived`,
   `Warning`, `TrackerSwitched`, `NoUsableTracker`.
 - `TrackerStatus`: redacted active URL, last success, next announce, last
@@ -841,9 +898,10 @@ outside tests.
   `?passkey=abc` produces `...?passkey=abc&info_hash=...` and exactly one
   `?`; a URL ending in `?` appends the first pair directly. An existing
   `info_hash`, `peer_id`, `port`, `key`, `compact`, `numwant`, `event`, `ip`,
-  `ipv4` or `ipv6` parameter is removed. A hash containing `0x00`, `0x20`,
-  `0x41`, `0x7e` and `0xff` proves byte-wise percent-encoding: `%00`, `%20`,
-  `%41`, `~`, `%FF`.
+  `ipv4` or `ipv6` parameter is removed. Names are matched after
+  percent-decoding, so `%69nfo_hash` and `info%5Fhash` are removed too. A hash
+  containing `0x00`, `0x20`, `0x41`, `0x7e` and `0xff` proves byte-wise
+  percent-encoding: `%00`, `%20`, `%41`, `~`, `%FF`.
 - Redirect vectors: absolute URL, same-host absolute path, cross-host target,
   `https` to `http` downgrade, a `Location` with a passkey (redacted in every
   diagnostic), a malformed `Location`, and more than 5 hops.
@@ -858,8 +916,11 @@ outside tests.
 - Policy table with the first and last address of every range, plus
   IPv4-mapped and zone-ID cases.
 - State machine with a fake clock and fake transport: interval clamp, event
-  coalescing, backoff, tier order, move-to-front, private switch, stopped
-  budget, no-usable-tracker.
+  coalescing, saturating backoff including `u32::MAX` failures, tier order,
+  move-to-front, every round starting at tier 0 (including a round after a
+  failed round that follows an earlier success in a later tier), the
+  `announce` fallback when `announce-list` has no valid URL, private switch,
+  stopped budget, no-usable-tracker.
 
 ### Integration
 
@@ -882,9 +943,11 @@ outside tests.
   IP SAN fails, a trailing-dot hostname verifies, and a CN-only certificate
   fails.
 - DNS tests use an injected resolver: a resolve timeout with a paused clock,
-  a mix of allowed and blocked results, and a resolver that returns more than
-  8 results. `lookup_host` itself is covered by one localhost integration
-  test, not by the deterministic suite.
+  a mix of allowed and blocked results, a resolver that returns more than 8
+  results, and a resolver that never returns, proving that the 8-permit
+  semaphore bounds lookups and that the queue timeout fails with `Dns`. The
+  real resolver path is covered by one localhost integration test, not by the
+  deterministic suite.
 - End-to-end: a metainfo with two tiers, a private torrent, a tracker switch,
   and a session loop that asserts peer churn and event order.
 - Log capture: a failure reason, a warning message, a `Location`, a
@@ -913,7 +976,7 @@ Positive:
   166-crate graph.
 - Exact control of SSRF, redirects, timeouts, caps, redaction and private
   torrent behaviour.
-- The tracker logic without TLS is only +90 KiB, so UDP and HTTP can land
+- The tracker logic without TLS is only +90 KB, so UDP and HTTP can land
   before the TLS work and stay testable.
 - A small trait boundary keeps the network replaceable in tests.
 
@@ -921,8 +984,8 @@ Negative:
 
 - We own a minimal HTTP/1.1 parser, a URL parser, a TLS connector and the
   UDP retransmission logic. Each needs fuzzing and maintenance.
-- HTTPS is the dominant size cost: about +968 KiB over the no-TLS build. The
-  daemon grows to roughly 1.46 MB.
+- HTTPS is the dominant size cost: about +968 KB (968,160 bytes) over the
+  no-TLS build. The daemon grows to roughly 1.46 MB.
 - No scrape, proxy, dual-family announce, or IPv6 peer connections in v0.1.
 - No proxy at all in v0.1: a user who can reach trackers only through a proxy
   cannot announce. Proxy support is roadmap v0.3.

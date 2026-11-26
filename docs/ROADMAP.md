@@ -3,7 +3,7 @@
 Status key: [ ] todo, [~] in progress, [x] done.
 
 ## v0.1: engine + API + TUI (first release)
-BEPs: 3, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
+BEPs: 3, 7, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
 
 - [ ] 1. proto types and EngineClient trait (bootstrap)
 - [x] 2. Bencode + metainfo parsing, fuzz targets

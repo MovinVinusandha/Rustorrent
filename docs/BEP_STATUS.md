@@ -7,6 +7,7 @@ stays unverified.
 | BEP | Name | Target | Status | rbit | Module | Tests | Notes |
 |---|---|---|---|---|---|---|---|
 | 3 | Core protocol | v0.1 | in-progress | verify | bencode, metainfo, bitfield, storage, piece, resume | unit + fuzz | bencode, v1 metainfo, layout, verification/write, streaming recheck, and version 1 resume save/restore done; tracker and peer wire are not implemented. Fuzz targets compile in CI and run weekly. Gaps: `.utf-8` keys and legacy text encodings (v0.2) |
+| 7 | IPv6 tracker | v0.1 | planned | verify | | | `key` and `peers6` decoding; no dual-family or multi-homed announce |
 | 23 | Compact peers | v0.1 | planned | verify | | | |
 | 15 | UDP tracker | v0.1 | planned | verify | | | |
 | 12 | Multi-tracker | v0.1 | planned | verify | | | |

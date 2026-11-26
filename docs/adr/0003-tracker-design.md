@@ -317,8 +317,8 @@ trade-off is that ring is not FIPS-oriented; this client does not need FIPS.
   no revocation checking (no OCSP or CRL). Revocation is documented as out of
   scope; the root store and certificate lifetime are the control.
 - The TLS handshake has a 10-second timeout inside the 30-second per-hop
-  budget. A handshake failure is `TrackerError::Tls`; the announce round
-  fails and the state machine backs off.
+  budget. A handshake failure is `TrackerError::Tls`; the attempt fails and
+  §8 applies the tier and backoff rules.
 
 ### Root store
 
@@ -334,8 +334,8 @@ entry for ring only if the file scanner disagrees. This ADR does not change
 `deny.toml`.
 
 The root list is baked in at build time, so a major root change needs a
-dependency update. The weekly `cargo deny` and `cargo update` pass is the
-reminder; there is no runtime root refresh.
+dependency update. The weekly `cargo deny` pass and a periodic `cargo update`
+serve as the reminder; there is no runtime root refresh.
 
 Fallback: `rustls-native-certs` 0.8, which loads the OS store. It is 31,928
 bytes smaller, is license-clean under the current policy, and follows
@@ -366,14 +366,16 @@ Production constructs the connector from `webpki-roots` alone; this is how the
   `numwant`, `key`, `trackerid` when the tracker returned one.
 - `info_hash` and `peer_id` are the raw 20 bytes, percent-encoded byte by
   byte with uppercase hex, never via a UTF-8 string. Every byte outside the
-  unreserved set `A-Z a-z 0-9 - . _ ~` is escaped, including ASCII letters
-  that happen to appear in a hash: `0x41` becomes `%41`, not `A`. `port`,
-  counters, `numwant` and `key` are decimal.
+  unreserved set `A-Z a-z 0-9 - . _ ~` is escaped, so `0x41` stays `A` and
+  `0x7e` stays `~`; `0x00` becomes `%00`. A space is `%20`, never `+`; a
+  literal `+` is `%2B` and a literal `%` is `%25`. `port`, counters,
+  `numwant` and `key` are decimal.
 - An existing query in the tracker URL is preserved and extended with `&`,
   never a second `?`: `?passkey=abc` becomes `?passkey=abc&info_hash=...`.
   A URL ending in `?` gets the first pair directly after that `?`. Existing
-  `info_hash`, `peer_id`, `port`, `key`, `compact`, `numwant`, `event`, `ip`,
-  `ipv4` and `ipv6` parameters are removed first, so our values always win.
+  `info_hash`, `peer_id`, `port`, `uploaded`, `downloaded`, `left`, `compact`,
+  `event`, `numwant`, `key`, `trackerid`, `ip`, `ipv4` and `ipv6` parameters
+  are removed first, so our values always win.
   Names are matched after percent-decoding and case-insensitively, so
   `%69nfo_hash` and `info%5Fhash` are removed too. Only names are decoded for
   matching; values and the remaining query are kept as raw bytes and are not
@@ -413,7 +415,8 @@ Production constructs the connector from `webpki-roots` alone; this is how the
   integers in seconds; missing `interval` means 1800. The effective interval
   is `clamp(max(interval, min_interval), 60, 86400)`. `complete` and
   `incomplete` are optional non-negative counters. `tracker id` is an optional
-  `TrackerId` capped at 256 bytes and kept per tracker for HTTP announces.
+  `TrackerId`; a value longer than 256 bytes is ignored, not truncated, and
+  the ID is kept per tracker for HTTP announces.
 - `TrackerMessage` stores the tracker bytes and exposes
   `sanitized_text(&TrackerUrl)` for the UI. Sanitization is best-effort:
   UTF-8 lossy, control characters stripped, 256-byte cap, and every path
@@ -487,6 +490,9 @@ Summary of the decisions:
   Waits are 15, 30 and 60 seconds, so sends are due at 0, 15 and 45 seconds.
   Every datagram, connect or announce, counts as one of the three sends. A
   reconnect replaces the announce for that slot and does not reset the
+  deadline.
+- A `stopped` announce is the exception: it uses a 2-second deadline and no
+  retries, on UDP as on HTTP, instead of the 105-second normal-attempt
   deadline.
 - Before every send, if `now - id_received >= 50 s`, send a connect instead of
   the announce. 50 s is our decision; BEP 15 allows use until 60 s after
@@ -689,8 +695,8 @@ caps, shuffle, merge, tier-0 reset and backoff below are our policy; the
   backups and are not contacted in that round.
 - Move the first successful tracker in the tier to the front, keeping the
   relative order of the rest. Failed trackers stay in place and are retried
-  next round. A success resets nothing else: the rest of the candidate order
-  and the active tracker are unchanged.
+  next round. A success changes nothing else in the candidate order: the rest
+  of the order and the active tracker are unchanged.
 - If every tracker in every tier fails, the round fails and the backoff
   applies. The next round starts at tier 0.
 - Caps: 32 URLs, 8 tiers, 4 per tier. Duplicate normalized URLs are removed;
@@ -794,9 +800,9 @@ Redaction keeps `scheme://host[:port]` and replaces the rest:
   `sanitized_text()`; logs and errors record only a length and a
   classification.
 - `TrackerId` is a newtype over the opaque bytes. It is never displayed, is
-  capped at 256 bytes, is sent back only to the tracker that issued it, and
-  its `Debug` and `Display` forms print only its length. It is percent-encoded
-  byte by byte when echoed.
+  ignored if longer than 256 bytes, is sent back only to the tracker that
+  issued it, and its `Debug` and `Display` forms print only its length. It is
+  percent-encoded byte by byte when echoed.
 - `TrackerMessage` `Debug` and `Display` also print only the length; the UI
   must call `sanitized_text()` explicitly. This keeps a stray `?error` or
   `?response` in a log from printing tracker text.
@@ -855,8 +861,8 @@ Types (engine-internal, `crates/engine/src/tracker`):
 - `AnnounceResponse { interval: Duration, min_interval: Option<Duration>,
   complete: Option<u64>, incomplete: Option<u64>, peers: Vec<SocketAddr>,
   tracker_id: Option<TrackerId>, warning: Option<TrackerMessage> }`
-- `TrackerId`: opaque bytes capped at 256; `Debug` and `Display` print only
-  the length.
+- `TrackerId`: opaque bytes, ignored if longer than 256; `Debug` and `Display`
+  print only the length.
 - `TrackerMessage`: tracker-supplied bytes plus `sanitized_text(&TrackerUrl)`
   for the UI; `Debug` and `Display` print only the length.
 - `TrackerError`: `InvalidUrl`, `UnsupportedScheme`, `Dns`, `BlockedTarget`,
@@ -897,11 +903,13 @@ outside tests.
   `Accept-Encoding: identity`, `Connection: close`, and no body. A URL with
   `?passkey=abc` produces `...?passkey=abc&info_hash=...` and exactly one
   `?`; a URL ending in `?` appends the first pair directly. An existing
-  `info_hash`, `peer_id`, `port`, `key`, `compact`, `numwant`, `event`, `ip`,
-  `ipv4` or `ipv6` parameter is removed. Names are matched after
-  percent-decoding, so `%69nfo_hash` and `info%5Fhash` are removed too. A hash
-  containing `0x00`, `0x20`, `0x41`, `0x7e` and `0xff` proves byte-wise
-  percent-encoding: `%00`, `%20`, `%41`, `~`, `%FF`.
+  `info_hash`, `peer_id`, `port`, `uploaded`, `downloaded`, `left`, `compact`,
+  `event`, `numwant`, `key`, `trackerid`, `ip`, `ipv4` or `ipv6` parameter is
+  removed. Names are matched after percent-decoding, so `%69nfo_hash` and
+  `info%5Fhash` are removed too; a URL with `?left=0&trackerid=abc` loses
+  both. A hash containing `0x00`, `0x20`, `0x25`, `0x2B`, `0x41`, `0x7E` and
+  `0xFF` proves byte-wise percent-encoding: `%00`, `%20`, `%25`, `%2B`, `A`,
+  `~`, `%FF`.
 - Redirect vectors: absolute URL, same-host absolute path, cross-host target,
   `https` to `http` downgrade, a `Location` with a passkey (redacted in every
   diagnostic), a malformed `Location`, and more than 5 hops.
@@ -965,6 +973,8 @@ outside tests.
   beyond the 1 MiB cap.
 - `tracker_udp_response`: arbitrary bytes to the connect, announce and error
   decoders; no panic.
+- The response targets also call `sanitized_text()` on every `failure reason`
+  and `warning message`, so the sanitizer is fuzzed with the same input.
 - Targets are registered in `fuzz/Cargo.toml`, compile in CI, and run weekly,
   matching the existing bencode and metainfo targets.
 
@@ -1058,9 +1068,9 @@ leaves the workspace green.
 | Step | Branch | Content | New dependencies |
 |---|---|---|---|
 | 1 | `feat/tracker-url-decode` | URL parser, `TrackerUrl`, redaction, BEP 23/7 peer decoding, response envelope, fuzz targets | none |
-| 2 | `feat/tracker-udp` | BEP 15 codec, UDP transport, 105 s deadline, reconnect, local fake tracker | `getrandom`; tokio `net`, `time`, `test-util` (dev) |
+| 2 | `feat/tracker-udp` | BEP 15 codec, UDP transport, target policy, 105 s deadline, reconnect, local fake tracker | `getrandom`; tokio `net`, `time`, `test-util` (dev) |
 | 3 | `feat/tracker-state` | state machine, BEP 12 tiers, BEP 27 private policy, backoff, fake transport | none |
-| 4 | `feat/tracker-http` | HTTP/1.1 client, redirects, `RedirectPolicy`, target policy, TLS connector and test roots, HTTPS tests | `rustls`, `tokio-rustls`, `ring`, roots, `rcgen` (dev), tokio `io-util` |
+| 4 | `feat/tracker-http` | HTTP/1.1 client, redirects, `RedirectPolicy`, TLS connector and test roots, HTTPS tests | `rustls`, `tokio-rustls`, `ring`, roots, `rcgen` (dev), tokio `io-util` |
 | 5 | `docs/tracker-status` | BEP_STATUS, ROADMAP, ARCHITECTURE updates | none |
 
 The first branch is pure and adds no dependencies: it can be reviewed and

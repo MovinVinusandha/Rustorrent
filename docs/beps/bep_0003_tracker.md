@@ -32,13 +32,14 @@ behaviour out of scope; this note covers the HTTP tracker fields.
   `numwant`, `key`, `trackerid` when the tracker returned one.
 - Our decision: `info_hash` and `peer_id` are percent-encoded byte by byte
   with uppercase hex, never through a UTF-8 string. Every byte outside the
-  unreserved set `A-Z a-z 0-9 - . _ ~` is escaped.
+  unreserved set `A-Z a-z 0-9 - . _ ~` is escaped. A space is `%20`, never
+  `+`; a literal `+` is `%2B` and a literal `%` is `%25`.
 - Our decision: an existing query in the tracker URL is preserved and
   extended with `&`, never a second `?`. Existing `info_hash`, `peer_id`,
-  `port`, `key`, `compact`, `numwant`, `event`, `ip`, `ipv4` and `ipv6`
-  parameters are removed first. Names are matched after percent-decoding and
-  case-insensitively, so `%69nfo_hash` and `info%5Fhash` cannot compete with
-  our values.
+  `port`, `uploaded`, `downloaded`, `left`, `compact`, `event`, `numwant`,
+  `key`, `trackerid`, `ip`, `ipv4` and `ipv6` parameters are removed first.
+  Names are matched after percent-decoding and case-insensitively, so
+  `%69nfo_hash` and `info%5Fhash` cannot compete with our values.
 - Our decision: `numwant` is 50 for `started`, `completed` and periodic
   announces, and 0 for `stopped`.
 - Our decision: `key` is a 32-bit value from OS randomness, generated once per
@@ -72,9 +73,10 @@ behaviour out of scope; this note covers the HTTP tracker fields.
   0 or a negative value is treated as missing.
 - Our decision: `complete` and `incomplete` are optional non-negative
   counters. Unknown keys are ignored.
-- Our decision: `tracker id` is capped at 256 bytes and held in a `TrackerId`
-  newtype. It is echoed only to the tracker that issued it, is never
-  displayed, and its `Debug` and `Display` forms print only its length.
+- Our decision: `tracker id` is ignored if longer than 256 bytes and held in a
+  `TrackerId` newtype otherwise. It is echoed only to the tracker that issued
+  it, is never displayed, and its `Debug` and `Display` forms print only its
+  length.
 - Our decision: `peers` and `peers6` are decoded per the BEP 23 and BEP 7
   notes. The merged peer set is capped at 200 per response.
 - Our decision: the `Content-Type` header is ignored. Bencode validity is the

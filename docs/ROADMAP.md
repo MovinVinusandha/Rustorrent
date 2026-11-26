@@ -77,7 +77,13 @@ BEPs: 3, 7, 23, 15, 12, 9, 10, 5. See BEP_STATUS.md.
     counts, and a partial failure leaves the storage retryable. The in-process
     API stub still rejects `delete_files: true` with `NOT_IMPLEMENTED` until
     item 10 wires the session. See ADR 0002 section 8.
-- [ ] 4. Tracker announce (HTTP, then UDP)
+- [ ] 4. Tracker announce.
+  - [ ] 4a. URL parser, redaction types, peer decoding, response envelope.
+  - [ ] 4b. UDP transport (BEP 15).
+  - [ ] 4c. Announce state machine (BEP 12/27, backoff).
+  - The `deny.toml` prerequisite PR for the `webpki-roots` license lands
+    before 4d.
+  - [ ] 4d. HTTP transport, then the `https` feature.
 - [ ] 5. Peer connection, handshake, message loop
 - [ ] 6. Piece picker, request pipelining, endgame
 - [ ] 7. Upload side: choking, rate limiter

@@ -40,6 +40,21 @@ behaviour out of scope; this note covers the HTTP tracker fields.
   `key`, `trackerid`, `ip`, `ipv4` and `ipv6` parameters are removed first.
   Names are matched after percent-decoding and case-insensitively, so
   `%69nfo_hash` and `info%5Fhash` cannot compete with our values.
+- Our decision: tracker URL hosts are canonical dotted-quad IPv4, bracketed
+  IPv6, or validated ASCII DNS names. Every numeric-looking host is
+  classified before DNS; the following are rejected, never passed to a
+  resolver:
+
+  | Host | Why |
+  |---|---|
+  | `127.1` | 2-part shorthand |
+  | `2130706433` | single integer |
+  | `0177.0.0.1` | octal part |
+  | `0x7f.0.0.1`, `0x7f000001` | hex part |
+  | `1.2.3.4.5`, `1.2.3.256` | not four canonical parts |
+  | `127.0.0.1.` | trailing dot on an IP literal |
+
+  See ADR 0003 section 9 for the full rule and the IPv6 cases.
 - Our decision: `numwant` is 50 for `started`, `completed` and periodic
   announces, and 0 for `stopped`.
 - Our decision: `key` is a 32-bit value from OS randomness, generated once per

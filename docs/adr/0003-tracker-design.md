@@ -5,8 +5,9 @@
 - Deciders: project owner
 - Supersedes: none
 - Related: `docs/ROADMAP.md` item 4, ADR 0001, `docs/BEP_STATUS.md`,
-  `docs/beps/bep_0015.md`, `bep_0012.md`, `bep_0023.md`, `bep_0007.md`,
-  `bep_0020.md`, `bep_0027.md`, `deny.toml`, `fuzz/Cargo.toml`
+  `docs/beps/bep_0015.md`, `bep_0003_tracker.md`, `bep_0012.md`,
+  `bep_0023.md`, `bep_0007.md`, `bep_0020.md`, `bep_0027.md`, `deny.toml`,
+  `fuzz/Cargo.toml`
 
 ## Decisions summary
 
@@ -36,20 +37,23 @@ full document.
   `Accept-Encoding: identity`. Limits: 1 MiB body, 64 KiB head, 100 header
   lines, 8 KiB per line. Chunked, Content-Length, close-delimited and
   HTTP/1.0 bodies are accepted; conflicting length/transfer-coding is
-  rejected. Up to 5 redirects: absolute paths stay on the same host, absolute
-  URLs are re-checked; 30 s per hop, 60 s total.
+  rejected. Up to 5 redirects (301, 302, 303, 307, 308): public torrents may
+  cross hosts, private torrents use `RedirectPolicy::SameHostOnly`; every
+  target is re-checked; 30 s per hop, 60 s total.
 - Query: `info_hash` and `peer_id` are percent-encoded byte by byte; an
   existing query is extended with `&`, never a second `?`; our values replace
   duplicates already in the URL.
-- UDP: BEP 15 connect then announce, 15/30/60 s sends with a 105 s cap. The
+- UDP: BEP 15 connect then announce; one 105 s deadline from the first
+  datagram, sends due at 0/15/45 s with waits 15/30/60; every datagram counts,
+  and a connect is sent before any send when the ID is at least 50 s old. The
   cap is our decision, not the full `15 * 2^n` schedule. 200 peers, 6-byte
   IPv4 and 18-byte IPv6 strides.
 - Peers: compact and list formats plus `peers6`; 200-peer cap; invalid
   addresses dropped; tracker-supplied hostnames dropped (SSRF).
 - SSRF: public targets only by default; `allow_private_targets` is for tests
   and self-hosting. DNS results are checked and the connection goes to the
-  checked IP; SNI and certificate verification use the hostname. Every
-  redirect is re-checked.
+  checked IP; SNI is sent only for DNS hostnames, and certificate verification
+  uses the hostname or the IP SAN. Every redirect is re-checked.
 - Redaction: `Debug`/`Display` show only `scheme://host[:port]/…`; path,
   query and fragment stay hidden. Redirect `Location`, `tracker id`,
   `failure reason` and `warning message` are sanitized (controls stripped,
@@ -61,9 +65,10 @@ full document.
   exponential backoff with jitter; one in-flight announce per torrent.
 - Boundary: engine-internal `TrackerTransport` with boxed futures; the client
   sees only a `TrackerStatus` snapshot.
-- Tests: unit vectors, local HTTP/UDP/TLS trackers, paused-time UDP tests,
-  log-capture tests, and fuzz targets `tracker_url`,
-  `tracker_http_response`, `tracker_udp_response`.
+- Tests: unit vectors, local HTTP/UDP/TLS trackers, paused-time UDP tests
+  (including the 51 s reconnect and the 105 s deadline), log-capture tests, and
+  fuzz targets `tracker_url`, `tracker_http_response`,
+  `tracker_udp_response`.
 - Limitations: no proxy (roadmap v0.3), no scrape, no dual-family announce,
   no IPv6 peer connections, and private whitelists may refuse the client.
 - Prerequisites: the `deny.toml` license PR, dependency approval, and the
@@ -217,7 +222,8 @@ its own measurements.
 - Events `started`, `completed`, `stopped`; periodic announces; exponential
   backoff after a failed round.
 - Response fields: `interval`, `min interval`, `complete`, `incomplete`,
-  `peers`, `peers6`, `tracker id`, `failure reason`, `warning message`.
+  `peers`, `peers6`, `tracker id`, `failure reason`, `warning message`; the
+  HTTP fields are defined in `docs/beps/bep_0003_tracker.md`.
 - One in-flight announce per torrent; one connection per HTTP announce.
 
 Known limitations of v0.1:
@@ -292,8 +298,9 @@ trade-off is that ring is not FIPS-oriented; this client does not need FIPS.
 - Certificate and hostname verification are always on. There is no
   `danger_accept_invalid_certs`, no custom verifier, and no plaintext fallback
   for an `https` URL.
-- SNI is the URL host. For an IP-literal URL, `ServerName::IpAddress` is used
-  and the certificate must contain a matching IP SAN.
+- SNI is sent only for DNS hostnames, using the hostname with any trailing
+  dot stripped. For an IP-literal URL no SNI is sent; `ServerName::IpAddress`
+  is used for verification and the certificate must contain a matching IP SAN.
 - No client certificates, no custom session resumption, no early data, and
   no revocation checking (no OCSP or CRL). Revocation is documented as out of
   scope; the root store and certificate lifetime are the control.
@@ -324,6 +331,12 @@ enterprise or user-installed roots. The cost is OS-dependent behavior and
 tests that cannot assume a fixed root set. If the license approval is denied,
 the fallback is the decision, not a blocker.
 
+Tests use a `pub(crate)` constructor on the TLS connector that takes extra
+`CertificateDer` roots. It is compiled only for tests (or behind the existing
+dev-only `test-util` feature) and is not reachable from a release build.
+Production constructs the connector from `webpki-roots` alone; this is how the
+`rcgen` test CA is trusted without weakening production verification.
+
 ## 4. HTTP behaviour
 
 ### Request
@@ -349,7 +362,10 @@ the fallback is the decision, not a blocker.
   A URL ending in `?` gets the first pair directly after that `?`. Existing
   `info_hash`, `peer_id`, `port`, `key`, `compact`, `numwant`, `event`, `ip`,
   `ipv4` and `ipv6` parameters are removed first, so our values always win.
-  The raw query is kept as bytes; it is not decoded and re-encoded.
+  Names are matched after percent-decoding and case-insensitively, so
+  `%69nfo_hash` and `info%5Fhash` are removed too. Only names are decoded for
+  matching; values and the remaining query are kept as raw bytes and are not
+  re-encoded.
 - `numwant` is 50 for a normal announce and 0 for `stopped`.
 - `event` is omitted for a periodic announce, and is `started`, `completed`
   or `stopped` otherwise.
@@ -357,20 +373,25 @@ the fallback is the decision, not a blocker.
 
 ### Response
 
-- Status 200 is the only success. 3xx is handled as a redirect. Any other
-  status is `TrackerError::HttpStatus`, with no body retained.
+- Status 200 is the only success. 301, 302, 303, 307 and 308 are redirects;
+  every other 3xx (including 300, 304, 305 and 306) is a terminal
+  `TrackerError::HttpStatus`. Any other status is also `HttpStatus`, with no
+  body retained. Only the numeric status is kept; the reason phrase is
+  discarded.
 - The status line must be HTTP/1.0 or HTTP/1.1; any other version is a
   malformed response. HTTP/2 is not negotiated.
 - The response head is capped at 64 KiB, 100 header lines, and 8 KiB per
   line. Header names are ASCII and case-insensitive; obs-fold, NUL, CR and LF
-  inside a value are rejected.
+  inside a value are rejected. Header values are not retained except
+  `Location`; they never reach a log, error or UI.
 - `Content-Length` must parse as a decimal `usize`; duplicate values must be
   identical. `Transfer-Encoding` must be exactly `chunked`. A response with
   both `Content-Length` and `Transfer-Encoding` is rejected, as is a
   non-chunked transfer coding.
 - No length and no chunking means read to EOF, capped at 1 MiB. A chunked body
   is decoded incrementally with the same cap; the chunk-size line is capped at
-  1 KiB and trailers at 8 KiB.
+  1 KiB and trailers at 8 KiB. Chunk extensions are ignored up to the 1 KiB
+  line cap; an invalid extension is a malformed response.
 - The body is capped at 1 MiB before bencode decoding. The existing bounded
   bencode decoder is used with its depth limit; no length prefix can allocate
   beyond the body.
@@ -394,7 +415,9 @@ the fallback is the decision, not a blocker.
 
 ### Redirects
 
-- 301, 302, 303, 307 and 308 are followed, up to 5 hops.
+- 301, 302, 303, 307 and 308 are followed, up to 5 hops. Any other 3xx is
+  terminal (see Response). A response with more than one `Location` header is
+  rejected; the first is not chosen silently.
 - `Location` may be an absolute `http`/`https` URL or an absolute path on the
   same host. Other relative forms are rejected. The raw value is capped at
   2048 bytes.
@@ -404,6 +427,13 @@ the fallback is the decision, not a blocker.
   fixed `<invalid tracker url>` placeholder, never the raw header value.
 - An `https` to `http` downgrade is rejected. `http` to `https` is allowed.
   Any other scheme is rejected.
+- `AnnounceRequest` carries `RedirectPolicy::{Public, SameHostOnly}`.
+  `Public` allows a cross-host target after the normal checks. `SameHostOnly`
+  requires the same host and effective port (defaults 80 and 443), allows an
+  `http` to `https` upgrade only to the default https port, and rejects a
+  downgrade. Hosts are compared with a trailing dot normalized. A cross-host
+  `SameHostOnly` target fails before a second request and is never added to
+  the candidate list.
 - Every hop is parsed, resolved, policy-checked and connected from scratch.
   No connection, DNS result or TLS session is reused across hops.
 - Userinfo in a redirect target is rejected, not silently stripped.
@@ -429,20 +459,28 @@ Summary of the decisions:
 - One connected UDP socket per announce attempt, bound to the address family
   of the chosen tracker address. The kernel drops datagrams from other
   sources.
-- Connect request first; the connection ID is reused for the announce and for
-  a reconnect after an expired-ID error. No cross-announce connection-ID
-  cache in v0.1.
-- Three sends per attempt, with waits of 15, 30 and 60 seconds, for a
-  105-second budget. This is a deliberate cap on the BEP 15 `15 * 2^n`
-  schedule; the state machine's backoff covers longer outages.
+- Connect request first. The connection ID is reused within the attempt. There
+  is no cross-announce connection-ID cache in v0.1; the next announce
+  reconnects.
+- One 105-second deadline per attempt, measured from the first datagram.
+  Waits are 15, 30 and 60 seconds, so sends are due at 0, 15 and 45 seconds.
+  Every datagram, connect or announce, counts as one of the three sends. A
+  reconnect replaces the announce for that slot and does not reset the
+  deadline.
+- Before every send, if `now - id_received >= 50 s`, send a connect instead of
+  the announce. 50 s is our decision; BEP 15 allows use until 60 s after
+  receipt, and a tracker silently ignores an expired ID. The new ID is used
+  once the connect response arrives.
 - Receive buffer 4096 bytes; 200 peers per response; 6-byte stride on IPv4
   and 18-byte stride on IPv6, selected by the socket family.
 - Transaction IDs are 32 bits from OS randomness, fresh for each connect and
   announce. A mismatched action or transaction ID is ignored and the receive
   wait continues.
-- Error packets are checked for transaction ID, truncated to 256 bytes,
-  control-stripped, and never logged raw. The attempt fails with
-  `TrackerRejected`.
+- Error packets are checked for transaction ID. The text is untrusted: it is
+  passed through the same best-effort sanitizer as an HTTP `failure reason`
+  before it may be shown in the UI, and it is never logged. Logs and errors
+  record only a length and a classification. The attempt fails with
+  `Rejected`.
 - No scrape, no BEP 41, no multi-homed or dual-family announce.
 
 ## 6. Target policy and SSRF
@@ -499,11 +537,13 @@ keep it off outside tests and self-hosting.
 - The connection is made to the checked `IpAddr`, never by passing the
   hostname to a connector that would resolve again. This closes the DNS
   rebinding window between check and connect.
-- For HTTPS the TCP connection still goes to the checked IP, but SNI and
-  certificate verification use the original hostname: the TLS `ServerName` is
-  the URL host, not the IP. For an IP-literal URL, `ServerName::IpAddress` is
-  used and the certificate must contain a matching IP SAN. Connecting to the
-  IP without this would verify the wrong name.
+- For HTTPS the TCP connection still goes to the checked IP, but certificate
+  verification uses the original hostname: the TLS `ServerName` is the URL
+  host, not the IP. SNI is sent only when the host is a DNS name, using the
+  hostname with any trailing dot stripped. For an IP-literal URL no SNI is
+  sent; `ServerName::IpAddress` is used and the certificate must contain a
+  matching IP SAN. Connecting to the IP without this would verify the wrong
+  name.
 - Resolution uses `tokio::net::lookup_host`, which runs the system resolver on
   tokio's blocking pool. The caller wraps it in the 5-second timeout. Dropping
   the future does not cancel the blocking call, so a hung resolver keeps one
@@ -733,9 +773,10 @@ Types (engine-internal, `crates/engine/src/tracker`):
 
 - `AnnounceRequest { url: TrackerUrl, info_hash: InfoHash, peer_id: PeerId,
   port: u16, stats: AnnounceStats, event: AnnounceEvent, num_want: i32,
-  key: u32, tracker_id: Option<Vec<u8>> }`
+  key: u32, tracker_id: Option<Vec<u8>>, redirect: RedirectPolicy }`
 - `AnnounceStats { uploaded: u64, downloaded: u64, left: u64 }`
 - `AnnounceEvent { None, Started, Completed, Stopped }`
+- `RedirectPolicy { Public, SameHostOnly }`
 - `AnnounceResponse { interval: Duration, min_interval: Option<Duration>,
   complete: Option<u64>, incomplete: Option<u64>, peers: Vec<SocketAddr>,
   tracker_id: Option<Vec<u8>>, warning: Option<TrackerMessage> }`
@@ -766,6 +807,9 @@ tests.
   chunk-size line, invalid UTF-8 in a header value, obs-fold, and a
   `Content-Encoding: gzip` response. The chunked decoder is exercised with a
   body just under and just over the 1 MiB cap.
+- HTTP status vectors: 300, 304, 305 and 306 are terminal errors; duplicate
+  `Location` is rejected; chunk extensions are ignored up to the 1 KiB line
+  cap; a non-UTF-8 header value is discarded except for `Location`.
 - HTTP request builder vectors: method and target, `Host` with and without a
   non-default port, IPv6 bracket form, `User-Agent: bt-app/0.1`,
   `Accept-Encoding: identity`, `Connection: close`, and no body. A URL with
@@ -778,8 +822,14 @@ tests.
 - Redirect vectors: absolute URL, same-host absolute path, cross-host target,
   `https` to `http` downgrade, a `Location` with a passkey (redacted in every
   diagnostic), a malformed `Location`, and more than 5 hops.
+- Redirect policy vectors: `Public` accepts a cross-host target;
+  `SameHostOnly` rejects it before a second request, compares effective ports
+  (80 and 443 defaults), normalizes a trailing dot, and rejects a downgrade.
 - UDP connect/announce/error vectors, wrong transaction ID and action,
   truncated packets, 6- and 18-byte strides.
+- Paused-clock UDP tests: a connection ID 51 seconds old triggers a connect
+  before the announce; every datagram counts as a send; a reconnect does not
+  reset the 105-second deadline; an attempt is not cut at 60 seconds.
 - Policy table with the first and last address of every range, plus
   IPv4-mapped and zone-ID cases.
 - State machine with a fake clock and fake transport: interval clamp, event
@@ -798,10 +848,14 @@ tests.
   `#[tokio::test(start_paused = true)]` so the 15/30/60-second waits are
   virtual; a fake transport covers the cases a real socket cannot.
 - Local TLS tracker with a test CA generated by `rcgen` (dev-dependency only,
-  no release size impact): success against a certificate for the hostname
-  while the socket is reached through `127.0.0.1` (proves SNI and verification
-  use the hostname, not the IP), hostname mismatch, expired certificate, and
-  a plaintext server on an `https` URL must all fail closed.
+  no release size impact), trusted through the test-only extra-roots
+  constructor: success against a certificate for the hostname while the socket
+  is reached through `127.0.0.1` (proves SNI and verification use the
+  hostname, not the IP), hostname mismatch, expired certificate, and a
+  plaintext server on an `https` URL must all fail closed. Further vectors:
+  an IP-literal URL with a matching IP SAN succeeds, the same URL without an
+  IP SAN fails, a trailing-dot hostname verifies, and a CN-only certificate
+  fails.
 - DNS tests use an injected resolver: a resolve timeout with a paused clock,
   a mix of allowed and blocked results, and a resolver that returns more than
   8 results. `lookup_host` itself is covered by one localhost integration
@@ -918,9 +972,9 @@ leaves the workspace green.
 | Step | Branch | Content | New dependencies |
 |---|---|---|---|
 | 1 | `feat/tracker-url-decode` | URL parser, `TrackerUrl`, redaction, BEP 23/7 peer decoding, response envelope, fuzz targets | none |
-| 2 | `feat/tracker-udp` | BEP 15 codec, UDP transport, retransmission, local fake tracker | `getrandom`; tokio `net`, `time`, `test-util` (dev) |
+| 2 | `feat/tracker-udp` | BEP 15 codec, UDP transport, 105 s deadline, reconnect, local fake tracker | `getrandom`; tokio `net`, `time`, `test-util` (dev) |
 | 3 | `feat/tracker-state` | state machine, BEP 12 tiers, BEP 27 private policy, backoff, fake transport | none |
-| 4 | `feat/tracker-http` | HTTP/1.1 client, redirects, target policy, TLS connector, HTTPS tests | `rustls`, `tokio-rustls`, `ring`, roots, `rcgen` (dev), tokio `io-util` |
+| 4 | `feat/tracker-http` | HTTP/1.1 client, redirects, `RedirectPolicy`, target policy, TLS connector and test roots, HTTPS tests | `rustls`, `tokio-rustls`, `ring`, roots, `rcgen` (dev), tokio `io-util` |
 | 5 | `docs/tracker-status` | BEP_STATUS, ROADMAP, ARCHITECTURE updates | none |
 
 The first branch is pure and adds no dependencies: it can be reviewed and

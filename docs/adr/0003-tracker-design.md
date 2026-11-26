@@ -1,6 +1,6 @@
 # ADR 0003: Tracker announce design
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-25
 - Deciders: project owner
 - Supersedes: none
@@ -1046,11 +1046,7 @@ Risks and mitigations:
 3. Owner decision on whether `allow_private_targets` is exposed in the v0.1
    daemon config. The default is `false`; tests and self-hosted setups set it
    through the engine API.
-4. The ROADMAP line says "HTTP, then UDP". This ADR implements UDP first
-   because it is smaller and its codec is easier to test in isolation. The
-   roadmap line is updated when the implementation lands, not in this
-   proposed ADR.
-5. BEP_STATUS rows for 7, 12, 15, 20, 23 and 27 stay `planned` until code
+4. BEP_STATUS rows for 7, 12, 15, 20, 23 and 27 stay `planned` until code
    lands; the notes and this ADR do not change implementation status.
 
 ## 15. Implementation order

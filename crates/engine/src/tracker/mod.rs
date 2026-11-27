@@ -1,8 +1,8 @@
-//! Tracker URL parsing and, later, announce decoding.
+//! Tracker URL parsing, response decoding and announce transports.
 //!
-//! The module is pure: parsing and decoding perform no network I/O. URL
-//! parsing lives in [`url`]; transports and response decoding are added in
-//! later steps.
+//! URL parsing and response decoding are pure. DNS resolution and the UDP
+//! transport perform network I/O under their own deadlines; the announce
+//! state machine and the HTTP transport land in 4c and 4d.
 
 use std::io;
 

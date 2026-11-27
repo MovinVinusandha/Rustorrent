@@ -511,10 +511,11 @@ Summary of the decisions:
   first connect, a connect after the 50 s guard, and the announce after a
   connect response). A mismatched action or transaction ID is ignored and the
   receive wait continues.
-- An ICMP port-unreachable (`ConnectionRefused` on Unix, `ConnectionReset` on
-  Windows) ends the attempt immediately with the typed `Connect` error; waiting
-  for the deadline would only delay failover. On Windows, an oversized
-  datagram that fails `recv` with `WSAEMSGSIZE` maps to `TooLarge`.
+- An ICMP port-unreachable (`ConnectionRefused` or `ConnectionReset`,
+  depending on platform and OS) ends the attempt immediately with the typed
+  `Connect` error; waiting for the deadline would only delay failover. On
+  Windows, an oversized datagram that fails `recv` with `WSAEMSGSIZE` maps to
+  `TooLarge`.
 - Reflection and amplification are bounded by construction: requests are 16
   and 98 bytes, an attempt sends at most three datagrams, and responses are
   accepted only from the connected address. A spoofed source can therefore
@@ -582,8 +583,8 @@ keep it off outside tests and self-hosting.
 - The first allowed result is used. If a TCP connect fails immediately, the
   next allowed result is tried, up to the 8-result cap. A timeout does not
   fall through to the next result, because the attempt budget is already
-  bounded. UDP uses the first allowed result and falls through only when the
-  send itself fails.
+  bounded. UDP uses the first allowed result; a bind, connect or send failure
+  ends the attempt. v0.1 does not fall through to the next result for UDP.
 - The connection is made to the checked `IpAddr`, never by passing the
   hostname to a connector that would resolve again. This closes the DNS
   rebinding window between check and connect.

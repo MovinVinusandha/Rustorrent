@@ -9,12 +9,14 @@ use thiserror::Error;
 pub mod id;
 pub mod message;
 pub mod peers;
+pub mod policy;
 pub mod response;
 pub mod url;
 
 pub use id::{MAX_TRACKER_ID_LEN, TrackerId};
 pub use message::{MAX_MESSAGE_LEN, TrackerMessage};
 pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};
+pub use policy::TargetPolicy;
 pub use response::{
     AnnounceResponse, DEFAULT_INTERVAL_SECS, MAX_INTERVAL_SECS, MAX_RESPONSE_BYTES,
     MIN_INTERVAL_SECS, decode_response,
@@ -44,4 +46,7 @@ pub enum TrackerError {
     /// The tracker response body is larger than the cap.
     #[error("tracker response is too large")]
     TooLarge,
+    /// Every candidate address is blocked by the target policy.
+    #[error("blocked tracker target")]
+    BlockedTarget,
 }

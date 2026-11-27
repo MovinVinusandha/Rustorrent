@@ -8,6 +8,7 @@ use std::io;
 
 use thiserror::Error;
 
+pub mod candidates;
 pub mod dns;
 pub mod id;
 pub mod message;
@@ -18,6 +19,10 @@ pub mod transport;
 pub mod udp;
 pub mod url;
 
+pub use candidates::{
+    CandidateWarnings, MAX_TIERS, MAX_TRACKER_URLS, MAX_URLS_PER_TIER, OsShuffle, Shuffle,
+    TrackerCandidates,
+};
 pub use dns::{
     DNS_LOOKUP_TIMEOUT, DNS_QUEUE_TIMEOUT, MAX_CONCURRENT_LOOKUPS, MAX_RESOLVED_ADDRESSES,
     Resolver, SystemResolver,

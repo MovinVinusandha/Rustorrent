@@ -36,6 +36,7 @@ jobs:
           - piece_buffer
           - resume
           - tracker_http_response
+          - tracker_udp_response
           - tracker_url
     env:
       # The repo pins stable in rust-toolchain.toml; the environment variable

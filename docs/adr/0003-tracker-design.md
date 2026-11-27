@@ -613,7 +613,8 @@ keep it off outside tests and self-hosting.
 - A redirect repeats resolution and checking from scratch. A host that
   resolves to both allowed and blocked addresses can still be used through an
   allowed address; a host whose every result is blocked fails with
-  `TrackerError::BlockedTarget`.
+  `TrackerError::BlockedTarget`, and an empty lookup result fails with
+  `TrackerError::Dns`.
 - There is no port allowlist. The address policy is the control; a public IP
   on an unusual port is allowed.
 

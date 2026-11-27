@@ -162,6 +162,18 @@ async fn an_all_blocked_result_is_blocked_target() {
 }
 
 #[tokio::test]
+async fn an_empty_lookup_result_is_a_dns_error() {
+    let lookup = StaticLookup::new(Vec::new());
+    let resolver = resolver_with(lookup, 8, Duration::from_secs(2), Duration::from_secs(5));
+
+    assert_eq!(
+        resolver.resolve(&name(), 6969, policy()).await,
+        Err(TrackerError::Dns),
+        "no addresses is a failed lookup, not a blocked target"
+    );
+}
+
+#[tokio::test]
 async fn a_resolved_ipv4_mapped_address_is_blocked() {
     let lookup = StaticLookup::new(vec![socket("::ffff:127.0.0.1", 80)]);
     let resolver = resolver_with(lookup, 8, Duration::from_secs(2), Duration::from_secs(5));

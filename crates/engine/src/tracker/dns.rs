@@ -132,6 +132,10 @@ impl Resolver for SystemResolver {
                 Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => return Err(TrackerError::Dns),
             };
 
+            if addresses.is_empty() {
+                return Err(TrackerError::Dns);
+            }
+
             for address in addresses.into_iter().take(MAX_RESOLVED_ADDRESSES) {
                 let address = SocketAddr::new(address.ip(), port);
                 if policy.check(address.ip()).is_ok() {

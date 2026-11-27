@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::tracker::udp::codec::{ConnectionId, Family, UdpAnnounceResponse};
-use crate::tracker::{PeerWarnings, TrackerError, TrackerMessage};
+use crate::tracker::udp::codec::{ConnectionId, Family};
+use crate::tracker::{AnnounceResponse, PeerWarnings, TrackerError, TrackerMessage};
 
 use super::{
     ATTEMPT_DEADLINE, AttemptOutcome, MAX_SENDS, RECONNECT_AGE, STOPPED_DEADLINE, Step,
@@ -59,12 +59,15 @@ fn error_response(transaction_id: u32, text: &[u8]) -> Vec<u8> {
     packet
 }
 
-fn expected_response() -> UdpAnnounceResponse {
-    UdpAnnounceResponse {
-        interval: 1800,
-        leechers: 0,
-        seeders: 0,
+fn expected_response() -> AnnounceResponse {
+    AnnounceResponse {
+        interval: Duration::from_secs(1800),
+        min_interval: None,
+        complete: Some(0),
+        incomplete: Some(0),
         peers: Vec::new(),
+        tracker_id: None,
+        warning: None,
         peer_warnings: PeerWarnings::default(),
     }
 }

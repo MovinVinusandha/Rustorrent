@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::codec::{ConnectionId, Decoded, Family, UdpAnnounceResponse, decode};
-use crate::tracker::{TrackerError, TrackerMessage};
+use super::codec::{ConnectionId, Decoded, Family, decode};
+use crate::tracker::{AnnounceResponse, TrackerError, TrackerMessage};
 
 /// Deadline of a normal attempt, measured from the first datagram.
 pub const ATTEMPT_DEADLINE: Duration = Duration::from_secs(105);
@@ -90,7 +90,7 @@ pub enum Step {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// The tracker answered the announce.
-    Announce(UdpAnnounceResponse),
+    Announce(AnnounceResponse),
     /// The tracker sent an error packet.
     Rejected(TrackerMessage),
     /// The deadline passed with no usable response.

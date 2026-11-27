@@ -16,18 +16,24 @@
 
 #![allow(dead_code)] // The session wires the transport in item 10; tests drive it today.
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, sleep_until};
 
-use super::attempt::{AttemptOutcome, Step, TransactionIds, UdpAttempt};
-use super::codec::{
-    Family, MAX_DATAGRAM_LEN, UdpAnnounce, UdpAnnounceResponse, encode_announce, encode_connect,
+use super::attempt::{
+    ATTEMPT_DEADLINE, AttemptOutcome, STOPPED_DEADLINE, Step, TransactionIds, UdpAttempt,
 };
-use crate::tracker::{Resolver, Scheme, TargetPolicy, TrackerError, TrackerUrl};
+use super::codec::{Family, MAX_DATAGRAM_LEN, encode_announce, encode_connect};
+use crate::tracker::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, DNS_LOOKUP_TIMEOUT, DNS_QUEUE_TIMEOUT,
+    Resolver, Scheme, TargetPolicy, TrackerError, TrackerTransport,
+};
 
 /// Windows `WSAEMSGSIZE`: the datagram was larger than the receive buffer.
 const WSAEMSGSIZE: i32 = 10040;
@@ -48,19 +54,14 @@ impl UdpTransport {
     ///
     /// A `stopped` announce uses the short deadline and is not retried. The
     /// returned future is the whole attempt: dropping it closes the socket.
-    pub(crate) async fn announce(
-        &self,
-        url: &TrackerUrl,
-        request: &UdpAnnounce,
-        stopped: bool,
-    ) -> Result<UdpAnnounceResponse, TrackerError> {
-        if url.scheme() != Scheme::Udp {
+    async fn run(&self, request: AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
+        if request.url.scheme() != Scheme::Udp {
             return Err(TrackerError::UnsupportedScheme);
         }
 
         let address = self
             .resolver
-            .resolve(url.host(), url.port(), self.policy)
+            .resolve(request.url.host(), request.url.port(), self.policy)
             .await?;
         let family = match address {
             SocketAddr::V4(_) => Family::V4,
@@ -72,7 +73,11 @@ impl UdpTransport {
             .map_err(map_send_error)?;
         socket.connect(address).await.map_err(map_send_error)?;
 
-        let mut attempt = UdpAttempt::new(Instant::now(), stopped, Box::new(OsTransactionIds));
+        let mut attempt = UdpAttempt::new(
+            Instant::now(),
+            request.event.is_stopped(),
+            Box::new(OsTransactionIds),
+        );
         let mut buffer = [0u8; MAX_DATAGRAM_LEN];
 
         loop {
@@ -85,9 +90,7 @@ impl UdpTransport {
                     transaction_id,
                     connection_id,
                 } => {
-                    let mut request = request.clone();
-                    request.connection_id = connection_id;
-                    let packet = encode_announce(&request, transaction_id);
+                    let packet = encode_announce(&request, connection_id, transaction_id);
                     socket.send(&packet).await.map_err(map_send_error)?;
                 }
                 Step::Wait { until } => {
@@ -112,6 +115,26 @@ impl UdpTransport {
                 }
             }
         }
+    }
+}
+
+impl TrackerTransport for UdpTransport {
+    fn announce<'a>(
+        &'a self,
+        request: AnnounceRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AnnounceResponse, TrackerError>> + Send + 'a>> {
+        Box::pin(self.run(request))
+    }
+
+    fn max_duration(&self, event: AnnounceEvent) -> Duration {
+        let attempt = if event.is_stopped() {
+            STOPPED_DEADLINE
+        } else {
+            ATTEMPT_DEADLINE
+        };
+        // DNS runs before the first datagram and is outside the attempt
+        // deadline, so the transport's own bound includes both bounded phases.
+        attempt + DNS_QUEUE_TIMEOUT + DNS_LOOKUP_TIMEOUT
     }
 }
 

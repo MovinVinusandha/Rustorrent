@@ -131,6 +131,16 @@ impl AnnounceEvent {
     pub const fn is_stopped(self) -> bool {
         matches!(self, Self::Stopped)
     }
+
+    /// Returns the BEP 15 wire value.
+    pub(crate) const fn as_udp(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Completed => 1,
+            Self::Started => 2,
+            Self::Stopped => 3,
+        }
+    }
 }
 
 /// Redirect policy carried by every request.

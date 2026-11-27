@@ -45,15 +45,12 @@ fn config() -> TrackerConfig {
         peer_id: *b"-BT0001-000000000001",
         port: 6881,
         key: 0x1234_5678,
-        private: false,
         completed_sent_at_start: false,
     }
 }
 
 fn tracker(tiers: &[&[&str]], private: bool, now: Instant) -> Tracker {
-    let mut config = config();
-    config.private = private;
-    Tracker::new(candidates(tiers, private), config, now).expect("tracker")
+    Tracker::new(candidates(tiers, private), config(), now).expect("tracker")
 }
 
 fn stats() -> AnnounceStats {
@@ -82,17 +79,48 @@ fn url(text: &str) -> TrackerUrl {
 }
 
 fn failure_retry(events: &[TrackerEvent]) -> Instant {
-    match events {
-        [TrackerEvent::AnnounceFailed { retry_at, .. }] => retry_at.expect("retry"),
-        other => panic!("expected one failure event, got {other:?}"),
-    }
+    events
+        .iter()
+        .find_map(|event| match event {
+            TrackerEvent::AnnounceFailed { retry_at, .. } => *retry_at,
+            _ => None,
+        })
+        .expect("failure event with a retry")
 }
 
 fn success_interval(events: &[TrackerEvent]) -> Duration {
-    match events {
-        [TrackerEvent::AnnounceSucceeded { interval }] => *interval,
-        other => panic!("expected one success event, got {other:?}"),
-    }
+    events
+        .iter()
+        .find_map(|event| match event {
+            TrackerEvent::AnnounceSucceeded { interval } => Some(*interval),
+            _ => None,
+        })
+        .expect("success event")
+}
+
+fn peer(index: u8) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(127, 0, 0, index), 6881))
+}
+
+fn peer_batches(events: &[TrackerEvent]) -> Vec<Vec<SocketAddr>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            TrackerEvent::PeersReceived(peers) => Some(peers.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_switch(events: &[TrackerEvent], drop_peers: bool) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            TrackerEvent::TrackerSwitched {
+                drop_peers: value
+            } if *value == drop_peers
+        )
+    })
 }
 
 #[tokio::test(start_paused = true)]
@@ -579,4 +607,483 @@ async fn calls_without_an_in_flight_attempt_are_ignored() {
     assert!(tracker.handle_cancel(now).is_empty());
     assert_eq!(tracker.next_deadline(), Some(now));
     assert_eq!(tracker.status().consecutive_failures, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_public_round_stops_after_the_first_successful_tier() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[
+            &["http://a.example/announce", "http://b.example/announce"],
+            &["http://c.example/announce"],
+        ],
+        false,
+        now,
+    );
+    let mut requested = Vec::new();
+
+    let request = tracker.build_request(now, stats()).expect("started on a");
+    requested.push(request.url.clone());
+    assert_eq!(request.url, url("http://a.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::Started);
+
+    let events = tracker.handle_failure(now, TrackerError::Timeout);
+    let retry_at = failure_retry(&events);
+    assert_eq!(retry_at, now);
+    assert!(has_switch(&events, false));
+
+    let request = tracker.build_request(now, stats()).expect("started on b");
+    requested.push(request.url.clone());
+    assert_eq!(request.url, url("http://b.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::Started);
+    tracker.handle_response(now, response(1800));
+
+    let a_retry = tracker.next_deadline().expect("a retry");
+    assert!(a_retry > now && a_retry <= now + Duration::from_secs(36));
+
+    let request = tracker.build_request(a_retry, stats()).expect("a retry");
+    requested.push(request.url.clone());
+    assert_eq!(request.url, url("http://a.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::None);
+    tracker.handle_response(a_retry, response(1800));
+
+    let b_retry = tracker.next_deadline().expect("b retry");
+    assert_eq!(b_retry, now + Duration::from_secs(1800));
+    let request = tracker.build_request(b_retry, stats()).expect("b retry");
+    requested.push(request.url.clone());
+    assert_eq!(request.url, url("http://b.example/announce"));
+    tracker.handle_response(b_retry, response(1800));
+
+    assert!(!requested.contains(&url("http://c.example/announce")));
+    assert!(requested.iter().all(|requested| {
+        *requested == url("http://a.example/announce")
+            || *requested == url("http://b.example/announce")
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn peers_from_successes_in_one_tier_are_merged_and_deduped() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[
+            &["http://a.example/announce", "http://b.example/announce"],
+            &["http://c.example/announce"],
+        ],
+        false,
+        now,
+    );
+    let p1 = peer(1);
+    let p2 = peer(2);
+    let p3 = peer(3);
+
+    let request = tracker.build_request(now, stats()).expect("started");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    tracker.handle_response(now, response(60));
+
+    let at = now + Duration::from_secs(60);
+    let request = tracker.build_request(at, stats()).expect("a");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    let mut a = response(60);
+    a.peers = vec![p1, p2];
+    let a_events = tracker.handle_response(at, a);
+    assert_eq!(peer_batches(&a_events), vec![vec![p1, p2]]);
+
+    let request = tracker.build_request(at, stats()).expect("b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::None);
+    let mut b = response(60);
+    b.peers = vec![p2, p3];
+    let b_events = tracker.handle_response(at, b);
+    assert_eq!(peer_batches(&b_events), vec![vec![p3]]);
+    assert_eq!(tracker.status().peer_count, 3);
+    assert!(tracker.build_request(at, stats()).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_first_successful_tracker_in_a_tier_moves_to_the_front() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&[
+            "http://a.example/announce",
+            "http://b.example/announce",
+            "http://c.example/announce",
+        ]],
+        false,
+        now,
+    );
+
+    let request = tracker.build_request(now, stats()).expect("started");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    tracker.handle_response(now, response(60));
+
+    let at = now + Duration::from_secs(60);
+    let request = tracker.build_request(at, stats()).expect("a");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    tracker.handle_failure(at, TrackerError::Timeout);
+
+    let request = tracker.build_request(at, stats()).expect("b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    let mut b = response(60);
+    b.peers = vec![peer(1)];
+    tracker.handle_response(at, b);
+
+    let request = tracker.build_request(at, stats()).expect("c");
+    assert_eq!(request.url, url("http://c.example/announce"));
+    let mut c = response(60);
+    c.peers = vec![peer(2)];
+    let events = tracker.handle_response(at, c);
+
+    assert!(has_switch(&events, false));
+    assert_eq!(
+        tracker.status().active_url,
+        Some(url("http://b.example/announce"))
+    );
+    assert_eq!(
+        tracker.slots[0]
+            .iter()
+            .map(|slot| slot.url.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            url("http://b.example/announce"),
+            url("http://a.example/announce"),
+            url("http://c.example/announce"),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_tracker_keeps_its_own_backoff() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&["http://a.example/announce", "http://b.example/announce"]],
+        false,
+        now,
+    );
+
+    let request = tracker.build_request(now, stats()).expect("started");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    tracker.handle_response(now, response(60));
+
+    let at = now + Duration::from_secs(60);
+    let request = tracker.build_request(at, stats()).expect("a");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    tracker.handle_response(at, response(60));
+
+    let request = tracker.build_request(at, stats()).expect("b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    tracker.handle_failure(at, TrackerError::Timeout);
+    assert_eq!(tracker.slots[0][1].failures, 1);
+    assert_eq!(tracker.status().consecutive_failures, 0);
+
+    let b_retry = tracker.next_deadline().expect("b retry");
+    assert!(b_retry > at && b_retry < at + Duration::from_secs(60));
+    let request = tracker.build_request(b_retry, stats()).expect("b retry");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    tracker.handle_failure(b_retry, TrackerError::Timeout);
+    assert_eq!(tracker.status().consecutive_failures, 2);
+
+    let a_retry = tracker.next_deadline().expect("a retry");
+    assert_eq!(a_retry, at + Duration::from_secs(60));
+    let request = tracker.build_request(a_retry, stats()).expect("a retry");
+    assert_eq!(request.url, url("http://a.example/announce"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_private_failure_switches_to_the_next_candidate_and_drops_peers() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&["http://a.example/announce", "http://b.example/announce"]],
+        true,
+        now,
+    );
+
+    let request = tracker.build_request(now, stats()).expect("started");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    let events = tracker.handle_failure(now, TrackerError::Timeout);
+    assert!(has_switch(&events, true));
+    assert_eq!(
+        tracker.status().active_url,
+        Some(url("http://b.example/announce"))
+    );
+    assert_eq!(failure_retry(&events), now);
+
+    let request = tracker.build_request(now, stats()).expect("started on b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::Started);
+    let events = tracker.handle_response(now, response(60));
+    assert!(!has_switch(&events, true));
+    assert_eq!(
+        tracker.notified_trackers(),
+        vec![url("http://b.example/announce")]
+    );
+    assert_eq!(
+        tracker.status().active_url,
+        Some(url("http://b.example/announce"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_private_torrent_cycles_through_every_candidate_before_retrying() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&[
+            "http://a.example/announce",
+            "http://b.example/announce",
+            "http://c.example/announce",
+        ]],
+        true,
+        now,
+    );
+    let mut requested = Vec::new();
+    let mut at = now;
+
+    for expected in [
+        "http://a.example/announce",
+        "http://b.example/announce",
+        "http://c.example/announce",
+    ] {
+        let request = tracker.build_request(at, stats()).expect("started");
+        requested.push(request.url.clone());
+        assert_eq!(request.url, url(expected));
+        assert_eq!(request.event, AnnounceEvent::Started);
+        let events = tracker.handle_failure(at, TrackerError::Timeout);
+        assert!(has_switch(&events, true));
+        at = failure_retry(&events);
+        assert_eq!(Some(at), tracker.next_deadline());
+    }
+
+    let request = tracker.build_request(at, stats()).expect("a retry");
+    requested.push(request.url.clone());
+    assert_eq!(request.url, url("http://a.example/announce"));
+    assert_eq!(
+        requested,
+        vec![
+            url("http://a.example/announce"),
+            url("http://b.example/announce"),
+            url("http://c.example/announce"),
+            url("http://a.example/announce"),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_private_single_candidate_retries_without_a_switch() {
+    let now = Instant::now();
+    let mut tracker = tracker(&[&["http://a.example/announce"]], true, now);
+
+    tracker.build_request(now, stats()).expect("started");
+    let events = tracker.handle_failure(now, TrackerError::Timeout);
+    assert!(!has_switch(&events, true));
+    let retry = failure_retry(&events);
+    assert!(retry > now);
+
+    let request = tracker.build_request(retry, stats()).expect("retry");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::Started);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_private_success_keeps_the_active_tracker() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&["http://a.example/announce", "http://b.example/announce"]],
+        true,
+        now,
+    );
+
+    tracker.build_request(now, stats()).expect("started");
+    let events = tracker.handle_response(now, response(60));
+    assert!(!has_switch(&events, true));
+
+    let at = now + Duration::from_secs(60);
+    let request = tracker.build_request(at, stats()).expect("periodic");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::None);
+    let events = tracker.handle_response(at, response(60));
+    assert!(!has_switch(&events, true));
+    assert_eq!(
+        tracker.status().active_url,
+        Some(url("http://a.example/announce"))
+    );
+    assert!(
+        !tracker
+            .notified_trackers()
+            .contains(&url("http://b.example/announce"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn notified_trackers_excludes_trackers_that_only_failed() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&[
+            "http://a.example/announce",
+            "http://b.example/announce",
+            "http://c.example/announce",
+        ]],
+        true,
+        now,
+    );
+
+    tracker.build_request(now, stats()).expect("started on a");
+    tracker.handle_failure(now, TrackerError::Timeout);
+    tracker.build_request(now, stats()).expect("started on b");
+    tracker.handle_response(now, response(60));
+
+    assert_eq!(
+        tracker.notified_trackers(),
+        vec![url("http://b.example/announce")]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopped_ignores_backoff_and_is_terminal() {
+    let now = Instant::now();
+    let mut tracker = tracker(&[&["http://a.example/announce"]], false, now);
+
+    tracker.build_request(now, stats()).expect("started");
+    let events = tracker.handle_failure(now, TrackerError::Timeout);
+    assert!(failure_retry(&events) > now);
+
+    tracker.stop(now);
+    assert_eq!(tracker.next_deadline(), Some(now));
+    let request = tracker.build_request(now, stats()).expect("stopped");
+    assert_eq!(request.event, AnnounceEvent::Stopped);
+    tracker.handle_response(now, response(0));
+    assert!(tracker.is_terminal());
+    assert_eq!(tracker.next_deadline(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_between_tier_successes_keeps_emitted_peers_and_does_not_repeat_them() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[&["http://a.example/announce", "http://b.example/announce"]],
+        false,
+        now,
+    );
+    let p1 = peer(1);
+    let p2 = peer(2);
+
+    tracker.build_request(now, stats()).expect("started");
+    tracker.handle_response(now, response(60));
+
+    let at = now + Duration::from_secs(60);
+    tracker.build_request(at, stats()).expect("a");
+    let mut a = response(60);
+    a.peers = vec![p1];
+    let a_events = tracker.handle_response(at, a);
+    assert_eq!(peer_batches(&a_events), vec![vec![p1]]);
+
+    let request = tracker.build_request(at, stats()).expect("b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    tracker.handle_cancel(at);
+    assert_eq!(tracker.status().consecutive_failures, 0);
+
+    let request = tracker.build_request(at, stats()).expect("b retry");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    let mut b = response(60);
+    b.peers = vec![p1, p2];
+    let b_events = tracker.handle_response(at, b);
+    assert_eq!(peer_batches(&b_events), vec![vec![p2]]);
+    assert_eq!(tracker.status().peer_count, 2);
+    assert_eq!(
+        tracker.status().active_url,
+        Some(url("http://a.example/announce"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_scripted_public_session_matches_the_expected_trace() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[
+            &["http://a.example/announce", "http://b.example/announce"],
+            &["http://c.example/announce"],
+        ],
+        false,
+        now,
+    );
+    let mut trace = Vec::new();
+
+    // The started event fails on A and succeeds on B.
+    let request = tracker.build_request(now, stats()).expect("started");
+    trace.push((request.url.clone(), request.event));
+    tracker.handle_failure(now, TrackerError::Timeout);
+
+    let request = tracker.build_request(now, stats()).expect("started");
+    trace.push((request.url.clone(), request.event));
+    tracker.handle_response(now, response(60));
+
+    // A's own backoff expires first. Its success moves it to the front and
+    // ends the round, so C is never contacted.
+    let a_retry = tracker.next_deadline().expect("a retry");
+    assert!(a_retry > now && a_retry < now + Duration::from_secs(60));
+    let request = tracker.build_request(a_retry, stats()).expect("a retry");
+    trace.push((request.url.clone(), request.event));
+    tracker.handle_response(a_retry, response(60));
+
+    // B is next at its interval.
+    let b_due = tracker.next_deadline().expect("b due");
+    assert_eq!(b_due, now + Duration::from_secs(60));
+    let request = tracker.build_request(b_due, stats()).expect("b");
+    trace.push((request.url.clone(), request.event));
+    let events = tracker.handle_response(b_due, response(60));
+    assert!(has_switch(&events, false));
+
+    // The remaining timer is A's interval.
+    let a_due = tracker.next_deadline().expect("a due");
+    assert_eq!(a_due, a_retry + Duration::from_secs(60));
+    let request = tracker.build_request(a_due, stats()).expect("a");
+    trace.push((request.url.clone(), request.event));
+    tracker.handle_response(a_due, response(60));
+
+    assert_eq!(
+        trace,
+        vec![
+            (url("http://a.example/announce"), AnnounceEvent::Started),
+            (url("http://b.example/announce"), AnnounceEvent::Started),
+            (url("http://a.example/announce"), AnnounceEvent::None),
+            (url("http://b.example/announce"), AnnounceEvent::None),
+            (url("http://a.example/announce"), AnnounceEvent::None),
+        ]
+    );
+    assert_eq!(
+        tracker.status().active_url,
+        Some(url("http://a.example/announce"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unrepresentable_deadline_schedules_no_timer() {
+    let base = Instant::now();
+    let mut good = Duration::ZERO;
+    let mut bad = Duration::from_secs(u64::MAX);
+    if base.checked_add(bad).is_some() {
+        // This platform can represent every offset; the fallback cannot be
+        // reached with a real monotonic clock, so there is nothing to check.
+        return;
+    }
+    while bad - good > Duration::from_secs(1) {
+        let mid = good + (bad - good) / 2;
+        if base.checked_add(mid).is_some() {
+            good = mid;
+        } else {
+            bad = mid;
+        }
+    }
+
+    // Stop one second short of the largest representable instant, so adding
+    // any real announce interval overflows.
+    let delta = good.saturating_sub(Duration::from_secs(1));
+    tokio::time::advance(delta).await;
+    let now = Instant::now();
+
+    let mut tracker = tracker(&[&["http://a.example/announce"]], false, now);
+    tracker.build_request(now, stats()).expect("started");
+    tracker.handle_response(now, response(60));
+
+    assert_eq!(tracker.status().next_announce, None);
+    assert_eq!(tracker.next_deadline(), None);
+    assert!(!tracker.is_terminal());
 }

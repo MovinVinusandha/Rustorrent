@@ -952,16 +952,29 @@ impl Tracker {
     }
 
     fn find_next_due_after(&self, current: (usize, usize), now: Instant) -> Option<(usize, usize)> {
+        let due = |slot: &Slot| slot.next_attempt.is_some_and(|at| at <= now);
+
         let mut after = false;
         for (tier, row) in self.slots.iter().enumerate() {
             for (index, slot) in row.iter().enumerate() {
-                if !after {
-                    if (tier, index) == current {
-                        after = true;
-                    }
+                if (tier, index) == current {
+                    after = true;
                     continue;
                 }
-                if slot.next_attempt.is_some_and(|at| at <= now) {
+                if after && due(slot) {
+                    return Some((tier, index));
+                }
+            }
+        }
+
+        // Wrap to the slots before `current`: a failure in a later tier must
+        // not bypass an earlier tier whose backoff has already expired.
+        for (tier, row) in self.slots.iter().enumerate() {
+            for (index, slot) in row.iter().enumerate() {
+                if (tier, index) == current {
+                    return None;
+                }
+                if due(slot) {
                     return Some((tier, index));
                 }
             }

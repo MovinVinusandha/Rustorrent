@@ -240,8 +240,8 @@ its own measurements.
   redirect, peer drop on switch). DHT (item 9), PEX, LSD and web seeds must
   enforce the flag when they land.
 - BEP 23 compact and list peers, BEP 7 `peers6` and `key`.
-- Events `started`, `completed`, `stopped`; periodic announces; exponential
-  backoff after a failed round.
+- Events `started`, `completed`, `stopped`; periodic announces; per-tracker
+  exponential backoff after a failed attempt.
 - Response fields: `interval`, `min interval`, `complete`, `incomplete`,
   `peers`, `peers6`, `tracker id`, `failure reason`, `warning message`; the
   HTTP fields are defined in `docs/beps/bep_0003_tracker.md`.
@@ -459,10 +459,10 @@ Production constructs the connector from `webpki-roots` alone; this is how the
 - `AnnounceRequest` carries `RedirectPolicy::{Public, SameHostOnly}`.
   `Public` allows a cross-host target after the normal checks. `SameHostOnly`
   requires the same host and effective port (defaults 80 and 443), allows an
-  `http` to `https` upgrade only to the default https port, and rejects a
-  downgrade. Hosts are compared with a trailing dot normalized. A cross-host
-  `SameHostOnly` target fails before a second request and is never added to
-  the candidate list.
+  `http` to `https` upgrade to the same port or the default https port, and
+  rejects a downgrade. Hosts are compared with a trailing dot normalized. A
+  cross-host `SameHostOnly` target fails before a second request and is never
+  added to the candidate list.
 - Every hop is parsed, resolved, policy-checked and connected from scratch.
   No connection, DNS result or TLS session is reused across hops.
 - Userinfo in a redirect target is rejected, not silently stripped.
@@ -827,11 +827,11 @@ backoff below are our policy.
   discovery, not listening.
 - A redirect is followed only to the same host and the same effective port
   (defaults 80 and 443), with a trailing dot normalized; an `http` to `https`
-  upgrade is allowed only to the default https port, and a downgrade is
-  rejected. `RedirectPolicy::SameHostOnly` is carried in `AnnounceRequest`;
-  the pure `RedirectPolicy::allows(from, to)` helper decides a hop and the HTTP
-  transport (4d) calls it. A cross-host redirect fails before a second request;
-  the target is never added to the candidate list.
+  upgrade is allowed to the same port or the default https port, and a
+  downgrade is rejected. `RedirectPolicy::SameHostOnly` is carried in
+  `AnnounceRequest`; the pure `RedirectPolicy::allows(from, to)` helper decides
+  a hop and the HTTP transport (4d) calls it. A cross-host redirect fails
+  before a second request; the target is never added to the candidate list.
 - A private torrent with no usable tracker fails with
   `TrackerError::NoUsableTracker` without contacting anything.
 
@@ -982,10 +982,10 @@ pub trait TrackerTransport: Send + Sync {
   socket. There is no outer announce timeout: each transport owns its own
   deadlines, so a UDP attempt is not cut at 60 seconds and a `stopped`
   announce uses its 2-second budget.
-- The production implementation is `NetworkTransport`, which dispatches on
-  the URL scheme to the HTTP and UDP transports. Tests inject a
-  `FakeTransport` that records requests and returns scripted responses,
-  errors or pending futures.
+- The production UDP implementation is `UdpTransport`. The HTTP transport
+  (4d) adds `HttpTransport` and a `NetworkTransport` dispatcher that selects by
+  URL scheme. Tests inject a `FakeTransport` that records requests and returns
+  scripted responses, errors or pending futures.
 
 Types (engine-internal, `crates/engine/src/tracker`):
 

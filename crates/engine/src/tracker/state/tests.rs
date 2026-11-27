@@ -1094,3 +1094,53 @@ async fn an_unrepresentable_deadline_schedules_no_timer() {
     assert_eq!(tracker.next_deadline(), None);
     assert!(!tracker.is_terminal());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_event_does_not_bypass_backoff_when_an_earlier_tier_is_due() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[
+            &["http://a.example/announce"],
+            &["http://b.example/announce"],
+        ],
+        false,
+        now,
+    );
+
+    tracker.build_request(now, stats()).expect("started on a");
+    tracker.handle_response(now, response(60));
+
+    let at = now + Duration::from_secs(60);
+    let request = tracker.build_request(at, stats()).expect("periodic a");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    tracker.handle_failure(at, TrackerError::Timeout);
+
+    let request = tracker.build_request(at, stats()).expect("periodic b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    tracker.handle_response(at, response(60));
+
+    // A's backoff expires before B's interval, so A is due while B is active.
+    let a_retry = tracker.next_deadline().expect("a retry");
+    tracker.complete(a_retry);
+    let request = tracker
+        .build_request(a_retry, stats())
+        .expect("completed on b");
+    assert_eq!(request.url, url("http://b.example/announce"));
+    tracker.handle_failure(a_retry, TrackerError::Timeout);
+
+    // B must not be retried immediately with its backoff overwritten; the
+    // earlier tier is due, so the pending event moves there.
+    let request = tracker
+        .build_request(a_retry, stats())
+        .expect("completed on a");
+    assert_eq!(request.url, url("http://a.example/announce"));
+    assert_eq!(request.event, AnnounceEvent::Completed);
+    tracker.handle_response(a_retry, response(60));
+
+    // `completed` was sent once; a duplicate trigger is ignored.
+    tracker.complete(a_retry + Duration::from_secs(1));
+    assert_eq!(
+        tracker.next_deadline(),
+        Some(a_retry + Duration::from_secs(60))
+    );
+}

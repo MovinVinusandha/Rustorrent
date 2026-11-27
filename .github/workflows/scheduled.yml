@@ -35,6 +35,8 @@ jobs:
           - metainfo
           - piece_buffer
           - resume
+          - tracker_http_response
+          - tracker_url
     env:
       # The repo pins stable in rust-toolchain.toml; the environment variable
       # outranks it so cargo-fuzz and the sanitizer use nightly.

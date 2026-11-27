@@ -40,6 +40,21 @@ behaviour out of scope; this note covers the HTTP tracker fields.
   `key`, `trackerid`, `ip`, `ipv4` and `ipv6` parameters are removed first.
   Names are matched after percent-decoding and case-insensitively, so
   `%69nfo_hash` and `info%5Fhash` cannot compete with our values.
+- Our decision: tracker URL hosts are canonical dotted-quad IPv4, bracketed
+  IPv6, or validated ASCII DNS names. Every numeric-looking host is
+  classified before DNS; the following are rejected, never passed to a
+  resolver:
+
+  | Host | Why |
+  |---|---|
+  | `127.1` | 2-part shorthand |
+  | `2130706433` | single integer |
+  | `0177.0.0.1` | octal part |
+  | `0x7f.0.0.1`, `0x7f000001` | hex part |
+  | `1.2.3.4.5`, `1.2.3.256` | not four canonical parts |
+  | `127.0.0.1.` | trailing dot on an IP literal |
+
+  See ADR 0003 section 9 for the full rule and the IPv6 cases.
 - Our decision: `numwant` is 50 for `started`, `completed` and periodic
   announces, and 0 for `stopped`.
 - Our decision: `key` is a 32-bit value from OS randomness, generated once per
@@ -68,9 +83,9 @@ behaviour out of scope; this note covers the HTTP tracker fields.
 - BEP says (BEP 7): `peers6` is an optional compact IPv6 peer list.
 - Our decision: the body must be a bencode dictionary and is capped at 1 MiB
   before decoding; the existing bounded decoder is used.
-- Our decision: a missing `interval` means 1800 seconds. The effective
-  interval is `clamp(max(interval, min_interval), 60, 86400)`. An interval of
-  0 or a negative value is treated as missing.
+- Our decision: a missing `interval` means 1800 seconds. `interval` and
+  `min interval` are clamped to 60..=86400, so 0 and negative values become
+  60. The effective interval is `max(interval, min_interval)` after clamping.
 - Our decision: `complete` and `incomplete` are optional non-negative
   counters. Unknown keys are ignored.
 - Our decision: `tracker id` is ignored if longer than 256 bytes and held in a

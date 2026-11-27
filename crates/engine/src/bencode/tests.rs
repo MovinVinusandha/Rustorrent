@@ -62,6 +62,50 @@ fn decodes_integer_boundaries() {
 }
 
 #[test]
+fn oversized_integers_are_opaque_when_enabled() {
+    let options = DecodeOptions {
+        allow_integer_overflow: true,
+        ..DecodeOptions::default()
+    };
+
+    for input in [
+        b"i9223372036854775808e".as_slice(),
+        b"i-9223372036854775809e".as_slice(),
+    ] {
+        let value = decode_with_options(input, options).expect("oversized integer");
+        assert_eq!(value.as_int(), None);
+        assert_eq!(value.as_bytes(), None);
+        assert_eq!(encode(&value).expect("re-encode"), input);
+    }
+
+    assert_eq!(
+        decode(b"i9223372036854775808e"),
+        Err(Error::IntegerOverflow { offset: 0 })
+    );
+}
+
+#[test]
+fn the_overflow_option_keeps_malformed_integers_invalid() {
+    let options = DecodeOptions {
+        allow_integer_overflow: true,
+        ..DecodeOptions::default()
+    };
+
+    assert!(matches!(
+        decode_with_options(b"i12x3e", options),
+        Err(Error::InvalidInteger { .. })
+    ));
+    assert!(matches!(
+        decode_with_options(b"i01e", options),
+        Err(Error::IntegerLeadingZero { .. })
+    ));
+    assert!(matches!(
+        decode_with_options(b"i-0e", options),
+        Err(Error::IntegerNegativeZero { .. })
+    ));
+}
+
+#[test]
 fn records_exact_spans() {
     let value = decode(b"li1ee").unwrap();
     assert_eq!(value.span(), 0..5);
@@ -282,6 +326,7 @@ fn default_limits_and_options_match_constants() {
     assert_eq!(limits.max_container_items, MAX_CONTAINER_ITEMS);
     assert_eq!(limits.max_nodes, MAX_NODES);
     assert_eq!(DecodeOptions::default().key_order, KeyOrder::Strict);
+    assert!(!DecodeOptions::default().allow_integer_overflow);
 }
 
 fn raw_value<'a>(kind: Kind<'a>) -> Value<'a> {

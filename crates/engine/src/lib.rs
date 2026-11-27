@@ -11,6 +11,7 @@ pub mod piece;
 pub mod removal;
 pub mod resume;
 pub mod storage;
+pub mod tracker;
 
 /// Version of the engine API spoken by this build.
 pub const API_VERSION: u32 = bt_proto::API_VERSION;

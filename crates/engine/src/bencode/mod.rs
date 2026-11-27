@@ -85,6 +85,12 @@ pub struct DecodeOptions {
     pub limits: Limits,
     /// Dictionary key ordering rule.
     pub key_order: KeyOrder,
+    /// Decode integers outside `i64` as opaque values instead of failing.
+    ///
+    /// [`Value::as_int`] returns `None` for such a value. Tracker responses
+    /// use this so an oversized `interval` is ignored instead of rejecting
+    /// the whole response.
+    pub allow_integer_overflow: bool,
 }
 
 impl Default for DecodeOptions {
@@ -92,6 +98,7 @@ impl Default for DecodeOptions {
         Self {
             limits: Limits::default(),
             key_order: KeyOrder::Strict,
+            allow_integer_overflow: false,
         }
     }
 }
@@ -109,6 +116,8 @@ pub struct Value<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind<'a> {
     Int(i64),
+    /// A canonical integer literal outside `i64`, kept as its raw digits.
+    BigInt(&'a [u8]),
     Bytes(&'a [u8]),
     List(Vec<Value<'a>>),
     Dict(BTreeMap<&'a [u8], Value<'a>>),
@@ -169,6 +178,9 @@ impl<'a> Value<'a> {
     }
 
     /// Returns the integer value, or `None` for another value kind.
+    ///
+    /// An integer decoded outside `i64` with
+    /// [`DecodeOptions::allow_integer_overflow`] also returns `None`.
     pub fn as_int(&self) -> Option<i64> {
         match &self.kind {
             Kind::Int(value) => Some(*value),
@@ -381,6 +393,7 @@ pub fn decode_with_limits(input: &[u8], limits: Limits) -> Result<Value<'_>, Err
         DecodeOptions {
             limits,
             key_order: KeyOrder::Strict,
+            allow_integer_overflow: false,
         },
     )
 }
@@ -402,6 +415,7 @@ struct Decoder<'a> {
     pos: usize,
     limits: Limits,
     key_order: KeyOrder,
+    allow_integer_overflow: bool,
     nodes: usize,
 }
 
@@ -418,6 +432,7 @@ impl<'a> Decoder<'a> {
             pos: 0,
             limits: options.limits,
             key_order: options.key_order,
+            allow_integer_overflow: options.allow_integer_overflow,
             nodes: 0,
         })
     }
@@ -529,12 +544,14 @@ impl<'a> Decoder<'a> {
 
         let text =
             std::str::from_utf8(bytes).map_err(|_| Error::InvalidInteger { offset: start })?;
-        let value = text
-            .parse::<i64>()
-            .map_err(|_| Error::IntegerOverflow { offset: start })?;
+        let kind = match text.parse::<i64>() {
+            Ok(value) => Kind::Int(value),
+            Err(_) if self.allow_integer_overflow => Kind::BigInt(bytes),
+            Err(_) => return Err(Error::IntegerOverflow { offset: start }),
+        };
 
         self.pos = end + 1;
-        Ok(Kind::Int(value))
+        Ok(kind)
     }
 
     fn parse_string_bytes(&mut self) -> Result<&'a [u8], Error> {
@@ -708,6 +725,11 @@ impl Encoder<'_> {
             Kind::Int(number) => {
                 self.push(b"i")?;
                 self.push(number.to_string().as_bytes())?;
+                self.push(b"e")
+            }
+            Kind::BigInt(literal) => {
+                self.push(b"i")?;
+                self.push(literal)?;
                 self.push(b"e")
             }
             Kind::Bytes(bytes) => self.encode_bytes(bytes),

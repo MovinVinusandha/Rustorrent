@@ -409,7 +409,8 @@ Production constructs the connector from `webpki-roots` alone; this is how the
 - The body is capped at 1 MiB before bencode decoding. The existing bounded
   bencode decoder is used with its depth limit; no length prefix can allocate
   beyond the body.
-- The body must be a bencode dictionary. `failure reason` is checked first and
+- The body must be a bencode dictionary; keys may arrive in any order and
+  duplicates are rejected. `failure reason` is checked first and
   produces `TrackerError::Rejected { message: TrackerMessage }`. `warning
   message` is stored as a `TrackerMessage`. `interval` and `min interval` are
   integers in seconds; missing `interval` means 1800. The effective interval
@@ -750,23 +751,52 @@ a fuzz target.
 
 Rules:
 
-- scheme and host are lowercased; the default port is removed for `http`
-  (80) and `https` (443). A `udp` URL must carry an explicit port.
+- The URL is ASCII only. Non-ASCII bytes, spaces, ASCII controls and
+  backslashes are rejected anywhere, not only in the host.
+- scheme and host are lowercased; the default port is omitted from the
+  normalized URL for `http` (80) and `https` (443). A `udp` URL must carry an
+  explicit port. The parsed form keeps the effective port; a port equal to the
+  scheme default is omitted when the URL is rendered, so redaction shows only a
+  non-default port.
 - userinfo (`user:pass@`) is rejected, not stripped.
-- IPv6 literals are bracketed and parsed with `std::net::Ipv6Addr`.
-- non-ASCII hosts, spaces, controls, backslashes and empty labels are
-  rejected.
-- the path defaults to `/`; query and fragment are preserved as raw bytes
-  after validation.
-- the raw URL is capped at 2048 bytes; longer URLs are invalid.
-- a URL with a fragment keeps it in the raw form but never sends it; the
+- A host is one of three things: a canonical IPv4 literal, a bracketed IPv6
+  literal, or a validated DNS name. Every numeric-looking host is classified
+  before any resolver sees it; it is never passed to DNS as a name.
+- IPv4 literals are exactly four decimal parts, 1-3 digits each, no leading
+  zero unless the part is `0`, each at most 255. A host made only of digits
+  and dots is accepted only in that canonical form. Any host that matches the
+  `inet_aton` numeric grammar (decimal, octal with a leading `0`, hex with
+  `0x`, or a 1-3 part shorthand) but is not canonical dotted-quad is
+  rejected. This closes the `127.1`, `2130706433`, `0177.0.0.1`,
+  `0x7f.0.0.1` and `127.0.0.1.` bypasses.
+- IPv6 literals are bracketed and parsed with `std::net::Ipv6Addr`; zone IDs
+  (`%eth0`) are rejected. Unbracketed IPv6, bracketed IPv4 and empty brackets
+  are rejected.
+- IPv4-mapped IPv6 (`::ffff:a.b.c.d`) and the transition forms in section 6
+  parse as IPv6. `Host::canonical_ip()` returns the embedded IPv4 for a
+  mapped address and the IPv6 address otherwise, so the section 6 policy has
+  one place to check; the policy still blocks the mapped range itself.
+- DNS names are ASCII LDH: labels of 1-63 bytes, 253 bytes total, no empty
+  labels, no leading or trailing hyphen, no underscore. One trailing dot is
+  allowed and stripped; a trailing dot on an IPv4 literal is rejected.
+- `%` in the host is rejected. In the path, query and fragment every `%` must
+  be followed by two hex digits; a bare or invalid escape is rejected.
+- the path defaults to `/`; query and fragment are preserved byte for byte
+  after validation. `+` is a literal plus, `%20` is a space, and mixed-case
+  hex in an existing escape is not rewritten.
+- the URL is capped at 2048 bytes; longer URLs are invalid.
+- a URL with a fragment keeps it in the parsed form but never sends it; the
   fragment is not part of the HTTP request target.
 
 ### Redaction
 
-`TrackerUrl` stores the raw string and implements `Debug` and `Display` as
-the redacted form. The raw form is only reachable through a crate-internal
-`raw()` accessor used by the transport, and is never put in a log field.
+`TrackerUrl` stores the parsed components only: scheme, host, effective port,
+path, query and fragment. It does not store the original string. `Debug` and
+`Display` render the redacted form; the path and query are available to the
+transport as the same bytes that were parsed, and the request target is
+rebuilt from those components. `PartialEq` and `Hash` use the same normalized
+tuple `(scheme, host, port, path, query, fragment)`, never the original
+spelling, so equal URLs hash equally.
 
 Redaction keeps `scheme://host[:port]` and replaces the rest:
 
@@ -799,6 +829,10 @@ Redaction keeps `scheme://host[:port]` and replaces the rest:
   documented limit. The sanitized text may be shown in the UI through
   `sanitized_text()`; logs and errors record only a length and a
   classification.
+- Sanitization is bounded: the URL is at most 2048 bytes and the message at
+  most 256 bytes, so the token scan is O(URL tokens x 256) and no input can
+  make it unbounded. The implementation keeps that bound; a test uses the
+  longest accepted URL and a 256-byte message.
 - `TrackerId` is a newtype over the opaque bytes. It is never displayed, is
   ignored if longer than 256 bytes, is sent back only to the tracker that
   issued it, and its `Debug` and `Display` forms print only its length. It is
@@ -860,7 +894,11 @@ Types (engine-internal, `crates/engine/src/tracker`):
 - `RedirectPolicy { Public, SameHostOnly }`
 - `AnnounceResponse { interval: Duration, min_interval: Option<Duration>,
   complete: Option<u64>, incomplete: Option<u64>, peers: Vec<SocketAddr>,
-  tracker_id: Option<TrackerId>, warning: Option<TrackerMessage> }`
+  tracker_id: Option<TrackerId>, warning: Option<TrackerMessage>,
+  peer_warnings: PeerWarnings }`
+- `PeerWarnings { malformed_peer_records: u32, dropped_peer_records: u32,
+  truncated_peers: u32, missing_peers: bool }`: counters for recoverable
+  peer-list problems. They contain no tracker bytes and are safe to log.
 - `TrackerId`: opaque bytes, ignored if longer than 256; `Debug` and `Display`
   print only the length.
 - `TrackerMessage`: tracker-supplied bytes plus `sanitized_text(&TrackerUrl)`
@@ -886,6 +924,16 @@ outside tests.
   `Debug` and `Display` of `TrackerUrl`, `AnnounceRequest`, `AnnounceResponse`,
   `TrackerId` and `TrackerMessage`, and cover a path segment of 3 and 4 bytes,
   a fragment passkey, and a percent-encoded echo.
+- URL IP-literal vectors: canonical dotted-quad accepted; `127.1`,
+  `2130706433`, `0177.0.0.1`, `0x7f.0.0.1`, `0x7f000001`, `1.2.3.4.5`,
+  `1.2.3.256` and `127.0.0.1.` rejected. `[::1]:80` and `[::1]` are accepted
+  with the default port; `[::1]:0`, `[::1]:65536`, `[::1`, `::1]` and
+  `[::1]x` are rejected. `[::ffff:127.0.0.1]` maps to the embedded IPv4
+  through `Host::canonical_ip()`.
+- URL round-trip vectors: `+`, `%20` and mixed-case hex in the path and query
+  survive unchanged; equal URLs with different original spellings compare
+  equal and hash equally. The sanitizer test uses the longest accepted URL
+  and a 256-byte message.
 - BEP 23 and BEP 7 peer decoding vectors, partial records, invalid
   addresses, dedup and caps.
 - HTTP head/body parser vectors: Content-Length, chunked (including a chunk

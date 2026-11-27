@@ -9,11 +9,16 @@ use thiserror::Error;
 pub mod id;
 pub mod message;
 pub mod peers;
+pub mod response;
 pub mod url;
 
 pub use id::{MAX_TRACKER_ID_LEN, TrackerId};
 pub use message::{MAX_MESSAGE_LEN, TrackerMessage};
 pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};
+pub use response::{
+    AnnounceResponse, DEFAULT_INTERVAL_SECS, MAX_INTERVAL_SECS, MAX_RESPONSE_BYTES,
+    MIN_INTERVAL_SECS, decode_response,
+};
 pub use url::{
     Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl,
 };
@@ -30,4 +35,13 @@ pub enum TrackerError {
     /// The tracker response has the wrong shape.
     #[error("malformed tracker response")]
     MalformedResponse,
+    /// The tracker rejected the announce.
+    #[error("tracker rejected the announce")]
+    Rejected {
+        /// Tracker-supplied failure text; length-only in diagnostics.
+        message: TrackerMessage,
+    },
+    /// The tracker response body is larger than the cap.
+    #[error("tracker response is too large")]
+    TooLarge,
 }

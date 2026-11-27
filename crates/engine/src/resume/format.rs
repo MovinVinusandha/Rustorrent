@@ -29,7 +29,7 @@
 use sha1::{Digest, Sha1};
 use thiserror::Error;
 
-use crate::bencode::{self, DecodeOptions, KeyOrder, Limits, Value};
+use crate::bencode::{self, DecodeOptions, KeyOrder, Value};
 use crate::bitfield::{Bitfield, BitfieldError};
 use crate::storage::layout::FileMap;
 
@@ -284,8 +284,8 @@ pub fn decode_document(bytes: &[u8]) -> Result<ResumeDocument, DecodeError> {
     let document = bencode::decode_with_options(
         bytes,
         DecodeOptions {
-            limits: Limits::default(),
             key_order: KeyOrder::Strict,
+            ..DecodeOptions::default()
         },
     )?;
 

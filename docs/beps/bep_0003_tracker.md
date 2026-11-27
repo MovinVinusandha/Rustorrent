@@ -83,9 +83,9 @@ behaviour out of scope; this note covers the HTTP tracker fields.
 - BEP says (BEP 7): `peers6` is an optional compact IPv6 peer list.
 - Our decision: the body must be a bencode dictionary and is capped at 1 MiB
   before decoding; the existing bounded decoder is used.
-- Our decision: a missing `interval` means 1800 seconds. The effective
-  interval is `clamp(max(interval, min_interval), 60, 86400)`. An interval of
-  0 or a negative value is treated as missing.
+- Our decision: a missing `interval` means 1800 seconds. `interval` and
+  `min interval` are clamped to 60..=86400, so 0 and negative values become
+  60. The effective interval is `max(interval, min_interval)` after clamping.
 - Our decision: `complete` and `incomplete` are optional non-negative
   counters. Unknown keys are ignored.
 - Our decision: `tracker id` is ignored if longer than 256 bytes and held in a

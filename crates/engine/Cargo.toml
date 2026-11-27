@@ -9,9 +9,10 @@ publish.workspace = true
 [dependencies]
 bt-platform.workspace = true
 bt-proto.workspace = true
+getrandom.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net"] }
 
 [dev-dependencies]
 proptest.workspace = true

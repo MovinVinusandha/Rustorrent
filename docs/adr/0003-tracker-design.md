@@ -498,14 +498,31 @@ Summary of the decisions:
 - Before every send, if `now - id_received >= 50 s`, send a connect instead of
   the announce. 50 s is our decision; BEP 15 allows use until 60 s after
   receipt, and a tracker silently ignores an expired ID. The new ID is used
-  once the connect response arrives.
+  once the connect response arrives. The guard is defensive: at the nominal
+  schedule the ID is at most 45 s old at a send, so it only matters when a
+  send is delayed by a stalled task or a suspended host. It never moves the
+  deadline.
 - `num_want` is 50 for a normal announce and 0 for `stopped`, matching the
   HTTP `numwant` rule.
 - Receive buffer 4096 bytes; 200 peers per response; 6-byte stride on IPv4
   and 18-byte stride on IPv6, selected by the socket family.
-- Transaction IDs are 32 bits from OS randomness, fresh for each connect and
-  announce. A mismatched action or transaction ID is ignored and the receive
-  wait continues.
+- Transaction IDs are 32 bits from OS randomness. A retransmission reuses the
+  ID of the request it repeats; a fresh ID is used only for a new request (the
+  first connect, a connect after the 50 s guard, and the announce after a
+  connect response). A mismatched action or transaction ID is ignored and the
+  receive wait continues.
+- An ICMP port-unreachable (`ConnectionRefused` on Unix, `ConnectionReset` on
+  Windows) ends the attempt immediately with the typed `Connect` error; waiting
+  for the deadline would only delay failover. On Windows, an oversized
+  datagram that fails `recv` with `WSAEMSGSIZE` maps to `TooLarge`.
+- Reflection and amplification are bounded by construction: requests are 16
+  and 98 bytes, an attempt sends at most three datagrams, and responses are
+  accepted only from the connected address. A spoofed source can therefore
+  make us send at most three small datagrams, never a large reply.
+- Requirement for 4c: the session keeps at most one UDP attempt in flight per
+  tracker host. A stalled attempt must not stack sockets, timers or
+  retransmissions for the same host; the next attempt starts only after the
+  previous one ends.
 - Error packets are checked for transaction ID. The text is untrusted: it is
   passed through the same best-effort sanitizer as an HTTP `failure reason`
   before it may be shown in the UI, and it is never logged. Logs and errors

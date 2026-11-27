@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::codec::{ConnectionId, Decoded, Family, UdpAnnounceResponse, decode};
-use crate::tracker::TrackerMessage;
+use crate::tracker::{TrackerError, TrackerMessage};
 
 /// Deadline of a normal attempt, measured from the first datagram.
 pub(crate) const ATTEMPT_DEADLINE: Duration = Duration::from_secs(105);
@@ -41,8 +41,9 @@ const SECOND_WAIT: Duration = Duration::from_secs(30);
 
 /// Source of transaction IDs.
 pub(crate) trait TransactionIds: Send {
-    /// Returns a fresh 32-bit transaction ID.
-    fn next(&mut self) -> u32;
+    /// Returns a fresh 32-bit transaction ID, or `None` when the OS source
+    /// failed.
+    fn next(&mut self) -> Option<u32>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +93,9 @@ pub(crate) enum AttemptOutcome {
     Rejected(TrackerMessage),
     /// The deadline passed with no usable response.
     Timeout,
+    /// The attempt could not continue, for example because the OS
+    /// randomness source failed.
+    Failed(TrackerError),
 }
 
 /// One UDP announce attempt.
@@ -129,6 +133,7 @@ impl UdpAttempt {
     }
 
     /// Returns the absolute deadline of this attempt.
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -169,11 +174,13 @@ impl UdpAttempt {
         match decoded {
             Decoded::Connect(connection_id) => {
                 if matches!(pending, Pending::Connect { .. }) && self.sends < MAX_SENDS {
+                    let Some(transaction_id) = self.ids.next() else {
+                        self.outcome = Some(AttemptOutcome::Failed(TrackerError::Random));
+                        return;
+                    };
                     self.connection_id = Some(connection_id);
                     self.id_received = Some(now);
-                    self.pending = Some(Pending::Announce {
-                        transaction_id: self.ids.next(),
-                    });
+                    self.pending = Some(Pending::Announce { transaction_id });
                     self.next_send = Some(now);
                 }
             }
@@ -220,7 +227,9 @@ impl UdpAttempt {
             };
         }
 
-        let transaction_id = self.ids.next();
+        let Some(transaction_id) = self.ids.next() else {
+            return Step::Done(AttemptOutcome::Failed(TrackerError::Random));
+        };
         self.pending = Some(Pending::Connect { transaction_id });
         Step::Connect { transaction_id }
     }
@@ -243,7 +252,7 @@ impl UdpAttempt {
         attempt.connection_id = Some(connection_id);
         attempt.id_received = Some(received_at);
         attempt.pending = Some(Pending::Announce {
-            transaction_id: attempt.ids.next(),
+            transaction_id: attempt.ids.next().expect("test transaction source"),
         });
         attempt
     }

@@ -4,6 +4,8 @@
 //! parsing lives in [`url`]; transports and response decoding are added in
 //! later steps.
 
+use std::io;
+
 use thiserror::Error;
 
 pub mod dns;
@@ -58,4 +60,23 @@ pub enum TrackerError {
     /// Host resolution failed, timed out or produced no usable address.
     #[error("tracker DNS lookup failed")]
     Dns,
+    /// The tracker address refused the connection or reset it.
+    ///
+    /// This ends the attempt immediately: an ICMP port-unreachable means
+    /// nothing is listening, and waiting for the deadline would only delay
+    /// failover to the next tracker.
+    #[error("tracker is not reachable")]
+    Connect,
+    /// The attempt deadline passed with no usable response.
+    #[error("tracker announce timed out")]
+    Timeout,
+    /// A socket operation failed; only the error kind is kept.
+    #[error("tracker network error")]
+    Io {
+        /// Kind of the failed operation.
+        kind: io::ErrorKind,
+    },
+    /// The OS randomness source failed.
+    #[error("failed to generate a transaction ID")]
+    Random,
 }

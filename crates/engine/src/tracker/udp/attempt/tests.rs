@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::tracker::PeerWarnings;
-use crate::tracker::TrackerMessage;
 use crate::tracker::udp::codec::{ConnectionId, Family, UdpAnnounceResponse};
+use crate::tracker::{PeerWarnings, TrackerError, TrackerMessage};
 
 use super::{
     ATTEMPT_DEADLINE, AttemptOutcome, MAX_SENDS, RECONNECT_AGE, STOPPED_DEADLINE, Step,
@@ -24,9 +23,9 @@ impl CountingIds {
 }
 
 impl TransactionIds for CountingIds {
-    fn next(&mut self) -> u32 {
+    fn next(&mut self) -> Option<u32> {
         self.0 = self.0.wrapping_add(1);
-        self.0
+        Some(self.0)
     }
 }
 
@@ -448,6 +447,25 @@ async fn a_datagram_before_the_first_send_is_ignored() {
         Step::Connect {
             transaction_id: 0x1001
         }
+    );
+}
+
+struct FailingIds;
+
+impl TransactionIds for FailingIds {
+    fn next(&mut self) -> Option<u32> {
+        None
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transaction_id_failure_ends_the_attempt() {
+    let start = Instant::now();
+    let mut attempt = UdpAttempt::new(start, false, Box::new(FailingIds));
+
+    assert_eq!(
+        attempt.step(start),
+        Step::Done(AttemptOutcome::Failed(TrackerError::Random))
     );
 }
 

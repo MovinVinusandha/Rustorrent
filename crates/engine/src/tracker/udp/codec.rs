@@ -116,7 +116,6 @@ impl UdpEvent {
 /// The 32-bit IP address field is always zero: we never ask the tracker to
 /// publish a different address. The type stays crate-private until the public
 /// transport API lands; the session builds it from its own state.
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UdpAnnounce {
     /// Connection ID from the most recent connect response.
@@ -177,7 +176,6 @@ pub fn encode_connect(transaction_id: u32) -> [u8; CONNECT_REQUEST_LEN] {
 }
 
 /// Encodes an announce request as exactly 98 bytes.
-#[cfg(test)]
 pub(crate) fn encode_announce(
     request: &UdpAnnounce,
     transaction_id: u32,

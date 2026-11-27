@@ -6,6 +6,7 @@
 
 use thiserror::Error;
 
+pub mod dns;
 pub mod id;
 pub mod message;
 pub mod peers;
@@ -13,6 +14,10 @@ pub mod policy;
 pub mod response;
 pub mod url;
 
+pub use dns::{
+    DNS_LOOKUP_TIMEOUT, DNS_QUEUE_TIMEOUT, MAX_CONCURRENT_LOOKUPS, MAX_RESOLVED_ADDRESSES,
+    Resolver, SystemResolver,
+};
 pub use id::{MAX_TRACKER_ID_LEN, TrackerId};
 pub use message::{MAX_MESSAGE_LEN, TrackerMessage};
 pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};
@@ -49,4 +54,7 @@ pub enum TrackerError {
     /// Every candidate address is blocked by the target policy.
     #[error("blocked tracker target")]
     BlockedTarget,
+    /// Host resolution failed, timed out or produced no usable address.
+    #[error("tracker DNS lookup failed")]
+    Dns,
 }

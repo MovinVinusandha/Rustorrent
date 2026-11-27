@@ -11,12 +11,12 @@ bt-platform.workspace = true
 bt-proto.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 
 [lints]
 workspace = true

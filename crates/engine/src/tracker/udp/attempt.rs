@@ -25,22 +25,22 @@ use super::codec::{ConnectionId, Decoded, Family, UdpAnnounceResponse, decode};
 use crate::tracker::{TrackerError, TrackerMessage};
 
 /// Deadline of a normal attempt, measured from the first datagram.
-pub(crate) const ATTEMPT_DEADLINE: Duration = Duration::from_secs(105);
+pub const ATTEMPT_DEADLINE: Duration = Duration::from_secs(105);
 
 /// Deadline of a `stopped` announce.
-pub(crate) const STOPPED_DEADLINE: Duration = Duration::from_secs(2);
+pub const STOPPED_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Maximum number of datagrams sent in one attempt.
-pub(crate) const MAX_SENDS: u8 = 3;
+pub const MAX_SENDS: u8 = 3;
 
 /// Age at which a connection ID is replaced before a send.
-pub(crate) const RECONNECT_AGE: Duration = Duration::from_secs(50);
+pub const RECONNECT_AGE: Duration = Duration::from_secs(50);
 
 const FIRST_WAIT: Duration = Duration::from_secs(15);
 const SECOND_WAIT: Duration = Duration::from_secs(30);
 
 /// Source of transaction IDs.
-pub(crate) trait TransactionIds: Send {
+pub trait TransactionIds: Send {
     /// Returns a fresh 32-bit transaction ID, or `None` when the OS source
     /// failed.
     fn next(&mut self) -> Option<u32>;
@@ -62,7 +62,7 @@ impl Pending {
 
 /// The next thing the transport must do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Step {
+pub enum Step {
     /// Send a connect request now.
     Connect {
         /// Transaction ID to put in the request.
@@ -86,7 +86,7 @@ pub(crate) enum Step {
 
 /// Final result of one attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AttemptOutcome {
+pub enum AttemptOutcome {
     /// The tracker answered the announce.
     Announce(UdpAnnounceResponse),
     /// The tracker sent an error packet.
@@ -99,7 +99,7 @@ pub(crate) enum AttemptOutcome {
 }
 
 /// One UDP announce attempt.
-pub(crate) struct UdpAttempt {
+pub struct UdpAttempt {
     deadline: Instant,
     next_send: Option<Instant>,
     sends: u8,
@@ -112,7 +112,7 @@ pub(crate) struct UdpAttempt {
 
 impl UdpAttempt {
     /// Starts an attempt at `now`.
-    pub(crate) fn new(now: Instant, stopped: bool, ids: Box<dyn TransactionIds>) -> Self {
+    pub fn new(now: Instant, stopped: bool, ids: Box<dyn TransactionIds>) -> Self {
         let deadline = now
             + if stopped {
                 STOPPED_DEADLINE
@@ -139,7 +139,7 @@ impl UdpAttempt {
     }
 
     /// Advances the state machine to `now`.
-    pub(crate) fn step(&mut self, now: Instant) -> Step {
+    pub fn step(&mut self, now: Instant) -> Step {
         if let Some(outcome) = self.outcome.take() {
             return Step::Done(outcome);
         }
@@ -163,7 +163,7 @@ impl UdpAttempt {
     /// The datagram is decoded against the pending transaction ID, so a wrong
     /// action or transaction ID is ignored and changes nothing: the deadline
     /// and the next send stay where they were.
-    pub(crate) fn on_datagram(&mut self, now: Instant, datagram: &[u8], family: Family) {
+    pub fn on_datagram(&mut self, now: Instant, datagram: &[u8], family: Family) {
         let Some(pending) = self.pending else {
             return;
         };

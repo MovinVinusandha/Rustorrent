@@ -7,6 +7,9 @@
 //! Time in this module uses `tokio::time::Instant` only, never
 //! `std::time::Instant`, so a paused clock controls every deadline in tests.
 
+#[cfg(feature = "fuzzing")]
+pub mod attempt;
+#[cfg(not(feature = "fuzzing"))]
 pub(crate) mod attempt;
 pub mod codec;
 pub(crate) mod transport;

@@ -1036,12 +1036,16 @@ outside tests.
 - `tracker_http_response`: arbitrary bytes to the head, body, chunked and
   bencode decoders, including `peers` and `peers6`; no panic, no allocation
   beyond the 1 MiB cap.
-- `tracker_udp_response`: arbitrary bytes to the connect, announce and error
-  decoders; no panic.
-- The response targets also call `sanitized_text()` on every `failure reason`
-  and `warning message`, so the sanitizer is fuzzed with the same input.
-- Targets are registered in `fuzz/Cargo.toml`, compile in CI, and run weekly,
-  matching the existing bencode and metainfo targets.
+- `tracker_udp_response`: arbitrary datagram sequences through the attempt
+  state machine and the connect, announce and error decoders; no panic, at
+  most three sends, retransmissions keep their transaction ID, fresh requests
+  get a new one, at most 200 peers, and error text stays out of `Debug` and
+  `Display`.
+- The HTTP response target also calls `sanitized_text()` on every
+  `failure reason` and `warning message`, so the sanitizer is fuzzed with the
+  same input.
+- Targets are registered in `fuzz/Cargo.toml` and compile in CI; the
+  scheduled workflow lists the targets it runs.
 
 ## 12. Consequences
 

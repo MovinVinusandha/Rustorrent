@@ -409,7 +409,8 @@ Production constructs the connector from `webpki-roots` alone; this is how the
 - The body is capped at 1 MiB before bencode decoding. The existing bounded
   bencode decoder is used with its depth limit; no length prefix can allocate
   beyond the body.
-- The body must be a bencode dictionary. `failure reason` is checked first and
+- The body must be a bencode dictionary; keys may arrive in any order and
+  duplicates are rejected. `failure reason` is checked first and
   produces `TrackerError::Rejected { message: TrackerMessage }`. `warning
   message` is stored as a `TrackerMessage`. `interval` and `min interval` are
   integers in seconds; missing `interval` means 1800. The effective interval

@@ -7,7 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::bencode::{self, DecodeOptions, Value};
+use crate::bencode::{self, DecodeOptions, KeyOrder, Value};
 
 use super::{PeerWarnings, TrackerError, TrackerId, TrackerMessage, decode_peers};
 
@@ -56,6 +56,7 @@ pub fn decode_response(body: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     }
 
     let options = DecodeOptions {
+        key_order: KeyOrder::Lenient,
         allow_integer_overflow: true,
         ..DecodeOptions::default()
     };

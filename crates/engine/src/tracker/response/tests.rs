@@ -290,6 +290,17 @@ fn wrong_typed_peer_fields_are_malformed() {
 }
 
 #[test]
+fn unsorted_keys_are_accepted_and_duplicates_are_rejected() {
+    let response = decode_response(b"d5:peers0:8:intervali1800ee").expect("unsorted response keys");
+    assert_eq!(response.interval, Duration::from_secs(1800));
+
+    assert_eq!(
+        decode_response(b"d8:intervali1800e8:intervali1800e5:peers0:e"),
+        Err(TrackerError::MalformedResponse)
+    );
+}
+
+#[test]
 fn unknown_keys_are_ignored() {
     let response = decode(vec![
         (b"another".as_slice(), Value::list(vec![])),

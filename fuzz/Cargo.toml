@@ -40,6 +40,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "tracker_http_response"
+path = "fuzz_targets/tracker_http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tracker_url"
 path = "fuzz_targets/tracker_url.rs"
 test = false

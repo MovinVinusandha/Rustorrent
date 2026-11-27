@@ -8,6 +8,7 @@ use std::io;
 
 use thiserror::Error;
 
+pub mod backoff;
 pub mod candidates;
 pub mod dns;
 pub mod id;
@@ -19,6 +20,10 @@ pub mod transport;
 pub mod udp;
 pub mod url;
 
+pub use backoff::{
+    BASE_BACKOFF_SECS, JITTER_PERCENT, Jitter, JitterSeed, JitterSeedSource, MAX_BACKOFF_EXPONENT,
+    MAX_BACKOFF_SECS, effective_interval,
+};
 pub use candidates::{
     CandidateWarnings, MAX_TIERS, MAX_TRACKER_URLS, MAX_URLS_PER_TIER, OsShuffle, Shuffle,
     TrackerCandidates,

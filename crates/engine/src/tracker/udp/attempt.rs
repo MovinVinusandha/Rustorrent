@@ -24,6 +24,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::codec::{ConnectionId, Decoded, Family, decode};
+use crate::tracker::backoff::checked_deadline;
 use crate::tracker::{AnnounceResponse, TrackerError, TrackerMessage};
 
 /// Deadline of a normal attempt, measured from the first datagram.
@@ -115,12 +116,15 @@ pub struct UdpAttempt {
 impl UdpAttempt {
     /// Starts an attempt at `now`.
     pub fn new(now: Instant, stopped: bool, ids: Box<dyn TransactionIds>) -> Self {
-        let deadline = now
-            + if stopped {
-                STOPPED_DEADLINE
-            } else {
-                ATTEMPT_DEADLINE
-            };
+        let duration = if stopped {
+            STOPPED_DEADLINE
+        } else {
+            ATTEMPT_DEADLINE
+        };
+        // A synthetic clock can make the deadline unrepresentable. In that
+        // case the attempt times out immediately instead of panicking; a real
+        // monotonic clock cannot reach this state with a bounded duration.
+        let deadline = checked_deadline(now, duration).unwrap_or(now);
 
         Self {
             deadline,
@@ -207,8 +211,8 @@ impl UdpAttempt {
 
         self.sends += 1;
         self.next_send = match self.sends {
-            1 => Some(now + FIRST_WAIT),
-            2 => Some(now + SECOND_WAIT),
+            1 => checked_deadline(now, FIRST_WAIT),
+            2 => checked_deadline(now, SECOND_WAIT),
             _ => None,
         };
 

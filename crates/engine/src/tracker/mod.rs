@@ -6,9 +6,13 @@
 
 use thiserror::Error;
 
+pub mod id;
+pub mod message;
 pub mod peers;
 pub mod url;
 
+pub use id::{MAX_TRACKER_ID_LEN, TrackerId};
+pub use message::{MAX_MESSAGE_LEN, TrackerMessage};
 pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};
 pub use url::{
     Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl,

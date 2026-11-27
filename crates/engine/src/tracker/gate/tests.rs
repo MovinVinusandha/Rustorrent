@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -18,7 +19,7 @@ fn the_gate_is_shareable_between_tasks() {
 
 #[tokio::test(start_paused = true)]
 async fn a_host_and_port_has_at_most_one_attempt() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     let first = gate.acquire(key("udp://a.example:6969")).await;
 
     assert!(
@@ -37,7 +38,7 @@ async fn a_host_and_port_has_at_most_one_attempt() {
 
 #[tokio::test(start_paused = true)]
 async fn different_hosts_and_ports_do_not_share_a_gate() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     let _held = gate.acquire(key("udp://a.example:6969")).await;
 
     assert!(
@@ -54,7 +55,7 @@ async fn different_hosts_and_ports_do_not_share_a_gate() {
 
 #[tokio::test(start_paused = true)]
 async fn a_busy_gate_times_out_after_the_wait_budget() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     let _held = gate.acquire(key("udp://a.example:6969")).await;
     let start = Instant::now();
 
@@ -68,7 +69,7 @@ async fn a_busy_gate_times_out_after_the_wait_budget() {
 
 #[tokio::test(start_paused = true)]
 async fn a_waiter_registered_before_the_release_is_woken() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     let first = gate.acquire(key("udp://a.example:6969")).await;
     let mut waiter = Box::pin(gate.acquire(key("udp://a.example:6969")));
 
@@ -87,7 +88,7 @@ async fn a_waiter_registered_before_the_release_is_woken() {
 
 #[tokio::test(start_paused = true)]
 async fn a_cancelled_waiter_leaves_the_gate_free() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     let first = gate.acquire(key("udp://a.example:6969")).await;
     let mut waiter = Box::pin(gate.acquire(key("udp://a.example:6969")));
 
@@ -108,7 +109,7 @@ async fn a_cancelled_waiter_leaves_the_gate_free() {
 
 #[tokio::test(start_paused = true)]
 async fn normalized_hosts_share_the_key() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     let _held = gate.acquire(key("udp://A.Example.:6969")).await;
 
     assert!(
@@ -120,7 +121,7 @@ async fn normalized_hosts_share_the_key() {
 
 #[tokio::test(start_paused = true)]
 async fn a_released_key_can_be_acquired_again() {
-    let gate = HostGate::new();
+    let gate = Arc::new(HostGate::new());
     for _ in 0..3 {
         let permit = gate.acquire(key("udp://a.example:6969")).await;
         drop(permit);

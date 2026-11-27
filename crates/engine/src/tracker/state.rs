@@ -125,6 +125,15 @@ pub struct TrackerStatus {
     pub terminal: bool,
 }
 
+/// A tracker that has answered at least one announce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotifiedTracker {
+    /// Redacted tracker URL.
+    pub url: TrackerUrl,
+    /// Tracker ID returned by this tracker, if any.
+    pub tracker_id: Option<TrackerId>,
+}
+
 /// One candidate and its own backoff state.
 struct Slot {
     url: TrackerUrl,
@@ -262,16 +271,39 @@ impl Tracker {
     /// Returns the trackers that have answered at least one announce.
     ///
     /// The tracker task uses this list to send `stopped` to every notified
-    /// tracker; trackers that only ever failed are excluded. The task lands in
-    /// the next step, so the method is unused until then.
-    #[allow(dead_code)]
-    pub(crate) fn notified_trackers(&self) -> Vec<TrackerUrl> {
+    /// tracker; trackers that only ever failed are excluded.
+    pub(crate) fn notified_trackers(&self) -> Vec<NotifiedTracker> {
         self.slots
             .iter()
             .flatten()
             .filter(|slot| slot.notified)
-            .map(|slot| slot.url.clone())
+            .map(|slot| NotifiedTracker {
+                url: slot.url.clone(),
+                tracker_id: slot.tracker_id.clone(),
+            })
             .collect()
+    }
+
+    /// Returns the stable per-torrent announce inputs.
+    pub(crate) const fn config(&self) -> &TrackerConfig {
+        &self.config
+    }
+
+    /// Returns `true` for a private torrent.
+    pub(crate) const fn is_private(&self) -> bool {
+        self.private
+    }
+
+    /// Marks the state terminal after the task's stop fan-out.
+    pub(crate) fn mark_terminal(&mut self) {
+        self.terminal = true;
+        self.pending_event = None;
+        self.round = None;
+        self.next_announce = None;
+        self.in_flight = false;
+        self.in_flight_slot = None;
+        self.in_flight_event = None;
+        self.publish();
     }
 
     /// Builds the request that is due at `now`, if any.

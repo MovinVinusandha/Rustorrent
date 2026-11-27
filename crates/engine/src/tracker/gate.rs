@@ -15,7 +15,7 @@
 //! never across an `.await`. Waiters park on [`tokio::sync::Notify`].
 
 use std::collections::HashSet;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -63,7 +63,7 @@ impl HostGate {
     /// drop.
     ///
     /// The future is cancel-safe: dropping it while it waits leaves no state.
-    pub async fn acquire(&self, key: HostKey) -> GatePermit<'_> {
+    pub async fn acquire(self: &Arc<Self>, key: HostKey) -> GatePermit {
         loop {
             // Register before the check so a release between the check and the
             // await cannot be lost.
@@ -71,7 +71,10 @@ impl HostGate {
             {
                 let mut busy = self.lock();
                 if busy.insert(key.clone()) {
-                    return GatePermit { gate: self, key };
+                    return GatePermit {
+                        gate: Arc::clone(self),
+                        key,
+                    };
                 }
             }
             notified.await;
@@ -82,7 +85,7 @@ impl HostGate {
     ///
     /// Returns `None` when the wait expires; the caller decides whether that
     /// is a tracker timeout or a retryable scheduling delay.
-    pub async fn acquire_for(&self, key: HostKey, wait: Duration) -> Option<GatePermit<'_>> {
+    pub async fn acquire_for(self: &Arc<Self>, key: HostKey, wait: Duration) -> Option<GatePermit> {
         tokio::time::timeout(wait, self.acquire(key)).await.ok()
     }
 
@@ -96,12 +99,12 @@ impl HostGate {
 
 /// Releases its key when dropped.
 #[derive(Debug)]
-pub struct GatePermit<'a> {
-    gate: &'a HostGate,
+pub struct GatePermit {
+    gate: Arc<HostGate>,
     key: HostKey,
 }
 
-impl Drop for GatePermit<'_> {
+impl Drop for GatePermit {
     fn drop(&mut self) {
         {
             let mut busy = self.gate.lock();

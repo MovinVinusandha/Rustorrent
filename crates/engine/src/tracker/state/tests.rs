@@ -9,7 +9,7 @@ use crate::tracker::{
     TrackerCandidates, TrackerError, TrackerId, TrackerMessage, TrackerUrl,
 };
 
-use super::{Tracker, TrackerConfig, TrackerEvent};
+use super::{NotifiedTracker, Tracker, TrackerConfig, TrackerEvent};
 
 struct KeepOrder;
 
@@ -814,7 +814,10 @@ async fn a_private_failure_switches_to_the_next_candidate_and_drops_peers() {
     assert!(!has_switch(&events, true));
     assert_eq!(
         tracker.notified_trackers(),
-        vec![url("http://b.example/announce")]
+        vec![NotifiedTracker {
+            url: url("http://b.example/announce"),
+            tracker_id: None,
+        }]
     );
     assert_eq!(
         tracker.status().active_url,
@@ -908,7 +911,8 @@ async fn a_private_success_keeps_the_active_tracker() {
     assert!(
         !tracker
             .notified_trackers()
-            .contains(&url("http://b.example/announce"))
+            .iter()
+            .any(|tracker| tracker.url == url("http://b.example/announce"))
     );
 }
 
@@ -932,7 +936,10 @@ async fn notified_trackers_excludes_trackers_that_only_failed() {
 
     assert_eq!(
         tracker.notified_trackers(),
-        vec![url("http://b.example/announce")]
+        vec![NotifiedTracker {
+            url: url("http://b.example/announce"),
+            tracker_id: None,
+        }]
     );
 }
 

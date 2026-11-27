@@ -139,6 +139,15 @@ fn hex_host_forms_are_rejected() {
 }
 
 #[test]
+fn numeric_hosts_with_more_than_four_parts_are_rejected() {
+    for host in ["0x1.0x2.0x3.0x4.0x5", "0x7f.0.0.1.2", "1.2.3.4.0x5"] {
+        assert_invalid(&format!("http://{host}/"));
+    }
+
+    assert!(TrackerUrl::parse("http://1.2.3.4.example/").is_ok());
+}
+
+#[test]
 fn ipv6_hosts_are_bracketed_and_canonicalized() {
     let url = parse("http://[0:0:0:0:0:0:0:1]:8080/announce");
     assert_eq!(url.host(), &Host::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));

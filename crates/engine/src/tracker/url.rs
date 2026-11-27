@@ -361,14 +361,7 @@ fn parse_ipv4_part(part: &str) -> Result<u8, TrackerError> {
 }
 
 fn looks_like_inet_aton(text: &str) -> bool {
-    let mut parts = 0;
-    for part in text.split('.') {
-        parts += 1;
-        if parts > 4 || !is_numeric_part(part) {
-            return false;
-        }
-    }
-    parts != 0
+    text.split('.').all(is_numeric_part)
 }
 
 fn is_numeric_part(part: &str) -> bool {

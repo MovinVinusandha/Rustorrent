@@ -11,6 +11,7 @@ use thiserror::Error;
 pub mod backoff;
 pub mod candidates;
 pub mod dns;
+pub mod gate;
 pub mod id;
 pub mod message;
 pub mod peers;
@@ -33,6 +34,7 @@ pub use dns::{
     DNS_LOOKUP_TIMEOUT, DNS_QUEUE_TIMEOUT, MAX_CONCURRENT_LOOKUPS, MAX_RESOLVED_ADDRESSES,
     Resolver, SystemResolver,
 };
+pub use gate::{GATE_WAIT, GatePermit, HostGate, HostKey};
 pub use id::{MAX_TRACKER_ID_LEN, TrackerId};
 pub use message::{MAX_MESSAGE_LEN, TrackerMessage};
 pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};

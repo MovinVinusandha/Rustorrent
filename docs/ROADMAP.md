@@ -85,7 +85,11 @@ BEPs: 3, 7, 23, 15, 12, 27 (tracker rules), 9, 10, 5. See BEP_STATUS.md.
     connect/announce/error codec, 0/15/45 s schedule under one 105 s deadline,
     connected socket, and a fuzz target. The 4c announce state machine wires
     it; the item-10 session drives that.
-  - [ ] 4c. Announce state machine (BEP 12/27, backoff).
+  - [x] 4c. Announce state machine (BEP 12/27, backoff). Candidate
+    construction with caps and the `announce` fallback, per-tracker backoff,
+    public tier rounds, private failover with peer drops, and the tracker task
+    with a per-host UDP gate, watchdog, bounded event channels and a 3 s stop
+    fan-out. The item-10 session spawns it.
   - The `deny.toml`-only PR for the `webpki-roots` license lands before 4d.
   - [ ] 4d. HTTP transport, then the `https` feature.
 - [ ] 5. Peer connection, handshake, message loop

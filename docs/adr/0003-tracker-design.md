@@ -60,17 +60,25 @@ full document.
   may show `failure reason` and `warning message` after best-effort
   sanitization (controls stripped, 256-byte cap, URL tokens of at least 4
   bytes replaced); `tracker id` is suppressed.
-- Tiers: BEP 12 for public torrents (shuffle once, try all trackers in a tier,
-  move a success to the front; 32 URLs, 8 tiers, 4 per tier; every round
+- Tiers: BEP 12 for public torrents (shuffle once, try every due tracker in a
+  tier, move a success to the front; 32 URLs, 8 tiers, 4 per tier; every round
   starts at tier 0). `announce-list` is used when it has at least one valid
   URL, otherwise `announce`; this is a documented deviation from BEP 12.
   Private torrents use one active tracker and switch only on failure (BEP 27).
-- State: `started`, `completed`, `stopped`; interval clamped to 60..86400 s;
-  saturating exponential backoff with a capped exponent and jitter; one
-  in-flight announce per torrent.
-- Boundary: engine-internal `TrackerTransport` with boxed futures; `bt-client`
-  defines its own `TrackerStatus` and maps from the engine snapshot. A
-  versioned `bt-proto` type is planned for v0.2.
+- State: `started`, `completed`, `stopped`; per-tracker failure counts and
+  `next_attempt`; interval clamped to 60..86400 s; saturating exponential
+  backoff with a capped exponent and one jitter seed per tracker; one in-flight
+  announce per torrent. A failed round waits for the soonest eligible tracker,
+  not for every candidate to become due.
+- Task: one task per torrent owns the state machine, the per-host UDP gate and
+  the transport. The watchdog is the transport's `max_duration` plus 5 s. The
+  stop fan-out is 3 s in total across notified trackers. Events use bounded
+  channels; status, peers and warnings coalesce under backpressure, while
+  `TrackerSwitched` and `NoUsableTracker` are never dropped.
+- Boundary: engine-internal `TrackerTransport` with boxed futures and a
+  `max_duration(event)` bound; `bt-client` defines its own `TrackerStatus` and
+  maps from the engine snapshot. A versioned `bt-proto` type is planned for
+  v0.2.
 - Tests: unit vectors, local HTTP/UDP/TLS trackers, paused-time UDP tests
   (including the 51 s reconnect, the final-send exception and the 105 s
   deadline), log-capture tests, and
@@ -650,47 +658,97 @@ keep it off outside tests and self-hosting.
 
 ### States
 
-`Tracker` is a pure state machine driven by the session's select loop. It
-exposes `next_deadline`, `build_request`, `handle_response`,
-`handle_failure`, and a `TrackerStatus` snapshot. It does not own a task, a
-socket or a clock; the session supplies `Instant` and cancellation. This keeps
-time-dependent tests deterministic.
+`Tracker` is a pure state machine. It exposes `next_deadline`,
+`build_request`, `handle_response`, `handle_failure`, `handle_cancel`,
+`complete`, `stop`, `queue_event`, and a `TrackerStatus` snapshot. It does not
+own a socket or a clock; the caller supplies `Instant` and reports
+cancellation. The tracker task in `tracker::task` owns the async half: it waits
+for the deadline, acquires the per-host gate, runs the transport, and feeds the
+result back. This keeps time-dependent tests deterministic.
 
 Per torrent, the state is:
 
-- candidate list (public: tiers; private: a flat ordered list);
-- active tier and tracker cursor, or active tracker index;
-- `next_announce: Instant`;
-- `pending_event: Option<AnnounceEvent>`;
-- `consecutive_failures: u32`;
-- `completed_sent: bool`;
-- `tracker_id: Option<TrackerId>`;
-- `last_interval: Duration`.
+- candidate list (public: tiers; private: one tier with the flattened list);
+- per-tracker slots, each with `failures`, `next_attempt`, `tracker_id` and
+  `notified`;
+- active tier and cursor, or active tracker index;
+- `next_announce`, `pending_event`, in-flight slot and event;
+- `started_sent`, `completed_sent`, `terminal`;
+- `last_success`, `last_interval`, `peer_count`, `last_warning`;
+- one jitter seed, generated once per tracker session.
+
+`TrackerStatus` is `Clone` and shared as `Arc<std::sync::RwLock<_>>`. A reader
+holds the lock only while cloning the snapshot; the state machine is
+synchronous and never holds it across an `.await`.
 
 ### Schedule
 
 - Torrent start: send `started` immediately.
 - Download completion: send `completed` immediately, once. If it fails, keep
   it pending and retry it on the next attempt; do not send `started` again.
+  `completed_sent_at_start` lets the session suppress the event when a previous
+  session already sent it; tracker state itself is not persisted.
 - Periodic announce: at `next_announce`, with no event.
-- Pause, removal or shutdown: send `stopped` once with a 2-second budget and
-  no retries, then become terminal. A crash or kill sends no `stopped`; this
-  is documented and unavoidable.
-- One in-flight announce per torrent. An event that arrives during an
-  announce is queued; after the in-flight attempt, `stopped` wins over
-  `completed`, and `completed` wins over `started`.
-- A successful announce sets `next_announce = now + effective_interval` and
-  resets `consecutive_failures`.
-- A failed round sets
-  `next_announce = now + min(30 * 2^min(failures - 1, 6), 1800)` seconds,
-  with ±20% jitter. The failure count uses saturating addition and the
-  exponent is capped at 6, so `u32::MAX` failures still produce the
-  1800-second cap and cannot overflow. The first retry is about 30 seconds,
-  then 60, 120, 240, 480, 960, and 1800 at the cap. Jitter avoids a
-  thundering herd after a tracker outage.
+- Pause, removal or shutdown: send `stopped` once with a 2-second per-attempt
+  budget, no retries, then become terminal. The task sends it to every tracker
+  that has answered at least one announce, in parallel, under one 3-second
+  total budget; trackers that only ever failed are skipped. A crash or kill
+  sends no `stopped`; this is documented and unavoidable.
+- One in-flight announce per torrent. An event that arrives during an announce
+  is queued; after the in-flight attempt, `stopped` wins over `completed`, and
+  `completed` wins over `started`. `started` and `completed` are sent at most
+  once after a success; a failed one stays pending. `stopped` is terminal and
+  is not retried after a failure.
+- A successful announce resets that tracker's failure count, records its
+  tracker ID and sets its `next_attempt = now + effective_interval`. The next
+  round is the earliest `next_attempt` among the trackers the round may use.
+- A failed attempt increments only that tracker's failure count and sets its
+  `next_attempt = now + min(30 * 2^min(failures - 1, 6), 1800)` seconds, with
+  ±20% jitter. The round then continues with the next due tracker; if none is
+  due, `next_announce` is the soonest `next_attempt`. The exponent is capped
+  at 6 and arithmetic saturates, so `u32::MAX` failures still produce the
+  1800-second cap. The first retry is about 30 seconds, then 60, 120, 240,
+  480, 960, and 1800 at the cap. Jitter avoids a thundering herd after a
+  tracker outage.
+- Cancellation is not a failure. The in-flight event is queued again and the
+  attempt is retried at `now` without changing the failure count. A cancelled
+  `stopped` attempt is terminal.
 - The interval is clamped to 60..86400 seconds, and `min interval` can only
   raise it. An interval of 0 or a negative value is treated as missing and
   becomes 1800.
+- Every `Instant + Duration` uses `checked_add`. If a deadline is not
+  representable, that tracker gets `next_attempt = None`, the event carries
+  `retry_at: None`, and the tracker is not scheduled again automatically. This
+  is reachable only after an absurd clock advance; the stop path still works.
+- Jitter uses one seed per tracker, generated at startup. If `getrandom` fails,
+  a documented FNV-1a seed derived from the info-hash is used instead; the
+  fallback is typed and non-fatal.
+
+### Attempts
+
+- The task builds one request at a time. A `udp` attempt first acquires the
+  per-host gate keyed by normalized `Host` and effective port, then runs the
+  transport under a watchdog of `max_duration(event)` plus 5 seconds. The gate
+  wait is capped at 30 seconds; an expired gate wait is reported as
+  `TrackerError::Timeout`.
+- The gate covers DNS resolution because the UDP attempt begins there. If the
+  task is dropped while the blocking resolver is still running, the permit is
+  released immediately and the resolver continues in the background under the
+  resolver's eight-permit semaphore. The gate never waits for the resolver.
+- A transport panic is contained with `catch_unwind` and reported as
+  `TrackerError::Panicked`. This only works in unwind builds; release builds
+  use `panic = "abort"`, so a transport panic ends the process.
+
+### Events
+
+The task uses non-blocking sends and never blocks a runtime worker. While the
+channel is full, status, peer and warning events coalesce and the task waits
+asynchronously for space. Within a coalesced segment only the latest status is
+kept, peer batches merge up to 200 peers with the oldest batches dropped first,
+and warnings keep their order. `TrackerSwitched` and `NoUsableTracker` are
+control events with a reserved slot: they split coalescing segments, are never
+dropped or merged, and queued data may be discarded to deliver them on
+shutdown.
 
 ### Public torrents (BEP 12)
 
@@ -708,20 +766,27 @@ caps, shuffle, merge, tier-0 reset and backoff below are our policy; the
   list, and the fallback keeps a torrent with a damaged list usable. The BEP 12
   note records the same rule.
 - One shuffle at load with OS randomness; the order is stable for the
-  session. Tests inject a fixed order.
+  session. Tests inject a fixed order. If OS entropy fails, the tier keeps its
+  document order.
 - Every announce round starts at tier 0.
 - Within a tier, try trackers sequentially in order, up to 4 per tier. Every
-  tracker in the tier is attempted even after one succeeds; the peer lists of
-  all successes in that tier are merged, deduplicated, and capped at 200 new
-  peers per round.
+  due tracker in the tier is attempted even after one succeeds; a tracker
+  whose own backoff has not elapsed is skipped. The peer lists of all
+  successes in that tier are merged, deduplicated, and capped at 200 new peers
+  per round.
 - Stop after the first tier with at least one success. Later tiers are
   backups and are not contacted in that round.
 - Move the first successful tracker in the tier to the front, keeping the
-  relative order of the rest. Failed trackers stay in place and are retried
-  next round. A success changes nothing else in the candidate order: the rest
-  of the order and the active tracker are unchanged.
-- If every tracker in every tier fails, the round fails and the backoff
-  applies. The next round starts at tier 0.
+  relative order of the rest. A failed tracker stays in place and is retried
+  when its own backoff elapses. A success changes nothing else in the
+  candidate order.
+- If every tracker in a tier is in backoff and none succeeded, the round moves
+  to the next tier. If every tracker in every tier fails, the round fails and
+  the next attempt is the soonest per-tracker `next_attempt`. The next round
+  starts at tier 0.
+- A public round emits `TrackerSwitched { drop_peers: false }` whenever the
+  active URL changes, including when a success moves to the front or the
+  round advances to another tracker.
 - Caps: 32 URLs, 8 tiers, 4 per tier. Duplicate normalized URLs are removed;
   invalid schemes, empty hosts and bad ports are dropped with counters. The
   caps are applied at parse time, before any private flattening.
@@ -740,11 +805,19 @@ backoff below are our policy.
   active tracker. The 32-URL, 8-tier and 4-per-tier caps are applied at parse
   time before flattening, so the flattened list holds at most 32 URLs.
 - The active tracker is used until it fails. On failure, the next candidate
-  becomes active immediately; only after every candidate has failed does the
-  round back off.
+  becomes active immediately with `TrackerSwitched { drop_peers: true }`; only
+  after every candidate has failed does the round back off. A successful
+  announce schedules only the active tracker.
+- `started` remains torrent-scoped in 4c: a tracker that becomes active later
+  receives the next periodic or pending announce, not a second `started`. A
+  per-tracker `started` after a private switch is recorded as an open question
+  for a later release.
 - Before the first announce to a new tracker, drop every peer connection and
   every peer candidate learned from the old tracker. Downloaded pieces and
   verified progress are kept.
+- The state machine clears the old tracker's ID on every switch. A stopped
+  fan-out sends each notified tracker its own ID; a tracker that only ever
+  failed is not contacted.
 - v0.1 delivers the private flag and the tracker rules above. DHT (item 9),
   PEX, LSD and web seeds are separate components; when each lands, it must
   consult the session-level guard and refuse to run for a private torrent. The
@@ -755,9 +828,10 @@ backoff below are our policy.
 - A redirect is followed only to the same host and the same effective port
   (defaults 80 and 443), with a trailing dot normalized; an `http` to `https`
   upgrade is allowed only to the default https port, and a downgrade is
-  rejected. `RedirectPolicy::SameHostOnly` is carried in `AnnounceRequest` and
-  enforced by the transport. A cross-host redirect fails before a second
-  request; the target is never added to the candidate list.
+  rejected. `RedirectPolicy::SameHostOnly` is carried in `AnnounceRequest`;
+  the pure `RedirectPolicy::allows(from, to)` helper decides a hop and the HTTP
+  transport (4d) calls it. A cross-host redirect fails before a second request;
+  the target is never added to the candidate list.
 - A private torrent with no usable tracker fails with
   `TrackerError::NoUsableTracker` without contacting anything.
 
@@ -890,6 +964,8 @@ pub trait TrackerTransport: Send + Sync {
         &'a self,
         request: AnnounceRequest,
     ) -> Pin<Box<dyn Future<Output = Result<AnnounceResponse, TrackerError>> + Send + 'a>>;
+
+    fn max_duration(&self, event: AnnounceEvent) -> Duration;
 }
 ```
 
@@ -897,6 +973,11 @@ pub trait TrackerTransport: Send + Sync {
   trait object-safe.
 - `Send + Sync` because the session is async and may move the tracker between
   workers.
+- `max_duration` returns the transport's own upper bound for one attempt,
+  including its DNS phase. The tracker task uses that value plus a 5-second
+  margin as a watchdog. An implementation must not return a value shorter than
+  its internal deadline. UDP returns 112 seconds for a normal announce and
+  9 seconds for `stopped`.
 - Dropping the returned future cancels the announce; the transport closes its
   socket. There is no outer announce timeout: each transport owns its own
   deadlines, so a UDP attempt is not cut at 60 seconds and a `stopped`
@@ -908,12 +989,16 @@ pub trait TrackerTransport: Send + Sync {
 
 Types (engine-internal, `crates/engine/src/tracker`):
 
+- `TrackerConfig { info_hash: InfoHash, peer_id: [u8; 20], port: u16,
+  key: u32, completed_sent_at_start: bool }`
 - `AnnounceRequest { url: TrackerUrl, info_hash: InfoHash, peer_id: PeerId,
   port: u16, stats: AnnounceStats, event: AnnounceEvent, num_want: i32,
   key: u32, tracker_id: Option<TrackerId>, redirect: RedirectPolicy }`
 - `AnnounceStats { uploaded: u64, downloaded: u64, left: u64 }`
-- `AnnounceEvent { None, Started, Completed, Stopped }`
-- `RedirectPolicy { Public, SameHostOnly }`
+- `AnnounceEvent { None, Started, Completed, Stopped }`; `num_want` is 50 for
+  normal announces and 0 for `stopped`.
+- `RedirectPolicy { Public, SameHostOnly }`; `allows(from, to)` is a pure
+  helper, and the transport still owns the decision to follow.
 - `AnnounceResponse { interval: Duration, min_interval: Option<Duration>,
   complete: Option<u64>, incomplete: Option<u64>, peers: Vec<SocketAddr>,
   tracker_id: Option<TrackerId>, warning: Option<TrackerMessage>,
@@ -925,14 +1010,31 @@ Types (engine-internal, `crates/engine/src/tracker`):
   print only the length.
 - `TrackerMessage`: tracker-supplied bytes plus `sanitized_text(&TrackerUrl)`
   for the UI; `Debug` and `Display` print only the length.
-- `TrackerError`: `InvalidUrl`, `UnsupportedScheme`, `Dns`, `BlockedTarget`,
-  `Connect`, `Tls`, `Timeout`, `HttpStatus(u16)`, `MalformedResponse`,
-  `Rejected { message: TrackerMessage }`, `TooLarge`, `Redirect`,
-  `Cancelled`, `NoUsableTracker`, `Io`.
-- `TrackerEvent`: `AnnounceSucceeded`, `AnnounceFailed`, `PeersReceived`,
-  `Warning`, `TrackerSwitched`, `NoUsableTracker`.
+- `TrackerCandidates`, `CandidateWarnings`, `Shuffle`, `OsShuffle`: validated
+  BEP 12 tiers after caps, deduplication and one shuffle; a valid
+  `announce-list` is never merged with `announce`.
+- `JitterSeed`, `JitterSeedSource { Os, InfoHash }`: one seed per tracker;
+  the info-hash fallback is typed and non-fatal.
+- `HostKey` (normalized `Host` plus effective port), `HostGate`, `GatePermit`,
+  `GATE_WAIT` (30 s). `GatePermit` owns an `Arc<HostGate>` so it can cross
+  awaits and task boundaries.
+- `TrackerError`: `InvalidUrl`, `InvalidPort`, `UnsupportedScheme`, `Dns`,
+  `BlockedTarget`, `Connect`, `Timeout`, `MalformedResponse`,
+  `Rejected { message: TrackerMessage }`, `TooLarge`, `Io { kind }`, `Random`,
+  `NoUsableTracker`, `Panicked`. The HTTP transport adds `Tls`,
+  `HttpStatus(u16)`, `Redirect` and `Cancelled` with 4d.
+- `TrackerEvent`: `AnnounceSucceeded { interval }`, `AnnounceFailed { error,
+  retry_at }`, `PeersReceived(Vec<SocketAddr>)`, `Warning(TrackerMessage)`,
+  `TrackerSwitched { drop_peers }`, `NoUsableTracker`.
 - `TrackerStatus`: redacted active URL, last success, next announce, last
-  interval, consecutive failures, peer count, last warning flag.
+  interval, consecutive failures of the active tracker, peer count, last
+  warning flag, usable tracker count, private flag and terminal flag. It is
+  `Clone`.
+- `NotifiedTracker { url, tracker_id }`: a tracker that answered at least one
+  announce; the task uses the list for the stop fan-out.
+- `TrackerCommand { Complete, Stop, UpdateStats(AnnounceStats) }`,
+  `TrackerHandle` and `spawn(tracker, transport, gate, stats)`: command
+  capacity 8, event capacity 32, watchdog margin 5 s, stop budget 3 s.
 
 `thiserror` derives the error type; `Display` never contains a raw URL or
 tracker-supplied text. All parsing returns `Result`, no `unwrap` or `expect`
@@ -994,12 +1096,19 @@ outside tests.
   105-second deadline; an attempt is not cut at 60 seconds.
 - Policy table with the first and last address of every range, plus
   IPv4-mapped and zone-ID cases.
-- State machine with a fake clock and fake transport: interval clamp, event
-  coalescing, saturating backoff including `u32::MAX` failures, tier order,
-  move-to-front, every round starting at tier 0 (including a round after a
-  failed round that follows an earlier success in a later tier), the
-  `announce` fallback when `announce-list` has no valid URL, private switch,
-  stopped budget, no-usable-tracker.
+- Candidate tests: an invalid-only `announce-list` with a valid `announce`
+  uses `announce`; one valid list URL ignores a different valid `announce`;
+  caps, deduplication, private flattening and the shuffle seam.
+- State machine with a fake clock: interval clamp, event priority and
+  coalescing, per-tracker saturating backoff including `u32::MAX` failures,
+  the soonest eligible tracker, tier order, move-to-front, every round starting
+  at tier 0, the `announce` fallback, private failover with `drop_peers`, the
+  started/completed once rules, `completed_sent_at_start`, cancellation and
+  no-usable-tracker.
+- Tracker task with a fake transport and paused clock: the watchdog, a busy
+  host gate, periodic announces, stop fan-out to every notified tracker with
+  each tracker's own ID, the 3-second stop budget, panic containment in unwind
+  builds, and a full event channel that still delivers a switch.
 
 ### Integration
 
@@ -1131,8 +1240,10 @@ Risks and mitigations:
 3. Owner decision on whether `allow_private_targets` is exposed in the v0.1
    daemon config. The default is `false`; tests and self-hosted setups set it
    through the engine API.
-4. BEP_STATUS rows for 7, 12, 15, 20, 23 and 27 stay `planned` until code
-   lands; the notes and this ADR do not change implementation status.
+4. BEP_STATUS rows 7, 12, 15 and 27 move to `in-progress` and row 23 to
+   `done` as their code lands; row 20 stays `planned` until the peer ID is
+   final. The tracker rows record the state machine, candidates and UDP
+   transport now, with session wiring in item 10.
 
 ## 15. Implementation order
 
@@ -1144,7 +1255,7 @@ leaves the workspace green.
 |---|---|---|---|
 | 1 | `feat/tracker-url-decode` | URL parser, `TrackerUrl`, redaction, BEP 23/7 peer decoding, response envelope, fuzz targets | none |
 | 2 | `feat/tracker-udp` | BEP 15 codec, UDP transport, target policy, 105 s deadline, reconnect, local fake tracker | `getrandom`; tokio `net`, `time`, `test-util` (dev) |
-| 3 | `feat/tracker-state` | state machine, BEP 12 tiers, BEP 27 private policy, backoff, fake transport | none |
+| 3 | `feat/tracker-state` | state machine, BEP 12 tiers, BEP 27 private policy, backoff, tracker task, host gate, fake transport | none |
 | 4 | `feat/tracker-http` | HTTP/1.1 client, redirects, `RedirectPolicy`, TLS connector and test roots, HTTPS tests | `rustls`, `tokio-rustls`, `ring`, roots, `rcgen` (dev), tokio `io-util` |
 | 5 | `docs/tracker-status` | BEP_STATUS, ROADMAP, ARCHITECTURE updates | none |
 

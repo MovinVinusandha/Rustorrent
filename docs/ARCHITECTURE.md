@@ -26,8 +26,13 @@ Modules:
   `StorageHandle` (`save`), and restore against a `Rechecker` (`restore_run`).
 - `removal`: orchestrates one torrent removal, deleting resume data first and
   torrent data through the storage worker when requested.
-- Planned: `tracker`, `peer`, `picker`, `choker`, `ratelimit`, `magnet`,
-  `dht`, `session`, `settings`.
+- `tracker`: strict URL parsing and redaction (`url`), BEP 23/7 peer
+  decoding (`peers`), response envelope (`response`), target policy
+  (`policy`), bounded DNS (`dns`), BEP 15 UDP (`udp`), BEP 12 candidates
+  (`candidates`), backoff and jitter (`backoff`), the per-host gate (`gate`),
+  the pure announce state machine (`state`), and the tracker task (`task`).
+- Planned: `peer`, `picker`, `choker`, `ratelimit`, `magnet`, `dht`,
+  `session`, `settings`.
 
 Threads and tasks: one storage OS thread per `StorageHandle` owns the
 open-file cache and all positioned I/O; async code talks to it through a
@@ -38,8 +43,11 @@ worker. A recheck reads 256 KiB chunks and hashes 1 MiB batches with an
 incremental SHA-1 state, overlapping one read with one hash. Resume load,
 save, and removal use `spawn_blocking` (bounded, non-cancellable jobs; see ADR
 0002). Data removal is a worker pass of 256-item unlink and `remove_dir`
-chunks, never a runtime-worker operation. The per-torrent session tasks,
-tracker, and peer tasks arrive with items 4-10; the session will own one
+chunks, never a runtime-worker operation. The tracker task (`tracker::task`) is
+one tokio task per torrent and awaits at most one transport attempt at a time;
+the item-10 session will spawn it and own the shared `HostGate`. Tracker DNS
+runs on the blocking pool behind an eight-permit semaphore. The per-torrent
+session tasks and peer tasks arrive with items 5-10; the session will own one
 `Rechecker`, one `PieceAssembler`, and one budget handle per torrent, plus one
 shared `HashPool`.
 

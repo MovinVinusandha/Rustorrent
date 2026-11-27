@@ -147,11 +147,11 @@ fn push_peer(
     warnings: &mut PeerWarnings,
     peer: SocketAddr,
 ) {
-    if !seen.insert(peer) {
-        return;
-    }
     if peers.len() >= MAX_PEERS_PER_RESPONSE {
         warnings.truncated_peers = warnings.truncated_peers.saturating_add(1);
+        return;
+    }
+    if !seen.insert(peer) {
         return;
     }
     peers.push(peer);

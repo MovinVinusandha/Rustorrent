@@ -287,6 +287,22 @@ fn list_peers_are_capped_at_two_hundred() {
 }
 
 #[test]
+fn duplicate_records_after_the_cap_are_counted_as_truncated() {
+    let mut bytes = Vec::new();
+    for index in 0..MAX_PEERS_PER_RESPONSE as u32 {
+        let address = Ipv4Addr::new(10, 2, (index / 256) as u8, (index % 256) as u8);
+        bytes.extend(v4_record(address, 6881));
+    }
+    bytes.extend(v4_record(Ipv4Addr::new(10, 2, 0, 0), 6881));
+
+    let response = response_dict(vec![(b"peers".as_slice(), Value::bytes(&bytes))]);
+    let (peers, warnings) = decode_peers(&response).expect("capped compact peers");
+
+    assert_eq!(peers.len(), MAX_PEERS_PER_RESPONSE);
+    assert_eq!(warnings.truncated_peers, 1);
+}
+
+#[test]
 fn the_merged_lists_share_one_cap() {
     let mut ipv4 = Vec::new();
     for index in 0..150u32 {

@@ -32,6 +32,27 @@ fn messages_are_capped_at_256_bytes_on_a_char_boundary() {
 }
 
 #[test]
+fn control_stripping_happens_before_the_cap() {
+    let mut bytes = vec![b'\n'; 4096];
+    bytes.extend(b"visible");
+
+    assert_eq!(message(&bytes).sanitized_text(&root()), "visible");
+}
+
+#[test]
+fn a_body_sized_message_stays_at_the_cap() {
+    let message = message(&vec![0xff; 1024 * 1024]);
+
+    assert_eq!(message.len(), 255);
+    assert!(
+        message
+            .sanitized_text(&root())
+            .chars()
+            .all(|character| character == '\u{fffd}')
+    );
+}
+
+#[test]
 fn control_characters_are_stripped() {
     let text = "a\nb\rc\0d\u{7f}e\u{85}f";
     assert_eq!(message(text.as_bytes()).sanitized_text(&root()), "abcdef");

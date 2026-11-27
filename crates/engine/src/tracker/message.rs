@@ -34,18 +34,39 @@ pub struct TrackerMessage(String);
 impl TrackerMessage {
     /// Stores tracker bytes after lossy conversion, control stripping and the
     /// 256-byte cap.
+    ///
+    /// Conversion is incremental: once the cap is reached, the remaining
+    /// bytes are not decoded, so a 1 MiB field never becomes a multi-megabyte
+    /// temporary string.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let lossy = String::from_utf8_lossy(bytes);
-        let mut text = String::with_capacity(lossy.len().min(MAX_MESSAGE_LEN));
-        for character in lossy.chars() {
-            if character.is_control() {
-                continue;
+        let mut text = String::with_capacity(MAX_MESSAGE_LEN);
+        let mut remaining = bytes;
+
+        while !remaining.is_empty() {
+            match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    push_text(&mut text, valid);
+                    break;
+                }
+                Err(error) => {
+                    let (valid, rest) = remaining.split_at(error.valid_up_to());
+                    let Ok(valid) = std::str::from_utf8(valid) else {
+                        break;
+                    };
+                    if !push_text(&mut text, valid) {
+                        break;
+                    }
+                    if text.len() + '\u{fffd}'.len_utf8() > MAX_MESSAGE_LEN {
+                        break;
+                    }
+                    text.push('\u{fffd}');
+
+                    let skip = error.error_len().unwrap_or(rest.len());
+                    remaining = &rest[skip..];
+                }
             }
-            if text.len() + character.len_utf8() > MAX_MESSAGE_LEN {
-                break;
-            }
-            text.push(character);
         }
+
         Self(text)
     }
 
@@ -100,6 +121,22 @@ impl TrackerMessage {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// Appends the non-control characters of `valid`, stopping at the cap.
+///
+/// Returns `false` when the next character would exceed [`MAX_MESSAGE_LEN`].
+fn push_text(text: &mut String, valid: &str) -> bool {
+    for character in valid.chars() {
+        if character.is_control() {
+            continue;
+        }
+        if text.len() + character.len_utf8() > MAX_MESSAGE_LEN {
+            return false;
+        }
+        text.push(character);
+    }
+    true
 }
 
 impl fmt::Debug for TrackerMessage {

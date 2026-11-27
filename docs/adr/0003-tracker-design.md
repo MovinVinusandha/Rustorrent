@@ -754,8 +754,9 @@ Rules:
   backslashes are rejected anywhere, not only in the host.
 - scheme and host are lowercased; the default port is omitted from the
   normalized URL for `http` (80) and `https` (443). A `udp` URL must carry an
-  explicit port. The parsed form keeps the effective port and whether it was
-  explicit, so redaction shows only a non-default port.
+  explicit port. The parsed form keeps the effective port; a port equal to the
+  scheme default is omitted when the URL is rendered, so redaction shows only a
+  non-default port.
 - userinfo (`user:pass@`) is rejected, not stripped.
 - A host is one of three things: a canonical IPv4 literal, a bracketed IPv6
   literal, or a validated DNS name. Every numeric-looking host is classified
@@ -788,13 +789,13 @@ Rules:
 
 ### Redaction
 
-`TrackerUrl` stores the parsed components only: scheme, host, effective port
-plus an explicit-port flag, path, query and fragment. It does not store the
-original string. `Debug` and `Display` render the redacted form; the path and
-query are available to the transport as the same bytes that were parsed, and
-the request target is rebuilt from those components. `PartialEq` and `Hash`
-use the same normalized tuple `(scheme, host, port, path, query, fragment)`,
-never the original spelling, so equal URLs hash equally.
+`TrackerUrl` stores the parsed components only: scheme, host, effective port,
+path, query and fragment. It does not store the original string. `Debug` and
+`Display` render the redacted form; the path and query are available to the
+transport as the same bytes that were parsed, and the request target is
+rebuilt from those components. `PartialEq` and `Hash` use the same normalized
+tuple `(scheme, host, port, path, query, fragment)`, never the original
+spelling, so equal URLs hash equally.
 
 Redaction keeps `scheme://host[:port]` and replaces the rest:
 

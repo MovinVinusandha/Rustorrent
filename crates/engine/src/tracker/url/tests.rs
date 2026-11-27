@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::tracker::TrackerError;
 
-use super::{Host, MAX_URL_LEN, Scheme, TrackerUrl};
+use super::{Host, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl};
 
 fn parse(input: &str) -> TrackerUrl {
     TrackerUrl::parse(input).expect("valid tracker URL")
@@ -354,4 +354,121 @@ fn host_percent_escapes_are_rejected() {
     ] {
         assert_invalid(input);
     }
+}
+
+#[test]
+fn host_display_brackets_ipv6_only() {
+    assert_eq!(
+        Host::Name("tracker.example".into()).to_string(),
+        "tracker.example"
+    );
+    assert_eq!(
+        Host::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).to_string(),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        Host::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)).to_string(),
+        "[::1]"
+    );
+}
+
+#[test]
+fn redaction_follows_the_documented_table() {
+    for (input, expected) in [
+        (
+            "https://tracker.example/announce?passkey=SECRET",
+            "https://tracker.example/…",
+        ),
+        (
+            "http://tracker.example:8080/announce",
+            "http://tracker.example:8080/…",
+        ),
+        ("udp://tracker.example:6969", "udp://tracker.example:6969"),
+        ("http://tracker.example/", "http://tracker.example/"),
+        ("http://tracker.example", "http://tracker.example/"),
+        (
+            "http://tracker.example:8080/",
+            "http://tracker.example:8080/",
+        ),
+        ("http://tracker.example?x=1", "http://tracker.example/…"),
+        ("http://tracker.example#frag", "http://tracker.example/…"),
+        (
+            "HTTPS://Tracker.Example/Announce",
+            "https://tracker.example/…",
+        ),
+        ("http://[::1]/announce", "http://[::1]/…"),
+        ("http://[::1]/", "http://[::1]/"),
+        ("https://[::1]:8443/", "https://[::1]:8443/"),
+        ("udp://[::1]:6969/announce", "udp://[::1]:6969"),
+        ("http://127.0.0.1:80/announce", "http://127.0.0.1/…"),
+    ] {
+        let url = parse(input);
+        assert_eq!(url.to_string(), expected, "Display for {input:?}");
+        assert_eq!(format!("{url:?}"), format!("TrackerUrl({expected})"));
+    }
+}
+
+#[test]
+fn redaction_hides_secrets_in_every_component() {
+    let cases = [
+        (
+            "https://tracker.example/announce/SECRET/path",
+            "SECRET",
+            "https://tracker.example/…",
+        ),
+        (
+            "https://tracker.example/announce?passkey=SECRET",
+            "SECRET",
+            "https://tracker.example/…",
+        ),
+        (
+            "https://tracker.example/announce?x=1#SECRET",
+            "SECRET",
+            "https://tracker.example/…",
+        ),
+        (
+            "udp://tracker.example:6969/announce/SECRET",
+            "SECRET",
+            "udp://tracker.example:6969",
+        ),
+    ];
+
+    for (input, secret, expected) in cases {
+        let url = parse(input);
+        let display = url.to_string();
+        let debug = format!("{url:?}");
+        assert_eq!(display, expected);
+        assert_eq!(debug, format!("TrackerUrl({expected})"));
+        assert!(!display.contains(secret));
+        assert!(!debug.contains(secret));
+        assert!(!display.contains('?'));
+        assert!(!display.contains('#'));
+        assert!(display.chars().all(|character| !character.is_control()));
+    }
+
+    let userinfo = TrackerUrl::parse("http://user:SECRET@tracker.example/announce");
+    let error = userinfo.expect_err("userinfo is rejected");
+    assert_eq!(error.to_string(), "<invalid tracker url>");
+    assert!(!format!("{error:?}").contains("SECRET"));
+    assert!(!error.to_string().contains("SECRET"));
+}
+
+#[test]
+fn redacted_output_is_bounded_at_271_bytes() {
+    let label = "a".repeat(63);
+    let host = format!("{label}.{label}.{label}.{}", "a".repeat(61));
+    assert_eq!(host.len(), 253);
+
+    let prefix = format!("https://{host}:65535/");
+    let url = format!("{prefix}{}", "a".repeat(MAX_URL_LEN - prefix.len()));
+    assert_eq!(url.len(), MAX_URL_LEN);
+
+    let redacted = parse(&url).to_string();
+    assert_eq!(redacted, format!("https://{host}:65535/…"));
+    assert_eq!(redacted.len(), MAX_REDACTED_URL_LEN);
+    assert_eq!(MAX_REDACTED_URL_LEN, 271);
+
+    let oversized = format!("{url}{}", "a".repeat(2048));
+    assert_eq!(oversized.len(), 4096);
+    assert_invalid(&oversized);
 }

@@ -8,6 +8,7 @@
 //! normalized, while the path, query and fragment are kept byte for byte
 //! after validation.
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::TrackerError;
@@ -20,6 +21,13 @@ pub const MAX_HOST_LEN: usize = 253;
 
 /// Maximum accepted DNS label length in bytes.
 pub const MAX_LABEL_LEN: usize = 63;
+
+/// Maximum length of the redacted form of a tracker URL.
+///
+/// This is `https://`, a 253-byte host, `:65535` and the `/…` suffix. The
+/// redacted form never contains the path, query or fragment.
+pub const MAX_REDACTED_URL_LEN: usize =
+    "https://".len() + MAX_HOST_LEN + ":65535".len() + "/…".len();
 
 /// Tracker URL scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -75,6 +83,16 @@ impl Host {
                 Some(mapped) => IpAddr::V4(mapped),
                 None => IpAddr::V6(*address),
             }),
+        }
+    }
+}
+
+impl fmt::Display for Host {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Name(name) => formatter.write_str(name),
+            Self::Ip(IpAddr::V4(address)) => write!(formatter, "{address}"),
+            Self::Ip(IpAddr::V6(address)) => write!(formatter, "[{address}]"),
         }
     }
 }
@@ -170,6 +188,33 @@ impl TrackerUrl {
             target.push_str(query);
         }
         target
+    }
+}
+
+impl fmt::Display for TrackerUrl {
+    /// Renders the redacted form: `scheme://host[:port]`, then `/` when the
+    /// URL is exactly the root path, or `/…` otherwise. The path, query and
+    /// fragment are never shown.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.scheme == Scheme::Udp {
+            return write!(formatter, "udp://{}:{}", self.host, self.port);
+        }
+
+        write!(formatter, "{}://{}", self.scheme.as_str(), self.host)?;
+        if self.scheme.default_port() != Some(self.port) {
+            write!(formatter, ":{}", self.port)?;
+        }
+        if self.path == "/" && self.query.is_none() && self.fragment.is_none() {
+            formatter.write_str("/")
+        } else {
+            formatter.write_str("/…")
+        }
+    }
+}
+
+impl fmt::Debug for TrackerUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "TrackerUrl({self})")
     }
 }
 

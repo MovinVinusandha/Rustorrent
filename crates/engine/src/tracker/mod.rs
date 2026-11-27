@@ -8,7 +8,9 @@ use thiserror::Error;
 
 pub mod url;
 
-pub use url::{Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_URL_LEN, Scheme, TrackerUrl};
+pub use url::{
+    Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl,
+};
 
 /// Errors produced by tracker parsing and announce transports.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

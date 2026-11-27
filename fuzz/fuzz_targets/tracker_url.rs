@@ -20,4 +20,14 @@ fuzz_target!(|data: &[u8]| {
     if let Some(fragment) = url.fragment() {
         assert!(fragment.is_ascii());
     }
+
+    let display = url.to_string();
+    let debug = format!("{url:?}");
+    assert!(display.len() <= bt_engine::tracker::MAX_REDACTED_URL_LEN);
+    assert!(debug.len() <= bt_engine::tracker::MAX_REDACTED_URL_LEN + "TrackerUrl()".len());
+    for text in [&display, &debug] {
+        assert!(!text.contains('?'));
+        assert!(!text.contains('#'));
+        assert!(text.chars().all(|character| !character.is_control()));
+    }
 });

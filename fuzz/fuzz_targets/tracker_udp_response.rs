@@ -68,7 +68,9 @@ impl<'a> Input<'a> {
     }
 
     fn datagram(&mut self) -> &'a [u8] {
-        let length = usize::from(self.byte()).min(MAX_DATAGRAM_LEN);
+        // Two bytes so the raw path reaches the full 4096-byte buffer, not
+        // just the 0-255 range a single byte would allow.
+        let length = usize::from(u16::from_be_bytes(self.array::<2>())).min(MAX_DATAGRAM_LEN);
         self.bytes(length)
     }
 
@@ -82,8 +84,10 @@ impl<'a> Input<'a> {
 
     fn error_text(&mut self) -> Vec<u8> {
         let length = usize::from(self.byte());
-        let mut text = self.bytes(length).to_vec();
-        text.extend_from_slice(SECRET.as_bytes());
+        // Prepend the marker so `TrackerMessage`'s 256-byte cap cannot
+        // truncate it and turn the redaction check into a no-op.
+        let mut text = SECRET.as_bytes().to_vec();
+        text.extend_from_slice(self.bytes(length));
         text
     }
 }

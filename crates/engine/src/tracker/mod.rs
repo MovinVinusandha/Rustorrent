@@ -16,6 +16,7 @@ pub mod message;
 pub mod peers;
 pub mod policy;
 pub mod response;
+pub mod state;
 pub mod transport;
 pub mod udp;
 pub mod url;
@@ -40,6 +41,7 @@ pub use response::{
     AnnounceResponse, DEFAULT_INTERVAL_SECS, MAX_INTERVAL_SECS, MAX_RESPONSE_BYTES,
     MIN_INTERVAL_SECS, decode_response,
 };
+pub use state::{Tracker, TrackerConfig, TrackerEvent, TrackerStatus};
 pub use transport::{
     AnnounceEvent, AnnounceRequest, AnnounceStats, RedirectPolicy, TrackerTransport,
 };

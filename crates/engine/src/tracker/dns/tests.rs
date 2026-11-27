@@ -77,17 +77,19 @@ impl Lookup for GateLookup {
     }
 }
 
-fn wait_for_permits(resolver: &SystemResolver, expected: usize) {
-    for _ in 0..1_000 {
-        if resolver.permits.available_permits() == expected {
-            return;
-        }
-        std::thread::yield_now();
-    }
-    panic!(
-        "expected {expected} free permits, found {}",
-        resolver.permits.available_permits()
-    );
+async fn wait_for_permits(resolver: &SystemResolver, expected: usize) {
+    // Acquiring all `expected` permits blocks until the last one is released,
+    // instead of hoping that a fixed number of yields is enough for the
+    // blocking lookup thread to finish. The timeout keeps a broken test from
+    // hanging.
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        resolver.permits.clone().acquire_many_owned(expected as u32),
+    )
+    .await
+    .expect("permits were not released within five seconds")
+    .expect("permit pool is open");
+    drop(permit);
 }
 
 fn resolver_with(
@@ -262,7 +264,7 @@ async fn dropping_the_future_keeps_the_permit_until_the_lookup_returns() {
     assert_eq!(resolver.permits.available_permits(), 7);
 
     lookup.release();
-    wait_for_permits(&resolver, 8);
+    wait_for_permits(&resolver, 8).await;
 }
 
 #[tokio::test]
@@ -282,7 +284,7 @@ async fn a_lookup_past_the_timeout_fails_with_dns_and_still_releases_the_permit(
     assert_eq!(resolver.permits.available_permits(), 7);
 
     lookup.release();
-    wait_for_permits(&resolver, 8);
+    wait_for_permits(&resolver, 8).await;
 }
 
 #[tokio::test]

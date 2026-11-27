@@ -45,9 +45,9 @@ full document.
   duplicates already in the URL.
 - UDP: BEP 15 connect then announce; one 105 s deadline from the first
   datagram, sends due at 0/15/45 s with waits 15/30/60; every datagram counts,
-  and a connect is sent before any send when the ID is at least 50 s old. The
-  cap is our decision, not the full `15 * 2^n` schedule. 200 peers, 6-byte
-  IPv4 and 18-byte IPv6 strides.
+  and a connect is sent before a non-final send when the ID is at least 50 s
+  old; the final send keeps the existing ID. The cap is our decision, not the
+  full `15 * 2^n` schedule. 200 peers, 6-byte IPv4 and 18-byte IPv6 strides.
 - Peers: compact and list formats plus `peers6`; 200-peer cap; invalid
   addresses dropped; tracker-supplied hostnames dropped (SSRF).
 - SSRF: public targets only by default; `allow_private_targets` is for tests
@@ -72,7 +72,8 @@ full document.
   defines its own `TrackerStatus` and maps from the engine snapshot. A
   versioned `bt-proto` type is planned for v0.2.
 - Tests: unit vectors, local HTTP/UDP/TLS trackers, paused-time UDP tests
-  (including the 51 s reconnect and the 105 s deadline), log-capture tests, and
+  (including the 51 s reconnect, the final-send exception and the 105 s
+  deadline), log-capture tests, and
   fuzz targets `tracker_url`, `tracker_http_response`,
   `tracker_udp_response`.
 - Limitations: no proxy (roadmap v0.3), no scrape, no dual-family announce,
@@ -495,17 +496,37 @@ Summary of the decisions:
 - A `stopped` announce is the exception: it uses a 2-second deadline and no
   retries, on UDP as on HTTP, instead of the 105-second normal-attempt
   deadline.
-- Before every send, if `now - id_received >= 50 s`, send a connect instead of
-  the announce. 50 s is our decision; BEP 15 allows use until 60 s after
-  receipt, and a tracker silently ignores an expired ID. The new ID is used
-  once the connect response arrives.
+- Before every send except the final one, if `now - id_received >= 50 s`, send
+  a connect instead of the announce. The final send keeps the existing ID and
+  sends the announce: a reconnect cannot complete before the deadline, and
+  BEP 15 allows the ID until 60 s after receipt. 50 s is our decision, and a
+  tracker silently ignores an expired ID. The new ID is used once the connect
+  response arrives. The guard is defensive: at the nominal schedule the ID is
+  at most 45 s old at a send, so it only matters when a send is delayed by a
+  stalled task or a suspended host. It never moves the deadline.
 - `num_want` is 50 for a normal announce and 0 for `stopped`, matching the
   HTTP `numwant` rule.
 - Receive buffer 4096 bytes; 200 peers per response; 6-byte stride on IPv4
-  and 18-byte stride on IPv6, selected by the socket family.
-- Transaction IDs are 32 bits from OS randomness, fresh for each connect and
-  announce. A mismatched action or transaction ID is ignored and the receive
-  wait continues.
+  and 18-byte stride on IPv6, selected by the socket family. Duplicate peers
+  are dropped, keeping the first occurrence, matching the HTTP merge.
+- Transaction IDs are 32 bits from OS randomness. A retransmission reuses the
+  ID of the request it repeats; a fresh ID is used only for a new request (the
+  first connect, a connect after the 50 s guard, and the announce after a
+  connect response). A mismatched action or transaction ID is ignored and the
+  receive wait continues.
+- An ICMP port-unreachable (`ConnectionRefused` or `ConnectionReset`,
+  depending on platform and OS) ends the attempt immediately with the typed
+  `Connect` error; waiting for the deadline would only delay failover. On
+  Windows, an oversized datagram that fails `recv` with `WSAEMSGSIZE` maps to
+  `TooLarge`.
+- Reflection and amplification are bounded by construction: requests are 16
+  and 98 bytes, an attempt sends at most three datagrams, and responses are
+  accepted only from the connected address. A spoofed source can therefore
+  make us send at most three small datagrams, never a large reply.
+- Requirement for 4c: the session keeps at most one UDP attempt in flight per
+  tracker host. A stalled attempt must not stack sockets, timers or
+  retransmissions for the same host; the next attempt starts only after the
+  previous one ends.
 - Error packets are checked for transaction ID. The text is untrusted: it is
   passed through the same best-effort sanitizer as an HTTP `failure reason`
   before it may be shown in the UI, and it is never logged. Logs and errors
@@ -565,8 +586,8 @@ keep it off outside tests and self-hosting.
 - The first allowed result is used. If a TCP connect fails immediately, the
   next allowed result is tried, up to the 8-result cap. A timeout does not
   fall through to the next result, because the attempt budget is already
-  bounded. UDP uses the first allowed result and falls through only when the
-  send itself fails.
+  bounded. UDP uses the first allowed result; a bind, connect or send failure
+  ends the attempt. v0.1 does not fall through to the next result for UDP.
 - The connection is made to the checked `IpAddr`, never by passing the
   hostname to a connector that would resolve again. This closes the DNS
   rebinding window between check and connect.
@@ -593,7 +614,8 @@ keep it off outside tests and self-hosting.
 - A redirect repeats resolution and checking from scratch. A host that
   resolves to both allowed and blocked addresses can still be used through an
   allowed address; a host whose every result is blocked fails with
-  `TrackerError::BlockedTarget`.
+  `TrackerError::BlockedTarget`, and an empty lookup result fails with
+  `TrackerError::Dns`.
 - There is no port allowlist. The address policy is the control; a public IP
   on an unusual port is allowed.
 
@@ -967,8 +989,9 @@ outside tests.
 - UDP connect/announce/error vectors, wrong transaction ID and action,
   truncated packets, 6- and 18-byte strides.
 - Paused-clock UDP tests: a connection ID 51 seconds old triggers a connect
-  before the announce; every datagram counts as a send; a reconnect does not
-  reset the 105-second deadline; an attempt is not cut at 60 seconds.
+  before a non-final announce; an ID 55 seconds old is used by the final
+  announce; every datagram counts as a send; a reconnect does not reset the
+  105-second deadline; an attempt is not cut at 60 seconds.
 - Policy table with the first and last address of every range, plus
   IPv4-mapped and zone-ID cases.
 - State machine with a fake clock and fake transport: interval clamp, event
@@ -1019,12 +1042,16 @@ outside tests.
 - `tracker_http_response`: arbitrary bytes to the head, body, chunked and
   bencode decoders, including `peers` and `peers6`; no panic, no allocation
   beyond the 1 MiB cap.
-- `tracker_udp_response`: arbitrary bytes to the connect, announce and error
-  decoders; no panic.
-- The response targets also call `sanitized_text()` on every `failure reason`
-  and `warning message`, so the sanitizer is fuzzed with the same input.
-- Targets are registered in `fuzz/Cargo.toml`, compile in CI, and run weekly,
-  matching the existing bencode and metainfo targets.
+- `tracker_udp_response`: arbitrary datagram sequences through the attempt
+  state machine and the connect, announce and error decoders; no panic, at
+  most three sends, retransmissions keep their transaction ID, fresh requests
+  get a new one, at most 200 peers, and error text stays out of `Debug` and
+  `Display`.
+- The HTTP response target also calls `sanitized_text()` on every
+  `failure reason` and `warning message`, so the sanitizer is fuzzed with the
+  same input.
+- Targets are registered in `fuzz/Cargo.toml` and compile in CI; the
+  scheduled workflow lists the targets it runs.
 
 ## 12. Consequences
 

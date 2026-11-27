@@ -178,7 +178,7 @@ fn decode_list_entry(entry: &Value<'_>) -> Option<SocketAddr> {
     usable_socket(address, port)
 }
 
-fn usable_socket(address: IpAddr, port: u16) -> Option<SocketAddr> {
+pub(super) fn usable_socket(address: IpAddr, port: u16) -> Option<SocketAddr> {
     if port == 0 {
         return None;
     }

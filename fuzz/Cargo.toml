@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bt-engine = { path = "../crates/engine" }
+tokio = { version = "1", features = ["time"] }
+bt-engine = { path = "../crates/engine", features = ["fuzzing"] }
 
 [[bin]]
 name = "bencode"
@@ -49,6 +50,13 @@ bench = false
 [[bin]]
 name = "tracker_url"
 path = "fuzz_targets/tracker_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_udp_response"
+path = "fuzz_targets/tracker_udp_response.rs"
 test = false
 doc = false
 bench = false

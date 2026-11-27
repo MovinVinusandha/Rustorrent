@@ -893,7 +893,11 @@ Types (engine-internal, `crates/engine/src/tracker`):
 - `RedirectPolicy { Public, SameHostOnly }`
 - `AnnounceResponse { interval: Duration, min_interval: Option<Duration>,
   complete: Option<u64>, incomplete: Option<u64>, peers: Vec<SocketAddr>,
-  tracker_id: Option<TrackerId>, warning: Option<TrackerMessage> }`
+  tracker_id: Option<TrackerId>, warning: Option<TrackerMessage>,
+  peer_warnings: PeerWarnings }`
+- `PeerWarnings { malformed_peer_records: u32, dropped_peer_records: u32,
+  truncated_peers: u32, missing_peers: bool }`: counters for recoverable
+  peer-list problems. They contain no tracker bytes and are safe to log.
 - `TrackerId`: opaque bytes, ignored if longer than 256; `Debug` and `Display`
   print only the length.
 - `TrackerMessage`: tracker-supplied bytes plus `sanitized_text(&TrackerUrl)`

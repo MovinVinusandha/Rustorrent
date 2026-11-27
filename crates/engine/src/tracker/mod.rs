@@ -6,8 +6,10 @@
 
 use thiserror::Error;
 
+pub mod peers;
 pub mod url;
 
+pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};
 pub use url::{
     Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl,
 };
@@ -21,4 +23,7 @@ pub enum TrackerError {
     /// The URL scheme is not `http`, `https` or `udp`.
     #[error("unsupported tracker URL scheme")]
     UnsupportedScheme,
+    /// The tracker response has the wrong shape.
+    #[error("malformed tracker response")]
+    MalformedResponse,
 }

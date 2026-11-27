@@ -288,6 +288,75 @@ async fn the_fifty_second_guard_reconnects_before_the_announce() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_final_send_keeps_an_old_connection_id() {
+    let start = Instant::now();
+    let mut attempt = attempt(start, false);
+
+    let Step::Connect {
+        transaction_id: connect_transaction,
+    } = attempt.step(start)
+    else {
+        panic!("the first send must be a connect");
+    };
+
+    let received = advance(Duration::from_secs(1)).await;
+    attempt.on_datagram(
+        received,
+        &connect_response(connect_transaction, CONNECTION_ID),
+        FAMILY,
+    );
+    let Step::Announce {
+        transaction_id: announce_transaction,
+        ..
+    } = attempt.step(received)
+    else {
+        panic!("the connect response must schedule an announce");
+    };
+
+    // The second send is due at 31 s. Delay it to 56 s, so the ID is 55 s old
+    // at the third and final send.
+    let now = advance(Duration::from_secs(55)).await;
+    assert_eq!(
+        attempt.step(now),
+        Step::Announce {
+            transaction_id: announce_transaction,
+            connection_id: CONNECTION_ID
+        },
+        "the final send must use the existing ID: a reconnect cannot finish"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_non_final_delayed_send_still_reconnects() {
+    let received = Instant::now();
+    let mut attempt =
+        UdpAttempt::with_connection(received, received, CONNECTION_ID, CountingIds::new());
+
+    let Step::Announce {
+        transaction_id: announce_transaction,
+        ..
+    } = attempt.step(received)
+    else {
+        panic!("the first send must be the announce");
+    };
+
+    // The second send is due at 15 s. Delay it to 55 s; it is not the final
+    // slot, so the guard must replace the old ID with a fresh connect.
+    let now = received + Duration::from_secs(55);
+    let Step::Connect {
+        transaction_id: reconnect_transaction,
+    } = attempt.step(now)
+    else {
+        panic!("a non-final send with an old ID must reconnect");
+    };
+    assert_ne!(reconnect_transaction, announce_transaction);
+    assert_eq!(
+        reconnect_transaction, 0x1002,
+        "the reconnect is a new request with a fresh ID"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_stopped_announce_has_a_two_second_deadline_and_no_retries() {
     let start = Instant::now();
     let mut attempt = attempt(start, true);

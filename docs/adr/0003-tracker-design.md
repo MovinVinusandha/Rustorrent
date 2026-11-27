@@ -45,9 +45,9 @@ full document.
   duplicates already in the URL.
 - UDP: BEP 15 connect then announce; one 105 s deadline from the first
   datagram, sends due at 0/15/45 s with waits 15/30/60; every datagram counts,
-  and a connect is sent before any send when the ID is at least 50 s old. The
-  cap is our decision, not the full `15 * 2^n` schedule. 200 peers, 6-byte
-  IPv4 and 18-byte IPv6 strides.
+  and a connect is sent before a non-final send when the ID is at least 50 s
+  old; the final send keeps the existing ID. The cap is our decision, not the
+  full `15 * 2^n` schedule. 200 peers, 6-byte IPv4 and 18-byte IPv6 strides.
 - Peers: compact and list formats plus `peers6`; 200-peer cap; invalid
   addresses dropped; tracker-supplied hostnames dropped (SSRF).
 - SSRF: public targets only by default; `allow_private_targets` is for tests
@@ -72,7 +72,8 @@ full document.
   defines its own `TrackerStatus` and maps from the engine snapshot. A
   versioned `bt-proto` type is planned for v0.2.
 - Tests: unit vectors, local HTTP/UDP/TLS trackers, paused-time UDP tests
-  (including the 51 s reconnect and the 105 s deadline), log-capture tests, and
+  (including the 51 s reconnect, the final-send exception and the 105 s
+  deadline), log-capture tests, and
   fuzz targets `tracker_url`, `tracker_http_response`,
   `tracker_udp_response`.
 - Limitations: no proxy (roadmap v0.3), no scrape, no dual-family announce,
@@ -495,13 +496,14 @@ Summary of the decisions:
 - A `stopped` announce is the exception: it uses a 2-second deadline and no
   retries, on UDP as on HTTP, instead of the 105-second normal-attempt
   deadline.
-- Before every send, if `now - id_received >= 50 s`, send a connect instead of
-  the announce. 50 s is our decision; BEP 15 allows use until 60 s after
-  receipt, and a tracker silently ignores an expired ID. The new ID is used
-  once the connect response arrives. The guard is defensive: at the nominal
-  schedule the ID is at most 45 s old at a send, so it only matters when a
-  send is delayed by a stalled task or a suspended host. It never moves the
-  deadline.
+- Before every send except the final one, if `now - id_received >= 50 s`, send
+  a connect instead of the announce. The final send keeps the existing ID and
+  sends the announce: a reconnect cannot complete before the deadline, and
+  BEP 15 allows the ID until 60 s after receipt. 50 s is our decision, and a
+  tracker silently ignores an expired ID. The new ID is used once the connect
+  response arrives. The guard is defensive: at the nominal schedule the ID is
+  at most 45 s old at a send, so it only matters when a send is delayed by a
+  stalled task or a suspended host. It never moves the deadline.
 - `num_want` is 50 for a normal announce and 0 for `stopped`, matching the
   HTTP `numwant` rule.
 - Receive buffer 4096 bytes; 200 peers per response; 6-byte stride on IPv4
@@ -985,8 +987,9 @@ outside tests.
 - UDP connect/announce/error vectors, wrong transaction ID and action,
   truncated packets, 6- and 18-byte strides.
 - Paused-clock UDP tests: a connection ID 51 seconds old triggers a connect
-  before the announce; every datagram counts as a send; a reconnect does not
-  reset the 105-second deadline; an attempt is not cut at 60 seconds.
+  before a non-final announce; an ID 55 seconds old is used by the final
+  announce; every datagram counts as a send; a reconnect does not reset the
+  105-second deadline; an attempt is not cut at 60 seconds.
 - Policy table with the first and last address of every range, plus
   IPv4-mapped and zone-ID cases.
 - State machine with a fake clock and fake transport: interval clamp, event

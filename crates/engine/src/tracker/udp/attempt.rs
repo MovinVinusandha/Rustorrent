@@ -15,7 +15,9 @@
 //!
 //! The 50-second guard is defensive: at the nominal 0/15/45 schedule a
 //! connection ID is at most 45 seconds old at a send. It protects a delayed
-//! send, such as a stalled task or a suspended host.
+//! send, such as a stalled task or a suspended host. The final send is the
+//! exception: it has no time left to finish a reconnect, so it sends the
+//! announce with the existing ID even when that ID is 50 seconds or older.
 
 use std::time::Duration;
 
@@ -216,10 +218,13 @@ impl UdpAttempt {
         }
 
         // A pending announce is retransmitted with the same transaction ID
-        // unless the connection ID is old enough to need a new connect.
+        // unless the connection ID is old enough to need a new connect. The
+        // final send has no time left to finish a reconnect, so it keeps the
+        // old ID: BEP 15 allows it for 60 seconds, and a delayed send can
+        // still succeed.
         if let Some(Pending::Announce { transaction_id }) = self.pending
             && let Some(connection_id) = self.connection_id
-            && !self.reconnect_due(now)
+            && (self.sends == MAX_SENDS || !self.reconnect_due(now))
         {
             return Step::Announce {
                 transaction_id,

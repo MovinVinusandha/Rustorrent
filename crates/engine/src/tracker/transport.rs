@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::metainfo::InfoHash;
 
-use super::{AnnounceResponse, TrackerError, TrackerId, TrackerUrl};
+use super::{AnnounceResponse, Scheme, TrackerError, TrackerId, TrackerUrl};
 
 /// One announce transport.
 pub trait TrackerTransport: Send + Sync {
@@ -151,6 +151,36 @@ pub enum RedirectPolicy {
     Public,
     /// Private torrents may follow only a same-host redirect.
     SameHostOnly,
+}
+
+impl RedirectPolicy {
+    /// Returns whether an HTTP redirect from `from` to `to` may be followed.
+    ///
+    /// `Public` accepts any target; the HTTP transport still rejects schemes
+    /// it cannot follow. `SameHostOnly` requires the same normalized host and
+    /// the same effective port, with two exceptions: an `http` to `https`
+    /// upgrade may keep the port or move to the default https port, and a
+    /// downgrade or a UDP target is rejected. `TrackerUrl` already removes a
+    /// trailing dot and fills the scheme default, so no further normalization
+    /// happens here.
+    pub fn allows(self, from: &TrackerUrl, to: &TrackerUrl) -> bool {
+        if self == Self::Public {
+            return true;
+        }
+        if from.host() != to.host() {
+            return false;
+        }
+        let http = |scheme: Scheme| matches!(scheme, Scheme::Http | Scheme::Https);
+        if !http(from.scheme()) || !http(to.scheme()) {
+            return false;
+        }
+        if from.scheme() == to.scheme() {
+            return from.port() == to.port();
+        }
+        from.scheme() == Scheme::Http
+            && to.scheme() == Scheme::Https
+            && (from.port() == to.port() || to.port() == 443)
+    }
 }
 
 #[cfg(test)]

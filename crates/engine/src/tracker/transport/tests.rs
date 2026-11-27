@@ -128,3 +128,123 @@ fn the_new_error_variants_do_not_leak_input() {
         "tracker transport panicked"
     );
 }
+
+fn parse(text: &str) -> TrackerUrl {
+    TrackerUrl::parse(text).expect("valid tracker URL")
+}
+
+#[test]
+fn public_redirects_are_always_allowed() {
+    let policy = RedirectPolicy::Public;
+    assert!(policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("http://b.example/announce")
+    ));
+    assert!(policy.allows(
+        &parse("https://a.example:8443/announce"),
+        &parse("http://a.example/announce")
+    ));
+}
+
+#[test]
+fn same_host_only_allows_the_same_host_and_effective_port() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("http://a.example/other")
+    ));
+    assert!(policy.allows(
+        &parse("http://a.example:8080/announce"),
+        &parse("http://a.example:8080/other?x=1")
+    ));
+}
+
+#[test]
+fn same_host_only_rejects_a_cross_host_redirect() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(!policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("http://b.example/announce")
+    ));
+    assert!(!policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("http://127.0.0.1/announce")
+    ));
+    assert!(!policy.allows(
+        &parse("http://127.0.0.1/announce"),
+        &parse("http://127.0.0.2/announce")
+    ));
+}
+
+#[test]
+fn same_host_only_rejects_a_different_port() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(!policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("http://a.example:8080/announce")
+    ));
+    assert!(!policy.allows(
+        &parse("http://a.example:8080/announce"),
+        &parse("http://a.example:8081/announce")
+    ));
+    assert!(!policy.allows(
+        &parse("https://a.example:8443/announce"),
+        &parse("https://a.example:9443/announce")
+    ));
+}
+
+#[test]
+fn same_host_only_allows_an_http_to_https_upgrade() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("https://a.example/announce")
+    ));
+    assert!(policy.allows(
+        &parse("http://a.example:8443/announce"),
+        &parse("https://a.example:8443/announce")
+    ));
+}
+
+#[test]
+fn same_host_only_rejects_a_downgrade_and_an_https_port_change() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(!policy.allows(
+        &parse("https://a.example/announce"),
+        &parse("http://a.example/announce")
+    ));
+    assert!(!policy.allows(
+        &parse("https://a.example:443/announce"),
+        &parse("http://a.example:443/announce")
+    ));
+    assert!(!policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("https://a.example:8443/announce")
+    ));
+}
+
+#[test]
+fn same_host_only_rejects_a_udp_redirect() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(!policy.allows(
+        &parse("http://a.example/announce"),
+        &parse("udp://a.example:6969")
+    ));
+    assert!(!policy.allows(
+        &parse("udp://a.example:6969"),
+        &parse("http://a.example/announce")
+    ));
+}
+
+#[test]
+fn same_host_only_compares_normalized_hosts_and_ports() {
+    let policy = RedirectPolicy::SameHostOnly;
+    assert!(policy.allows(
+        &parse("http://A.Example./announce"),
+        &parse("http://a.example:80/announce")
+    ));
+    assert!(policy.allows(
+        &parse("http://[0:0:0:0:0:0:0:1]:8080/announce"),
+        &parse("http://[::1]:8080/announce")
+    ));
+}

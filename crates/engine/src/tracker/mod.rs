@@ -14,6 +14,7 @@ pub mod message;
 pub mod peers;
 pub mod policy;
 pub mod response;
+pub mod transport;
 pub mod udp;
 pub mod url;
 
@@ -29,6 +30,9 @@ pub use response::{
     AnnounceResponse, DEFAULT_INTERVAL_SECS, MAX_INTERVAL_SECS, MAX_RESPONSE_BYTES,
     MIN_INTERVAL_SECS, decode_response,
 };
+pub use transport::{
+    AnnounceEvent, AnnounceRequest, AnnounceStats, RedirectPolicy, TrackerTransport,
+};
 pub use url::{
     Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl,
 };
@@ -39,6 +43,9 @@ pub enum TrackerError {
     /// The input is not a valid tracker URL.
     #[error("<invalid tracker url>")]
     InvalidUrl,
+    /// A URL has no port and its scheme has no default.
+    #[error("invalid tracker port")]
+    InvalidPort,
     /// The URL scheme is not `http`, `https` or `udp`.
     #[error("unsupported tracker URL scheme")]
     UnsupportedScheme,
@@ -57,6 +64,9 @@ pub enum TrackerError {
     /// Every candidate address is blocked by the target policy.
     #[error("blocked tracker target")]
     BlockedTarget,
+    /// No tracker candidate survived URL validation.
+    #[error("no usable tracker")]
+    NoUsableTracker,
     /// Host resolution failed, timed out or produced no usable address.
     #[error("tracker DNS lookup failed")]
     Dns,
@@ -79,4 +89,10 @@ pub enum TrackerError {
     /// The OS randomness source failed.
     #[error("failed to generate a transaction ID")]
     Random,
+    /// A transport panicked; the panic was contained at the task boundary.
+    ///
+    /// Only reachable in unwind builds. Release builds use `panic = "abort"`,
+    /// so a transport panic ends the process instead.
+    #[error("tracker transport panicked")]
+    Panicked,
 }

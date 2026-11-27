@@ -507,7 +507,8 @@ Summary of the decisions:
 - `num_want` is 50 for a normal announce and 0 for `stopped`, matching the
   HTTP `numwant` rule.
 - Receive buffer 4096 bytes; 200 peers per response; 6-byte stride on IPv4
-  and 18-byte stride on IPv6, selected by the socket family.
+  and 18-byte stride on IPv6, selected by the socket family. Duplicate peers
+  are dropped, keeping the first occurrence, matching the HTTP merge.
 - Transaction IDs are 32 bits from OS randomness. A retransmission reuses the
   ID of the request it repeats; a fresh ID is used only for a new request (the
   first connect, a connect after the 50 s guard, and the announce after a

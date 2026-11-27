@@ -191,6 +191,24 @@ fn the_announce_vector_keeps_one_peer_and_drops_the_invalid_one() {
 }
 
 #[test]
+fn duplicate_peers_are_deduplicated_keeping_the_first() {
+    let mut peers = Vec::new();
+    peers.extend_from_slice(&v4_peer([93, 184, 216, 34], 6881));
+    peers.extend_from_slice(&v4_peer([93, 184, 216, 34], 6881));
+    peers.extend_from_slice(&v4_peer([1, 1, 1, 1], 51413));
+    let packet = announce_response(1800, 1, 2, &peers);
+
+    let response = decode_announce(&packet, Family::V4);
+    assert_eq!(response.peers.len(), 2);
+    assert_eq!(response.peers[0].to_string(), "93.184.216.34:6881");
+    assert_eq!(response.peers[1].to_string(), "1.1.1.1:51413");
+    assert!(
+        response.peer_warnings.is_empty(),
+        "a duplicate is not a warning or a truncated peer"
+    );
+}
+
+#[test]
 fn a_twenty_byte_announce_response_has_no_peers() {
     let packet = announce_response(60, 0, 0, &[]);
     assert_eq!(packet.len(), ANNOUNCE_RESPONSE_MIN_LEN);

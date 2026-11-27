@@ -1,8 +1,8 @@
 //! BEP 15 packet encoding and decoding.
 //!
 //! Every function is pure and bounds-checked: no socket, no clock, and no
-//! allocation beyond the decoded peer vector, which is capped at
-//! [`MAX_PEERS_PER_RESPONSE`]. The transport receives at most
+//! allocation beyond the decoded peer vector and its deduplication set, both
+//! capped at [`MAX_PEERS_PER_RESPONSE`]. The transport receives at most
 //! [`MAX_DATAGRAM_LEN`] bytes; a full 200-peer IPv6 response is
 //! `20 + 200 * 18 = 3620` bytes, so it fits in that buffer. A datagram that
 //! is still too large for the buffer is truncated by the kernel, and the
@@ -12,6 +12,7 @@
 //! request. Anything else returns `None` and the caller keeps waiting until
 //! its absolute deadline; a bad datagram never extends a wait.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::tracker::peers::usable_socket;
@@ -245,15 +246,20 @@ fn decode_announce_body(datagram: &[u8], family: Family) -> Option<UdpAnnounceRe
     }
 
     let mut peers = Vec::new();
+    let mut seen = HashSet::with_capacity(MAX_PEERS_PER_RESPONSE);
     for record in body.chunks_exact(stride) {
         let Some(peer) = decode_record(record, family) else {
             warnings.dropped_peer_records = warnings.dropped_peer_records.saturating_add(1);
             continue;
         };
+        if seen.contains(&peer) {
+            continue;
+        }
         if peers.len() >= MAX_PEERS_PER_RESPONSE {
             warnings.truncated_peers = warnings.truncated_peers.saturating_add(1);
             continue;
         }
+        seen.insert(peer);
         peers.push(peer);
     }
 

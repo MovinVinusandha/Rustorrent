@@ -12,6 +12,7 @@ pub mod message;
 pub mod peers;
 pub mod policy;
 pub mod response;
+pub mod udp;
 pub mod url;
 
 pub use dns::{

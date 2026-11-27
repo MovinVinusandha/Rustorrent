@@ -313,8 +313,8 @@ async fn the_final_send_keeps_an_old_connection_id() {
         panic!("the connect response must schedule an announce");
     };
 
-    // The second send is due at 31 s. Delay it to 56 s, so the ID is 55 s old
-    // at the third and final send.
+    // The third send is due at 31 s. Delay it to 56 s, so the ID is 55 s old
+    // at that final send.
     let now = advance(Duration::from_secs(55)).await;
     assert_eq!(
         attempt.step(now),

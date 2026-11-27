@@ -123,6 +123,22 @@ fn ipv4_literal_bypass_forms_are_rejected() {
 }
 
 #[test]
+fn hex_host_forms_are_rejected() {
+    for host in [
+        "0x7f.0.0.1",
+        "0X7F.0.0.1",
+        "0x7f000001",
+        "0X7F000001",
+        "0x7f.0.0.1.",
+        "1.2.3.0x4",
+    ] {
+        assert_invalid(&format!("http://{host}/"));
+    }
+
+    assert_invalid("http://0x7f.0.0.1:80/");
+}
+
+#[test]
 fn ipv6_hosts_are_bracketed_and_canonicalized() {
     let url = parse("http://[0:0:0:0:0:0:0:1]:8080/announce");
     assert_eq!(url.host(), &Host::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));

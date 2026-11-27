@@ -282,6 +282,10 @@ fn parse_host(text: &str) -> Result<Host, TrackerError> {
         return parse_ipv4(name).map(|address| Host::Ip(IpAddr::V4(address)));
     }
 
+    if looks_like_inet_aton(name) {
+        return Err(TrackerError::InvalidUrl);
+    }
+
     parse_name(name).map(Host::Name)
 }
 
@@ -309,6 +313,24 @@ fn parse_ipv4_part(part: &str) -> Result<u8, TrackerError> {
         return Err(TrackerError::InvalidUrl);
     }
     part.parse().map_err(|_| TrackerError::InvalidUrl)
+}
+
+fn looks_like_inet_aton(text: &str) -> bool {
+    let mut parts = 0;
+    for part in text.split('.') {
+        parts += 1;
+        if parts > 4 || !is_numeric_part(part) {
+            return false;
+        }
+    }
+    parts != 0
+}
+
+fn is_numeric_part(part: &str) -> bool {
+    if let Some(hex) = part.strip_prefix("0x") {
+        return !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn parse_name(name: &str) -> Result<String, TrackerError> {

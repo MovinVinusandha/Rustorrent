@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use proptest::prelude::*;
 use tokio::time::Instant;
 
 use crate::metainfo::{FileInfo, InfoHash, MetaInfo, Mode};
@@ -1143,4 +1144,178 @@ async fn a_failed_event_does_not_bypass_backoff_when_an_earlier_tier_is_due() {
         tracker.next_deadline(),
         Some(a_retry + Duration::from_secs(60))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_event_waits_for_a_tracker_out_of_backoff() {
+    let now = Instant::now();
+    let mut tracker = tracker(
+        &[
+            &["http://a.example/announce"],
+            &["http://b.example/announce"],
+        ],
+        false,
+        now,
+    );
+
+    tracker.build_request(now, stats()).expect("started on a");
+    tracker.handle_response(now, response(60));
+
+    let at = now + Duration::from_secs(60);
+    tracker.build_request(at, stats()).expect("periodic a");
+    tracker.handle_failure(at, TrackerError::Timeout);
+    tracker.build_request(at, stats()).expect("periodic b");
+    let events = tracker.handle_failure(at, TrackerError::Timeout);
+    let retry_at = failure_retry(&events);
+    assert!(retry_at > at, "both trackers are in backoff");
+
+    let early = at + Duration::from_secs(1);
+    assert!(early < retry_at);
+    tracker.complete(early);
+
+    assert!(
+        tracker.build_request(early, stats()).is_none(),
+        "completed was sent before the earliest retry_at"
+    );
+    assert_eq!(tracker.next_deadline(), Some(retry_at));
+
+    let request = tracker
+        .build_request(retry_at, stats())
+        .expect("completed at retry_at");
+    assert_eq!(request.event, AnnounceEvent::Completed);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    BuildAtDeadline { succeed: bool },
+    BuildAfter { secs: u8, succeed: bool },
+    Complete,
+    Cancel,
+    Stop,
+}
+
+fn step_strategy() -> impl Strategy<Value = Vec<Step>> {
+    prop::collection::vec(
+        prop_oneof![
+            4 => any::<bool>().prop_map(|succeed| Step::BuildAtDeadline { succeed }),
+            3 => (0u8..=45, any::<bool>())
+                .prop_map(|(secs, succeed)| Step::BuildAfter { secs, succeed }),
+            2 => Just(Step::Complete),
+            1 => Just(Step::Cancel),
+            1 => Just(Step::Stop),
+        ],
+        0..=60,
+    )
+}
+
+fn layout_strategy() -> impl Strategy<Value = Vec<Vec<String>>> {
+    prop::collection::vec(1usize..=3, 2..=3).prop_map(|lengths| {
+        let mut index = 0u8;
+        lengths
+            .into_iter()
+            .map(|len| {
+                (0..len)
+                    .map(|_| {
+                        let url = format!("http://t{index}.example/announce");
+                        index = index.wrapping_add(1);
+                        url
+                    })
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+fn tracker_from_owned(tiers: &[Vec<String>], private: bool, now: Instant) -> Tracker {
+    let owned: Vec<Vec<&str>> = tiers
+        .iter()
+        .map(|tier| tier.iter().map(String::as_str).collect())
+        .collect();
+    let tiers: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
+    tracker(&tiers, private, now)
+}
+
+fn build_and_check(
+    tracker: &mut Tracker,
+    now: Instant,
+    succeed: bool,
+    retry_at: &mut Vec<(TrackerUrl, Instant)>,
+) {
+    let Some(request) = tracker.build_request(now, stats()) else {
+        return;
+    };
+
+    if request.event != AnnounceEvent::Stopped
+        && let Some((_, at)) = retry_at.iter().find(|(url, _)| *url == request.url)
+    {
+        assert!(
+            now >= *at,
+            "sent {:?} to {} at {now:?}, before its retry_at {at:?}",
+            request.event,
+            request.url
+        );
+    }
+    retry_at.retain(|(url, _)| *url != request.url);
+
+    if succeed {
+        tracker.handle_response(now, response(60));
+    } else {
+        tracker.handle_failure(now, TrackerError::Timeout);
+        if let Some(slot) = tracker
+            .slots
+            .iter()
+            .flatten()
+            .find(|slot| slot.url == request.url)
+            && let Some(at) = slot.next_attempt
+        {
+            retry_at.push((request.url, at));
+        }
+    }
+}
+
+fn check_steps(tiers: Vec<Vec<String>>, private: bool, steps: Vec<Step>) {
+    let base = Instant::now();
+    let mut tracker = tracker_from_owned(&tiers, private, base);
+    let mut now = base;
+    let mut retry_at: Vec<(TrackerUrl, Instant)> = Vec::new();
+
+    for step in steps {
+        if tracker.is_terminal() {
+            break;
+        }
+        match step {
+            Step::Complete => tracker.complete(now),
+            Step::Cancel => {
+                tracker.handle_cancel(now);
+            }
+            Step::Stop => tracker.stop(now),
+            Step::BuildAfter { secs, succeed } => {
+                now = now
+                    .checked_add(Duration::from_secs(u64::from(secs)))
+                    .expect("test instant");
+                build_and_check(&mut tracker, now, succeed, &mut retry_at);
+            }
+            Step::BuildAtDeadline { succeed } => {
+                if let Some(deadline) = tracker.next_deadline()
+                    && deadline > now
+                {
+                    now = deadline;
+                }
+                build_and_check(&mut tracker, now, succeed, &mut retry_at);
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    #[test]
+    fn a_tracker_is_not_contacted_before_its_retry_at(
+        tiers in layout_strategy(),
+        private in any::<bool>(),
+        steps in step_strategy(),
+    ) {
+        check_steps(tiers, private, steps);
+    }
 }

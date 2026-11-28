@@ -330,6 +330,7 @@ impl Tracker {
         let Some(slot) = slot else {
             if event != AnnounceEvent::None {
                 self.queue_pending(event);
+                self.next_announce = self.next_retry();
             }
             self.publish();
             return None;
@@ -337,6 +338,7 @@ impl Tracker {
         let Some(tracker) = self.slot(slot) else {
             if event != AnnounceEvent::None {
                 self.queue_pending(event);
+                self.next_announce = self.next_retry();
             }
             self.publish();
             return None;
@@ -449,8 +451,11 @@ impl Tracker {
         }
 
         if self.pending_event.is_some() {
-            self.force_pending_event(now);
-            self.next_announce = Some(now);
+            if self.force_pending_event(now) {
+                self.next_announce = Some(now);
+            } else {
+                self.next_announce = self.next_retry();
+            }
         }
         self.publish();
         events
@@ -607,8 +612,11 @@ impl Tracker {
         self.queue_pending(event);
         if !self.in_flight {
             self.round = None;
-            self.force_pending_event(now);
-            self.next_announce = Some(now);
+            if self.force_pending_event(now) {
+                self.next_announce = Some(now);
+            } else {
+                self.next_announce = self.next_retry();
+            }
         }
         self.publish();
     }
@@ -621,20 +629,39 @@ impl Tracker {
     }
 
     fn select_event_slot(&mut self, now: Instant) -> Option<(usize, usize)> {
-        let slot = if self.private {
-            self.active.or_else(|| self.first_slot())
-        } else {
+        if !self.private {
             self.round = None;
-            self.active
-                .or_else(|| self.find_due_any(now))
-                .or_else(|| self.first_slot())
-        }?;
+        }
+        let slot = self.event_slot(now)?;
 
         if let Some(tracker) = self.slot_mut(slot) {
             tracker.next_attempt = Some(now);
         }
         self.mark_active(slot);
         Some(slot)
+    }
+
+    /// Selects a tracker for `started` or `completed`.
+    ///
+    /// A tracker without failures may be used at any time: events are not
+    /// bound by the success interval. A tracker that has failed is only used
+    /// once its backoff has elapsed, so an event cannot bypass `retry_at`.
+    fn event_slot(&self, now: Instant) -> Option<(usize, usize)> {
+        let allowed =
+            |slot: &Slot| slot.failures == 0 || slot.next_attempt.is_some_and(|at| at <= now);
+        let active = self
+            .active
+            .filter(|slot| self.slot(*slot).is_some_and(allowed));
+        if self.private {
+            return active;
+        }
+        active.or_else(|| {
+            self.slots.iter().enumerate().find_map(|(tier, row)| {
+                row.iter()
+                    .enumerate()
+                    .find_map(|(index, slot)| allowed(slot).then_some((tier, index)))
+            })
+        })
     }
 
     fn select_periodic_slot(&mut self, now: Instant) -> Option<(usize, usize)> {
@@ -678,19 +705,44 @@ impl Tracker {
         }
     }
 
-    fn force_pending_event(&mut self, now: Instant) {
-        let slot = if self.private {
+    /// Selects a slot for the pending event and reports whether one was found.
+    ///
+    /// A `stopped` event may bypass backoff: it is the last attempt and is
+    /// never retried. `started` and `completed` use `event_slot`, so they wait
+    /// for a tracker whose backoff has elapsed instead of resetting it.
+    fn force_pending_event(&mut self, now: Instant) -> bool {
+        let event = self.pending_event.unwrap_or(AnnounceEvent::None);
+        let slot = if event == AnnounceEvent::Stopped {
+            self.force_slot(now)
+        } else {
+            self.event_slot(now)
+        };
+        let Some(slot) = slot else {
+            return false;
+        };
+        if let Some(tracker) = self.slot_mut(slot) {
+            tracker.next_attempt = Some(now);
+        }
+        self.mark_active(slot);
+        true
+    }
+
+    fn force_slot(&self, now: Instant) -> Option<(usize, usize)> {
+        if self.private {
             self.active.or_else(|| self.first_slot())
         } else {
             self.active
                 .or_else(|| self.find_due_any(now))
                 .or_else(|| self.first_slot())
-        };
-        if let Some(slot) = slot {
-            if let Some(tracker) = self.slot_mut(slot) {
-                tracker.next_attempt = Some(now);
-            }
-            self.mark_active(slot);
+        }
+    }
+
+    /// Earliest time a tracker may be used again.
+    fn next_retry(&self) -> Option<Instant> {
+        if self.private {
+            self.recompute_private()
+        } else {
+            self.recompute_public()
         }
     }
 

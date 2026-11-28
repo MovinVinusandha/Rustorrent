@@ -5,10 +5,12 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
-use crate::tracker::udp::codec::{
-    ConnectionId, Family, PROTOCOL_ID, UdpAnnounce, UdpAnnounceResponse, UdpEvent,
+use crate::metainfo::InfoHash;
+use crate::tracker::udp::codec::{ConnectionId, Family, PROTOCOL_ID};
+use crate::tracker::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, AnnounceStats, RedirectPolicy,
+    SystemResolver, TargetPolicy, TrackerError, TrackerTransport, TrackerUrl,
 };
-use crate::tracker::{SystemResolver, TargetPolicy, TrackerError, TrackerUrl};
 
 use super::{UdpTransport, bind_address, map_recv_error, map_send_error};
 
@@ -55,28 +57,27 @@ fn url(address: SocketAddr) -> TrackerUrl {
     TrackerUrl::parse(&format!("udp://{address}/announce")).expect("valid tracker URL")
 }
 
-fn request() -> UdpAnnounce {
-    UdpAnnounce {
-        connection_id: ConnectionId::new(0),
-        info_hash: [0x11; 20],
-        peer_id: *b"-BA0100-123456789012",
-        downloaded: 0,
-        left: 0,
-        uploaded: 0,
-        event: UdpEvent::Started,
-        key: 0x1234_5678,
-        num_want: 50,
-        port: 51413,
-    }
+fn request_with(url: TrackerUrl, event: AnnounceEvent) -> AnnounceRequest {
+    AnnounceRequest::new(
+        url,
+        InfoHash::from_bytes([0x11; 20]),
+        *b"-BA0100-123456789012",
+        51413,
+        AnnounceStats::default(),
+        event,
+        0x1234_5678,
+        None,
+        RedirectPolicy::Public,
+    )
 }
 
-fn spawn(
-    url: TrackerUrl,
-    request: UdpAnnounce,
-    stopped: bool,
-) -> JoinHandle<Result<UdpAnnounceResponse, TrackerError>> {
+fn request(url: TrackerUrl) -> AnnounceRequest {
+    request_with(url, AnnounceEvent::Started)
+}
+
+fn spawn(request: AnnounceRequest) -> JoinHandle<Result<AnnounceResponse, TrackerError>> {
     let transport = transport();
-    tokio::spawn(async move { transport.announce(&url, &request, stopped).await })
+    tokio::spawn(async move { transport.announce(request).await })
 }
 
 fn connect_response(transaction_id: u32, connection_id: ConnectionId) -> Vec<u8> {
@@ -119,7 +120,7 @@ fn transaction_id(packet: &[u8]) -> u32 {
 async fn an_announce_round_trip() {
     let server = FakeTracker::bind().await;
     let mut buffer = [0u8; 2048];
-    let handle = spawn(url(server.address), request(), false);
+    let handle = spawn(request(url(server.address)));
 
     let (connect, source) = server.recv(&mut buffer).await;
     assert_eq!(connect.len(), 16);
@@ -148,9 +149,9 @@ async fn an_announce_round_trip() {
         .await
         .expect("announce task")
         .expect("announce response");
-    assert_eq!(response.interval, 1800);
-    assert_eq!(response.leechers, 2);
-    assert_eq!(response.seeders, 3);
+    assert_eq!(response.interval, Duration::from_secs(1800));
+    assert_eq!(response.incomplete, Some(2));
+    assert_eq!(response.complete, Some(3));
     assert!(response.peers.is_empty());
 }
 
@@ -158,7 +159,7 @@ async fn an_announce_round_trip() {
 async fn the_attempt_sends_three_connects_then_times_out() {
     let server = FakeTracker::bind().await;
     let mut buffer = [0u8; 2048];
-    let handle = spawn(url(server.address), request(), false);
+    let handle = spawn(request(url(server.address)));
 
     let (first, _) = server.recv(&mut buffer).await;
 
@@ -178,10 +179,33 @@ async fn the_attempt_sends_three_connects_then_times_out() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_stopped_announce_uses_the_short_deadline_and_does_not_retry() {
+    let server = FakeTracker::bind().await;
+    let mut buffer = [0u8; 2048];
+    let handle = spawn(request_with(url(server.address), AnnounceEvent::Stopped));
+
+    let (connect, _) = server.recv(&mut buffer).await;
+    assert_eq!(connect.len(), 16);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        server.try_recv(&mut buffer).is_none(),
+        "a stopped announce must not retransmit"
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        handle.await.expect("announce task"),
+        Err(TrackerError::Timeout)
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_wrong_transaction_id_is_ignored_and_the_connect_is_retransmitted() {
     let server = FakeTracker::bind().await;
     let mut buffer = [0u8; 2048];
-    let handle = spawn(url(server.address), request(), false);
+    let handle = spawn(request(url(server.address)));
 
     let (connect, source) = server.recv(&mut buffer).await;
     let connect_transaction = transaction_id(&connect);
@@ -219,7 +243,7 @@ async fn a_wrong_transaction_id_is_ignored_and_the_connect_is_retransmitted() {
 async fn a_datagram_from_another_source_is_dropped() {
     let server = FakeTracker::bind().await;
     let mut buffer = [0u8; 2048];
-    let handle = spawn(url(server.address), request(), false);
+    let handle = spawn(request(url(server.address)));
 
     let (connect, source) = server.recv(&mut buffer).await;
     let connect_transaction = transaction_id(&connect);
@@ -253,7 +277,8 @@ async fn a_datagram_from_another_source_is_dropped() {
 async fn an_error_packet_ends_the_attempt() {
     let server = FakeTracker::bind().await;
     let mut buffer = [0u8; 2048];
-    let handle = spawn(url(server.address), request(), false);
+    let tracker_url = url(server.address);
+    let handle = spawn(request(tracker_url.clone()));
 
     let (connect, source) = server.recv(&mut buffer).await;
     let connect_transaction = transaction_id(&connect);
@@ -264,8 +289,7 @@ async fn an_error_packet_ends_the_attempt() {
 
     match handle.await.expect("announce task") {
         Err(TrackerError::Rejected { message }) => {
-            let url = url(server.address);
-            assert_eq!(message.sanitized_text(&url), "go away");
+            assert_eq!(message.sanitized_text(&tracker_url), "go away");
             assert!(!format!("{message:?}").contains("go away"));
         }
         other => panic!("expected a rejection, got {other:?}"),
@@ -275,7 +299,6 @@ async fn an_error_packet_ends_the_attempt() {
 #[tokio::test]
 async fn a_non_udp_url_is_rejected() {
     let transport = transport();
-    let request = request();
 
     for text in [
         "http://127.0.0.1:6969/announce",
@@ -283,7 +306,7 @@ async fn a_non_udp_url_is_rejected() {
     ] {
         let url = TrackerUrl::parse(text).expect("valid tracker URL");
         assert_eq!(
-            transport.announce(&url, &request, false).await,
+            transport.announce(request(url)).await,
             Err(TrackerError::UnsupportedScheme)
         );
     }
@@ -294,10 +317,8 @@ async fn dropping_the_future_closes_the_socket() {
     let server = FakeTracker::bind().await;
     let mut buffer = [0u8; 2048];
     let transport = transport();
-    let url = url(server.address);
-    let request = request();
 
-    let mut future = Box::pin(transport.announce(&url, &request, false));
+    let mut future = Box::pin(transport.announce(request(url(server.address))));
     let mut receive = Box::pin(server.recv(&mut buffer));
     tokio::select! {
         _ = &mut receive => {}
@@ -311,6 +332,27 @@ async fn dropping_the_future_closes_the_socket() {
     assert!(
         server.try_recv(&mut buffer).is_none(),
         "a dropped attempt must not send again"
+    );
+}
+
+#[test]
+fn max_duration_covers_dns_and_the_attempt_deadline() {
+    let transport = transport();
+
+    for event in [
+        AnnounceEvent::None,
+        AnnounceEvent::Started,
+        AnnounceEvent::Completed,
+    ] {
+        assert_eq!(
+            transport.max_duration(event),
+            Duration::from_secs(112),
+            "{event:?} must include the bounded DNS phase"
+        );
+    }
+    assert_eq!(
+        transport.max_duration(AnnounceEvent::Stopped),
+        Duration::from_secs(9)
     );
 }
 
@@ -352,6 +394,5 @@ fn the_announce_future_is_send() {
 
     let transport = transport();
     let url = TrackerUrl::parse("udp://127.0.0.1:1/announce").expect("valid tracker URL");
-    let request = request();
-    drop(assert_send(transport.announce(&url, &request, false)));
+    drop(assert_send(transport.announce(request(url))));
 }

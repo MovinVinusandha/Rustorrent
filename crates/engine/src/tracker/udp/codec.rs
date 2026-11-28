@@ -14,9 +14,12 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use crate::tracker::peers::usable_socket;
-use crate::tracker::{MAX_PEERS_PER_RESPONSE, PeerWarnings, TrackerMessage};
+use crate::tracker::{
+    AnnounceRequest, AnnounceResponse, MAX_PEERS_PER_RESPONSE, PeerWarnings, TrackerMessage,
+};
 
 /// Protocol magic sent by a connect request.
 pub const PROTOCOL_ID: u64 = 0x0000_0417_2710_1980;
@@ -87,82 +90,13 @@ impl ConnectionId {
     }
 }
 
-/// Announce event sent to a UDP tracker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UdpEvent {
-    /// No event; a periodic announce.
-    None,
-    /// The download completed.
-    Completed,
-    /// The first announce for this torrent.
-    Started,
-    /// The torrent is stopping.
-    Stopped,
-}
-
-impl UdpEvent {
-    /// Returns the wire value of this event.
-    pub const fn as_u32(self) -> u32 {
-        match self {
-            Self::None => 0,
-            Self::Completed => 1,
-            Self::Started => 2,
-            Self::Stopped => 3,
-        }
-    }
-}
-
-/// Fields of a BEP 15 announce request.
-///
-/// The 32-bit IP address field is always zero: we never ask the tracker to
-/// publish a different address. The type stays crate-private until the public
-/// transport API lands; the session builds it from its own state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UdpAnnounce {
-    /// Connection ID from the most recent connect response.
-    pub(crate) connection_id: ConnectionId,
-    /// Raw v1 info-hash.
-    pub(crate) info_hash: [u8; 20],
-    /// Our peer ID.
-    pub(crate) peer_id: [u8; 20],
-    /// Bytes downloaded so far.
-    pub(crate) downloaded: u64,
-    /// Bytes still needed.
-    pub(crate) left: u64,
-    /// Bytes uploaded so far.
-    pub(crate) uploaded: u64,
-    /// Announce event.
-    pub(crate) event: UdpEvent,
-    /// Client key, reused across announces for one torrent.
-    pub(crate) key: u32,
-    /// Peers wanted; `-1` means the tracker default.
-    pub(crate) num_want: i32,
-    /// Our TCP listen port.
-    pub(crate) port: u16,
-}
-
-/// A decoded announce response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UdpAnnounceResponse {
-    /// Interval between regular announces, in seconds, as sent.
-    pub interval: u32,
-    /// Number of leechers reported by the tracker.
-    pub leechers: u32,
-    /// Number of seeders reported by the tracker.
-    pub seeders: u32,
-    /// Decoded and filtered peers, in wire order.
-    pub peers: Vec<SocketAddr>,
-    /// Counters for recoverable peer-record problems.
-    pub peer_warnings: PeerWarnings,
-}
-
 /// A datagram accepted for the current request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decoded {
     /// A connect response.
     Connect(ConnectionId),
-    /// An announce response.
-    Announce(UdpAnnounceResponse),
+    /// An announce response, in the shared response shape.
+    Announce(AnnounceResponse),
     /// An error packet; the text is untrusted and length-only in diagnostics.
     Error(TrackerMessage),
 }
@@ -178,19 +112,20 @@ pub fn encode_connect(transaction_id: u32) -> [u8; CONNECT_REQUEST_LEN] {
 
 /// Encodes an announce request as exactly 98 bytes.
 pub(crate) fn encode_announce(
-    request: &UdpAnnounce,
+    request: &AnnounceRequest,
+    connection_id: ConnectionId,
     transaction_id: u32,
 ) -> [u8; ANNOUNCE_REQUEST_LEN] {
     let mut packet = [0u8; ANNOUNCE_REQUEST_LEN];
-    packet[0..8].copy_from_slice(&request.connection_id.get().to_be_bytes());
+    packet[0..8].copy_from_slice(&connection_id.get().to_be_bytes());
     packet[8..12].copy_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
     packet[12..16].copy_from_slice(&transaction_id.to_be_bytes());
-    packet[16..36].copy_from_slice(&request.info_hash);
+    packet[16..36].copy_from_slice(request.info_hash.as_bytes());
     packet[36..56].copy_from_slice(&request.peer_id);
-    packet[56..64].copy_from_slice(&request.downloaded.to_be_bytes());
-    packet[64..72].copy_from_slice(&request.left.to_be_bytes());
-    packet[72..80].copy_from_slice(&request.uploaded.to_be_bytes());
-    packet[80..84].copy_from_slice(&request.event.as_u32().to_be_bytes());
+    packet[56..64].copy_from_slice(&request.stats.downloaded.to_be_bytes());
+    packet[64..72].copy_from_slice(&request.stats.left.to_be_bytes());
+    packet[72..80].copy_from_slice(&request.stats.uploaded.to_be_bytes());
+    packet[80..84].copy_from_slice(&request.event.as_udp().to_be_bytes());
     // Bytes 84..88 stay zero: the IP address field.
     packet[88..92].copy_from_slice(&request.key.to_be_bytes());
     packet[92..96].copy_from_slice(&request.num_want.to_be_bytes());
@@ -231,7 +166,7 @@ pub fn decode(datagram: &[u8], transaction_id: u32, family: Family) -> Option<De
     }
 }
 
-fn decode_announce_body(datagram: &[u8], family: Family) -> Option<UdpAnnounceResponse> {
+fn decode_announce_body(datagram: &[u8], family: Family) -> Option<AnnounceResponse> {
     let interval = u32::from_be_bytes(datagram.get(8..12)?.try_into().ok()?);
     let leechers = u32::from_be_bytes(datagram.get(12..16)?.try_into().ok()?);
     let seeders = u32::from_be_bytes(datagram.get(16..20)?.try_into().ok()?);
@@ -263,11 +198,14 @@ fn decode_announce_body(datagram: &[u8], family: Family) -> Option<UdpAnnounceRe
         peers.push(peer);
     }
 
-    Some(UdpAnnounceResponse {
-        interval,
-        leechers,
-        seeders,
+    Some(AnnounceResponse {
+        interval: Duration::from_secs(u64::from(interval)),
+        min_interval: None,
+        complete: Some(u64::from(seeders)),
+        incomplete: Some(u64::from(leechers)),
         peers,
+        tracker_id: None,
+        warning: None,
         peer_warnings: warnings,
     })
 }

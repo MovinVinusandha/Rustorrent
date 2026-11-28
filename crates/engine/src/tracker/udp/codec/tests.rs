@@ -1,13 +1,17 @@
 use std::fmt::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
-use crate::tracker::{PeerWarnings, TrackerError, TrackerUrl};
+use crate::metainfo::InfoHash;
+use crate::tracker::{
+    AnnounceEvent, AnnounceRequest, AnnounceResponse, AnnounceStats, PeerWarnings, RedirectPolicy,
+    TrackerError, TrackerUrl,
+};
 
 use super::{
     ANNOUNCE_REQUEST_LEN, ANNOUNCE_RESPONSE_MIN_LEN, CONNECT_REQUEST_LEN, CONNECT_RESPONSE_LEN,
     ConnectionId, Decoded, ERROR_MIN_LEN, Family, IPV4_PEER_STRIDE, IPV6_PEER_STRIDE,
-    MAX_DATAGRAM_LEN, PROTOCOL_ID, UdpAnnounce, UdpAnnounceResponse, UdpEvent, decode,
-    encode_announce, encode_connect,
+    MAX_DATAGRAM_LEN, PROTOCOL_ID, decode, encode_announce, encode_connect,
 };
 
 const TRANSACTION_ID: u32 = 0x1234_5678;
@@ -21,24 +25,27 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-fn request() -> UdpAnnounce {
+fn request() -> AnnounceRequest {
     let mut info_hash = [0u8; 20];
     for (index, byte) in info_hash.iter_mut().enumerate() {
         *byte = index as u8;
     }
 
-    UdpAnnounce {
-        connection_id: ConnectionId::new(CONNECTION_ID),
-        info_hash,
-        peer_id: *b"-BA0100-123456789012",
-        downloaded: 256,
-        left: 512,
-        uploaded: 768,
-        event: UdpEvent::Started,
-        key: 0xdead_beef,
-        num_want: 50,
-        port: 51413,
-    }
+    AnnounceRequest::new(
+        TrackerUrl::parse("udp://127.0.0.1:6969/announce").expect("valid tracker URL"),
+        InfoHash::from_bytes(info_hash),
+        *b"-BA0100-123456789012",
+        51413,
+        AnnounceStats {
+            uploaded: 768,
+            downloaded: 256,
+            left: 512,
+        },
+        AnnounceEvent::Started,
+        0xdead_beef,
+        None,
+        RedirectPolicy::Public,
+    )
 }
 
 fn announce_response(interval: u32, leechers: u32, seeders: u32, peers: &[u8]) -> Vec<u8> {
@@ -66,7 +73,7 @@ fn v6_peer(octets: [u8; 16], port: u16) -> [u8; 18] {
     record
 }
 
-fn decode_announce(packet: &[u8], family: Family) -> UdpAnnounceResponse {
+fn decode_announce(packet: &[u8], family: Family) -> AnnounceResponse {
     match decode(packet, TRANSACTION_ID, family) {
         Some(Decoded::Announce(response)) => response,
         other => panic!("expected an announce response, got {other:?}"),
@@ -85,7 +92,7 @@ fn the_connect_request_matches_the_bep_vector() {
 
 #[test]
 fn the_announce_request_is_exactly_98_bytes() {
-    let packet = encode_announce(&request(), TRANSACTION_ID);
+    let packet = encode_announce(&request(), ConnectionId::new(CONNECTION_ID), TRANSACTION_ID);
 
     assert_eq!(packet.len(), ANNOUNCE_REQUEST_LEN);
     assert_eq!(
@@ -110,10 +117,10 @@ fn the_announce_request_is_exactly_98_bytes() {
 
 #[test]
 fn every_event_has_its_wire_value() {
-    assert_eq!(UdpEvent::None.as_u32(), 0);
-    assert_eq!(UdpEvent::Completed.as_u32(), 1);
-    assert_eq!(UdpEvent::Started.as_u32(), 2);
-    assert_eq!(UdpEvent::Stopped.as_u32(), 3);
+    assert_eq!(AnnounceEvent::None.as_udp(), 0);
+    assert_eq!(AnnounceEvent::Completed.as_udp(), 1);
+    assert_eq!(AnnounceEvent::Started.as_udp(), 2);
+    assert_eq!(AnnounceEvent::Stopped.as_udp(), 3);
 }
 
 #[test]
@@ -176,9 +183,9 @@ fn the_announce_vector_keeps_one_peer_and_drops_the_invalid_one() {
     );
 
     let response = decode_announce(&packet, Family::V4);
-    assert_eq!(response.interval, 1800);
-    assert_eq!(response.leechers, 3);
-    assert_eq!(response.seeders, 4);
+    assert_eq!(response.interval, Duration::from_secs(1800));
+    assert_eq!(response.incomplete, Some(3));
+    assert_eq!(response.complete, Some(4));
     assert_eq!(response.peers.len(), 1);
     assert_eq!(response.peers[0].to_string(), "127.0.0.1:51413");
     assert_eq!(
@@ -258,7 +265,7 @@ fn a_full_ipv6_response_is_3620_bytes_and_fits_the_buffer() {
     let response = decode_announce(&packet, Family::V6);
     assert_eq!(response.peers.len(), 200);
     assert!(response.peer_warnings.is_empty());
-    assert_eq!(response.seeders, 200);
+    assert_eq!(response.complete, Some(200));
 }
 
 #[test]

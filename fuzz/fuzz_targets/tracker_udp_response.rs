@@ -24,8 +24,8 @@ use tokio::time::Instant;
 use bt_engine::tracker::udp::attempt::{
     ATTEMPT_DEADLINE, AttemptOutcome, MAX_SENDS, STOPPED_DEADLINE, Step, TransactionIds, UdpAttempt,
 };
-use bt_engine::tracker::udp::codec::{ConnectionId, Family, MAX_DATAGRAM_LEN, UdpAnnounceResponse};
-use bt_engine::tracker::{MAX_PEERS_PER_RESPONSE, TrackerMessage};
+use bt_engine::tracker::udp::codec::{ConnectionId, Family, MAX_DATAGRAM_LEN};
+use bt_engine::tracker::{AnnounceResponse, MAX_PEERS_PER_RESPONSE, TrackerMessage};
 
 /// Marker appended to every structured error packet; diagnostics must hide it.
 const SECRET: &str = "SECRET-TRACKER-TEXT-1234";
@@ -192,7 +192,7 @@ fn check_send(
     *last = Some((kind, transaction_id));
 }
 
-fn check_response(response: &UdpAnnounceResponse) {
+fn check_response(response: &AnnounceResponse) {
     assert!(
         response.peers.len() <= MAX_PEERS_PER_RESPONSE,
         "response carried more peers than the cap"

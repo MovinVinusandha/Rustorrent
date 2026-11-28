@@ -8,19 +8,34 @@ use std::io;
 
 use thiserror::Error;
 
+pub mod backoff;
+pub mod candidates;
 pub mod dns;
+pub mod gate;
 pub mod id;
 pub mod message;
 pub mod peers;
 pub mod policy;
 pub mod response;
+pub mod state;
+pub mod task;
+pub mod transport;
 pub mod udp;
 pub mod url;
 
+pub use backoff::{
+    BASE_BACKOFF_SECS, JITTER_PERCENT, Jitter, JitterSeed, JitterSeedSource, MAX_BACKOFF_EXPONENT,
+    MAX_BACKOFF_SECS, effective_interval,
+};
+pub use candidates::{
+    CandidateWarnings, MAX_TIERS, MAX_TRACKER_URLS, MAX_URLS_PER_TIER, OsShuffle, Shuffle,
+    TrackerCandidates,
+};
 pub use dns::{
     DNS_LOOKUP_TIMEOUT, DNS_QUEUE_TIMEOUT, MAX_CONCURRENT_LOOKUPS, MAX_RESOLVED_ADDRESSES,
     Resolver, SystemResolver,
 };
+pub use gate::{GATE_WAIT, GatePermit, HostGate, HostKey};
 pub use id::{MAX_TRACKER_ID_LEN, TrackerId};
 pub use message::{MAX_MESSAGE_LEN, TrackerMessage};
 pub use peers::{MAX_PEERS_PER_RESPONSE, PeerWarnings, decode_peers};
@@ -28,6 +43,14 @@ pub use policy::TargetPolicy;
 pub use response::{
     AnnounceResponse, DEFAULT_INTERVAL_SECS, MAX_INTERVAL_SECS, MAX_RESPONSE_BYTES,
     MIN_INTERVAL_SECS, decode_response,
+};
+pub use state::{NotifiedTracker, Tracker, TrackerConfig, TrackerEvent, TrackerStatus};
+pub use task::{
+    COMMAND_CAPACITY, EVENT_CAPACITY, MAX_QUEUED_PEERS, STOP_BUDGET, TrackerCommand, TrackerHandle,
+    WATCHDOG_MARGIN, spawn,
+};
+pub use transport::{
+    AnnounceEvent, AnnounceRequest, AnnounceStats, RedirectPolicy, TrackerTransport,
 };
 pub use url::{
     Host, MAX_HOST_LEN, MAX_LABEL_LEN, MAX_REDACTED_URL_LEN, MAX_URL_LEN, Scheme, TrackerUrl,
@@ -39,6 +62,9 @@ pub enum TrackerError {
     /// The input is not a valid tracker URL.
     #[error("<invalid tracker url>")]
     InvalidUrl,
+    /// A URL has no port and its scheme has no default.
+    #[error("invalid tracker port")]
+    InvalidPort,
     /// The URL scheme is not `http`, `https` or `udp`.
     #[error("unsupported tracker URL scheme")]
     UnsupportedScheme,
@@ -57,6 +83,9 @@ pub enum TrackerError {
     /// Every candidate address is blocked by the target policy.
     #[error("blocked tracker target")]
     BlockedTarget,
+    /// No tracker candidate survived URL validation.
+    #[error("no usable tracker")]
+    NoUsableTracker,
     /// Host resolution failed, timed out or produced no usable address.
     #[error("tracker DNS lookup failed")]
     Dns,
@@ -79,4 +108,10 @@ pub enum TrackerError {
     /// The OS randomness source failed.
     #[error("failed to generate a transaction ID")]
     Random,
+    /// A transport panicked; the panic was contained at the task boundary.
+    ///
+    /// Only reachable in unwind builds. Release builds use `panic = "abort"`,
+    /// so a transport panic ends the process instead.
+    #[error("tracker transport panicked")]
+    Panicked,
 }

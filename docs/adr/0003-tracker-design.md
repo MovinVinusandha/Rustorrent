@@ -684,10 +684,12 @@ synchronous and never holds it across an `.await`.
 ### Schedule
 
 - Torrent start: send `started` immediately.
-- Download completion: send `completed` immediately, once. If it fails, keep
-  it pending and retry it on the next attempt; do not send `started` again.
-  `completed_sent_at_start` lets the session suppress the event when a previous
-  session already sent it; tracker state itself is not persisted.
+- Download completion: queue `completed` once. It is sent at the next attempt
+  to a tracker that is not in backoff, immediately when one is usable. If it
+  fails, keep it pending and retry it at that tracker's `retry_at`; do not
+  send `started` again. `completed_sent_at_start` lets the session suppress
+  the event when a previous session already sent it; tracker state itself is
+  not persisted.
 - Periodic announce: at `next_announce`, with no event.
 - Pause, removal or shutdown: send `stopped` once with a 2-second per-attempt
   budget, no retries, then become terminal. The task sends it to every tracker
@@ -697,8 +699,10 @@ synchronous and never holds it across an `.await`.
 - One in-flight announce per torrent. An event that arrives during an announce
   is queued; after the in-flight attempt, `stopped` wins over `completed`, and
   `completed` wins over `started`. `started` and `completed` are sent at most
-  once after a success; a failed one stays pending. `stopped` is terminal and
-  is not retried after a failure.
+  once after a success; a failed one stays pending. A queued `started` or
+  `completed` only uses a tracker with no failures or one whose `retry_at` has
+  arrived, so it cannot reset a failure backoff. `stopped` may bypass backoff:
+  it is terminal and is not retried after a failure.
 - A successful announce resets that tracker's failure count, records its
   tracker ID and sets its `next_attempt = now + effective_interval`. The next
   round is the earliest `next_attempt` among the trackers the round may use.
